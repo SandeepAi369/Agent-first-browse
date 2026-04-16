@@ -121,6 +121,16 @@ class WorkerVisionPlanner:
                     scene_summary=decision.scene_summary or "Action schema invalid.",
                 )
 
+        if _looks_like_login_wall(decision.scene_summary, decision.confusion_reason):
+            return decision.model_copy(
+                update={
+                    "action": BrowserAction(action="manual_intervention_required"),
+                    "confidence": max(decision.confidence, 0.7),
+                    "confused": False,
+                    "confusion_reason": "",
+                }
+            )
+
         if decision.action is None:
             return decision.model_copy(
                 update={
@@ -208,6 +218,7 @@ def _build_vlm_messages(
         "- type: must include selector and text.\n"
         "- goto: must include url.\n"
         "- scroll/wait/screenshot: provide required fields only.\n"
+        "- manual_intervention_required: use this for login walls, Gmail auth, captcha, or MFA screens.\n"
         "- Keep action human-like and minimal (one tactical step).\n"
         "- scene_summary should be a short plain-English description of what is visible.\n"
     )
@@ -251,3 +262,24 @@ def _extract_accessibility_hints(tree: dict[str, Any], max_items: int) -> list[d
                 stack.append(child)
 
     return hints
+
+
+def _looks_like_login_wall(scene_summary: str, confusion_reason: str) -> bool:
+    """Detect login/captcha wall cues that require manual human intervention."""
+    haystack = f"{scene_summary} {confusion_reason}".lower()
+    keywords = (
+        "login",
+        "sign in",
+        "sign-in",
+        "gmail",
+        "google auth",
+        "authentication",
+        "verify",
+        "verification",
+        "2fa",
+        "mfa",
+        "captcha",
+        "one-time code",
+        "otp",
+    )
+    return any(keyword in haystack for keyword in keywords)

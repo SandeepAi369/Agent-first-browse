@@ -3,12 +3,14 @@ from __future__ import annotations
 import json
 import os
 from typing import Any, TypeVar
+from urllib.parse import urlparse
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.browser_promoter.database import lock_target_community
 from app.browser_promoter.state import AgentState, HighLevelCommand
 
 
@@ -30,6 +32,9 @@ class StrategyPlanOutput(BaseModel):
     target_description: str = Field(min_length=1)
     behavior_plan: str = Field(min_length=1)
     base_confidence: float = Field(default=0.5, ge=0.0, le=1.0)
+    reconnaissance_query: str = ""
+    community_niche: str = ""
+    candidate_community_url: str = ""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -182,20 +187,27 @@ async def strategy_planner_node(state: SupervisorInternalState) -> dict[str, Any
         stealth_notes="",
     )
     fallback = StrategyPlanOutput(
-        action_type="engage",
+        action_type="reconnaissance" if _should_default_to_recon(state) else "engage",
         target_description="Most relevant organic discussion thread on current page",
         behavior_plan=(
-            "Observe nearby human phrasing, mirror pacing, and take one minimal action "
-            "before any text submission."
+            "Search for high-signal communities, observe discussion quality, and avoid posting until a "
+            "strong fit is confirmed."
+            if _should_default_to_recon(state)
+            else "Observe nearby human phrasing, mirror pacing, and take one minimal action before any text submission."
         ),
         base_confidence=0.55,
+        reconnaissance_query="best developer communities reddit github open source discussions",
+        community_niche="software-engineering",
+        candidate_community_url=state.current_url,
     )
 
     result = await _invoke_structured(
         schema=StrategyPlanOutput,
         system_prompt=(
-            "You are Strategy Planner. Choose the single next high-level action and behavior plan. "
-            "Prioritize stealth, organic interaction, and human timing."
+            "You are Strategy Planner. Choose one next action_type and behavior plan. "
+            "Supported action types include reconnaissance and engage. "
+            "When discovery is needed, choose reconnaissance and provide a concrete recon query plus "
+            "candidate_community_url if visible. Prioritize stealth and organic behavior."
         ),
         payload={
             "objective": state.objective,
@@ -204,6 +216,8 @@ async def strategy_planner_node(state: SupervisorInternalState) -> dict[str, Any
             "audience_intent": context.audience_intent,
             "stealth_notes": context.stealth_notes,
             "current_scene_summary": state.current_scene_summary,
+            "current_url": state.current_url,
+            "target_platforms": state.target_platforms,
         },
         fallback=fallback,
     )
@@ -297,16 +311,105 @@ async def final_merge_node(state: SupervisorInternalState) -> dict[str, Any]:
     )
 
     merged_confidence = max(0.0, min(1.0, (strategy.base_confidence + risk.confidence) / 2.0))
+    behavior_plan = _compose_behavior_plan(strategy=strategy, state=state)
 
     command = HighLevelCommand(
         action_type=strategy.action_type,
         target_description=strategy.target_description,
         draft_text=copy.draft_text,
-        behavior_plan=strategy.behavior_plan,
+        behavior_plan=behavior_plan,
         confidence=merged_confidence,
         stealth_adjustments=risk.stealth_adjustments,
     )
+
+    _lock_target_if_reconnaissance(state=state, strategy=strategy)
     return {"final_command": command}
+
+
+def _should_default_to_recon(state: SupervisorInternalState) -> bool:
+    if not state.current_url.strip():
+        return True
+    if state.worker_last_confused:
+        return True
+    return False
+
+
+def _is_recon_action(action_type: str) -> bool:
+    lowered = action_type.strip().lower()
+    return lowered in {"reconnaissance", "recon", "discovery", "community_recon"}
+
+
+def _compose_behavior_plan(strategy: StrategyPlanOutput, state: SupervisorInternalState) -> str:
+    """Ensure reconnaissance actions carry explicit search-and-read instructions."""
+    if not _is_recon_action(strategy.action_type):
+        return strategy.behavior_plan
+
+    recon_query = strategy.reconnaissance_query.strip() or (
+        "site:reddit.com programming communities OR site:github.com topics developers"
+    )
+    platform_hint = _infer_platform_hint(state)
+    base = strategy.behavior_plan.strip()
+
+    recon_suffix = (
+        f" Run reconnaissance using query: {recon_query}. "
+        f"Search on Google and {platform_hint} where applicable, read on-screen signals, "
+        "and identify high-trust communities before engagement."
+    )
+    if recon_suffix.strip() in base:
+        return base
+    return (base + " " + recon_suffix).strip()
+
+
+def _lock_target_if_reconnaissance(state: SupervisorInternalState, strategy: StrategyPlanOutput) -> None:
+    """Persist discovered communities during reconnaissance for future posting workflows."""
+    if not _is_recon_action(strategy.action_type):
+        return
+
+    candidate_url = strategy.candidate_community_url.strip() or state.current_url.strip()
+    if not candidate_url or not _looks_like_valid_http_url(candidate_url):
+        return
+
+    platform = _platform_from_url(candidate_url) or _infer_platform_hint(state)
+    niche = strategy.community_niche.strip() or _infer_niche(state)
+
+    try:
+        lock_target_community(
+            platform=platform,
+            url=candidate_url,
+            niche=niche,
+        )
+    except Exception:
+        # Persistence failures should not break Supervisor planning loop.
+        return
+
+
+def _looks_like_valid_http_url(url: str) -> bool:
+    parsed = urlparse(url)
+    return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+
+
+def _platform_from_url(url: str) -> str:
+    host = urlparse(url).netloc.lower()
+    if "reddit.com" in host:
+        return "reddit"
+    if "github.com" in host:
+        return "github"
+    if "x.com" in host or "twitter.com" in host:
+        return "x"
+    return "web"
+
+
+def _infer_niche(state: SupervisorInternalState) -> str:
+    summary = state.current_scene_summary.lower()
+    if "ai" in summary:
+        return "ai"
+    if "security" in summary:
+        return "security"
+    if "devops" in summary:
+        return "devops"
+    if "python" in summary:
+        return "python"
+    return "software-engineering"
 
 
 def build_supervisor_subgraph():

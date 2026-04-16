@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from enum import Enum
 from typing import Any, Literal
 from uuid import uuid4
 
@@ -47,7 +48,15 @@ class BrowserAction(BaseModel):
     """Executable browser action prepared by the Worker model."""
 
     action_id: str = Field(default_factory=lambda: f"act_{uuid4().hex[:12]}", min_length=1)
-    action: Literal["goto", "scroll", "click", "type", "wait", "screenshot"]
+    action: Literal[
+        "goto",
+        "scroll",
+        "click",
+        "type",
+        "wait",
+        "screenshot",
+        "manual_intervention_required",
+    ]
     url: str = ""
     selector: str = ""
     text: str = ""
@@ -58,6 +67,26 @@ class BrowserAction(BaseModel):
     timeout_ms: int = Field(default=15000, ge=1, le=120000)
     typing_delay_ms: int = Field(default=45, ge=0, le=500)
     clear_before_type: bool = True
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class BrowserMode(str, Enum):
+    """Tri-mode runtime selection for browser connectivity."""
+
+    LOCAL_NATIVE_CDP = "LOCAL_NATIVE_CDP"
+    ISOLATED_SERVER = "ISOLATED_SERVER"
+    REMOTE_WEBSOCKET = "REMOTE_WEBSOCKET"
+
+
+class BrowserConfig(BaseModel):
+    """Runtime browser connectivity and behavior configuration."""
+
+    mode: BrowserMode = BrowserMode.ISOLATED_SERVER
+    local_cdp_endpoint: str = "http://localhost:9222"
+    remote_websocket_url: str = ""
+    headless: bool = True
+    cdp_timeout_ms: int = Field(default=15000, ge=1000, le=120000)
 
     model_config = ConfigDict(extra="forbid")
 
@@ -124,6 +153,8 @@ class AgentState(BaseModel):
     """
 
     campaign: CampaignContext
+    thread_id: str = Field(default_factory=lambda: f"thread_{uuid4().hex}")
+    browser_config: BrowserConfig = Field(default_factory=BrowserConfig)
     high_level_command: HighLevelCommand | None = None
 
     supervisor_commands: list[SupervisorCommand] = Field(default_factory=list)
@@ -149,6 +180,7 @@ class AgentState(BaseModel):
     cycle_count: int = Field(default=0, ge=0)
     max_cycles: int = Field(default=15, ge=1, le=1000)
     worker_confidence_threshold: float = Field(default=0.4, ge=0.0, le=1.0)
+    dry_run_mode: bool = True
 
     routing: RoutingFlags = Field(default_factory=RoutingFlags)
     ephemeral: dict[str, Any] = Field(default_factory=dict)
