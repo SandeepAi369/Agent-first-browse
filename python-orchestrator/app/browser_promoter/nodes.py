@@ -9,10 +9,17 @@ from typing import Any, Literal
 from playwright.async_api import Page
 
 from app.browser_promoter.browser_runtime import BrowserRuntime
-from app.browser_promoter.database import count_locked_target_communities
+from app.browser_promoter.dashboard import (
+    pause_for_manual_intervention,
+    print_terminal_dashboard,
+    resolve_platform_name,
+)
 from app.browser_promoter.state import AgentState, BrowserAction, InteractiveRegion, ScreenshotFrame, WorkerFeedback
 from app.browser_promoter.supervisor_subgraph import run_supervisor_subgraph
 from app.browser_promoter.worker_planner import WorkerVisionPlanner
+from app.logger import get_logger
+
+logger = get_logger(__name__)
 
 
 _WORKER_PLANNER: WorkerVisionPlanner | None = None
@@ -20,7 +27,7 @@ _WORKER_PLANNER: WorkerVisionPlanner | None = None
 
 async def supervisor_node(state: AgentState) -> dict[str, Any]:
     """Run hierarchical Supervisor subgraph and publish only final HighLevelCommand."""
-    print("[supervisor_node] running hierarchical subgraph")
+    logger.info("Running hierarchical supervisor subgraph")
     command = await run_supervisor_subgraph(state)
     return {"high_level_command": command}
 
@@ -32,7 +39,7 @@ async def worker_node(state: AgentState) -> dict[str, Any]:
     This node also performs aggressive garbage collection of heavy visual payloads
     once the decision is made, preserving only lightweight scene summaries.
     """
-    print("[worker_node] planning tactical action from screenshot + regions")
+    logger.info("Planning tactical action from screenshot + regions")
 
     high_level_command = _resolve_high_level_command(state)
     planner = _get_worker_planner()
@@ -117,15 +124,15 @@ async def worker_node(state: AgentState) -> dict[str, Any]:
 
 def router_node(state: AgentState) -> dict[str, Any]:
     """Minimal router node; decisions are made in router_function."""
-    print("[router_node] evaluating routing flags")
+    logger.info("Evaluating routing flags")
     next_cycle = state.cycle_count + 1
     hard_max = min(state.max_cycles, 15)
     still_allowed = state.should_continue and next_cycle < hard_max
-    _print_terminal_dashboard(state=state, cycle_value=next_cycle, hard_max=hard_max)
+    print_terminal_dashboard(state=state, cycle_value=next_cycle, hard_max=hard_max)
 
     ephemeral = dict(state.ephemeral)
     if _has_pending_manual_intervention_action(state):
-        _pause_for_manual_intervention(state=state, cycle_value=next_cycle, hard_max=hard_max)
+        pause_for_manual_intervention(state=state, cycle_value=next_cycle, hard_max=hard_max)
         remaining_actions = list(state.worker_action_queue)
         if remaining_actions and remaining_actions[0].action == "manual_intervention_required":
             remaining_actions.pop(0)
@@ -193,62 +200,6 @@ def _has_pending_manual_intervention_action(state: AgentState) -> bool:
     if not state.worker_action_queue:
         return False
     return state.worker_action_queue[0].action == "manual_intervention_required"
-
-
-def _pause_for_manual_intervention(state: AgentState, cycle_value: int, hard_max: int) -> None:
-    """Pause graph execution so a human can complete login/captcha manually."""
-    platform = _resolve_platform_name(state).upper()
-    print("\n" + "=" * 86)
-    print(
-        f"HITL PAUSE | Cycle {cycle_value}/{hard_max} | Platform: {platform} | "
-        "Action: Manual Intervention Required"
-    )
-    print("Reason: Login wall, Gmail auth, captcha, or MFA requires manual completion.")
-    print("Please complete the required manual browser actions, then press ENTER to resume.")
-    print("=" * 86)
-    try:
-        input("[HITL] Press ENTER when manual intervention is complete: ")
-    except EOFError:
-        print("[HITL] No interactive stdin detected; continuing without blocking.")
-
-
-def _print_terminal_dashboard(state: AgentState, cycle_value: int, hard_max: int) -> None:
-    """Render concise real-time orchestration status in terminal."""
-    mode = "Recon" if _is_recon_mode(state) else "Engage"
-    platform = _resolve_platform_name(state).capitalize()
-    action = _resolve_dashboard_action(state, mode)
-
-    try:
-        locked_targets = count_locked_target_communities()
-    except Exception:
-        locked_targets = 0
-
-    print(
-        f"Cycle {cycle_value}/{hard_max} | Mode: {mode} | Platform: {platform} | "
-        f"Action: {action} | Locked Targets: {locked_targets}"
-    )
-
-
-def _is_recon_mode(state: AgentState) -> bool:
-    if state.high_level_command is None:
-        return False
-    action_type = state.high_level_command.action_type.lower()
-    return action_type in {"reconnaissance", "recon", "discovery", "community_recon"}
-
-
-def _resolve_dashboard_action(state: AgentState, mode: str) -> str:
-    if state.worker_action_queue:
-        if state.worker_action_queue[0].action == "manual_intervention_required":
-            return "Manual Pause"
-        return state.worker_action_queue[0].action.replace("_", " ").title()
-
-    if mode == "Recon":
-        return "Searching"
-
-    if state.high_level_command is not None:
-        return state.high_level_command.action_type.replace("_", " ").title()
-
-    return "Planning"
 
 
 def _get_worker_planner() -> WorkerVisionPlanner:
@@ -330,19 +281,8 @@ def _normalize_url(url: str) -> str:
     return f"https://{url}"
 
 
-def _resolve_platform_name(state: AgentState) -> str:
-    """Resolve stable platform key for persistent browser session storage."""
-    if state.campaign.target_platforms:
-        return state.campaign.target_platforms[0]
-
-    url = state.current_url.lower()
-    if "reddit.com" in url:
-        return "reddit"
-    if "x.com" in url or "twitter.com" in url:
-        return "x"
-    if "github.com" in url:
-        return "github"
-    return "default"
+# _resolve_platform_name is now imported from app.browser_promoter.dashboard
+# as resolve_platform_name and used across the codebase.
 
 
 def _trim_accessibility_tree(tree: dict[str, Any] | None, max_nodes: int = 250) -> dict[str, Any]:
@@ -645,7 +585,7 @@ async def browser_controller_node(state: AgentState) -> dict[str, Any]:
     try:
         page = await BrowserRuntime.ensure_page(
             browser_config=state.browser_config,
-            platform_name=_resolve_platform_name(state),
+            platform_name=resolve_platform_name(state),
             thread_id=state.thread_id,
         )
     except Exception as exc:
