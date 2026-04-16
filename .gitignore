@@ -1,0 +1,49 @@
+# ─── Python ───────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.class
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+*.whl
+
+# ─── Virtual Environments ─────────────────────────────────
+.venv/
+venv/
+env/
+
+# ─── IDE / Editor ─────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ─── Type Checking & Linting ──────────────────────────────
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+htmlcov/
+.coverage
+coverage.xml
+
+# ─── Persistence (runtime data — never commit) ────────────
+persistence/
+
+# ─── Environment / Secrets ────────────────────────────────
+.env
+.env.local
+.env.*.local
+
+# ─── Playwright ───────────────────────────────────────────
+playwright-report/
+test-results/
+
+# ─── OS artifacts ─────────────────────────────────────────
+*.log
+*.bak
+*.tmp

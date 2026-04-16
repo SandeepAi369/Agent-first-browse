@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 import json
 import os
 from typing import Any, TypeVar
@@ -12,6 +13,9 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from app.browser_promoter.database import lock_target_community
 from app.browser_promoter.state import AgentState, HighLevelCommand
+from app.logger import get_logger
+
+logger = get_logger(__name__)
 
 
 class ContextAnalysisOutput(BaseModel):
@@ -84,7 +88,6 @@ class SupervisorInternalState(BaseModel):
 TModel = TypeVar("TModel", bound=BaseModel)
 
 _SUPERVISOR_LLM: ChatOpenAI | None = None
-_SUPERVISOR_SUBGRAPH: Any | None = None
 
 
 def _get_supervisor_llm() -> ChatOpenAI | None:
@@ -436,11 +439,11 @@ def build_supervisor_subgraph():
     return graph.compile()
 
 
+@functools.lru_cache(maxsize=1)
 def _get_supervisor_subgraph():
-    global _SUPERVISOR_SUBGRAPH
-    if _SUPERVISOR_SUBGRAPH is None:
-        _SUPERVISOR_SUBGRAPH = build_supervisor_subgraph()
-    return _SUPERVISOR_SUBGRAPH
+    """Lazily compile and cache the Supervisor subgraph singleton."""
+    logger.info("Compiling Supervisor subgraph (one-time)")
+    return build_supervisor_subgraph()
 
 
 def _fallback_high_level_command(main_state: AgentState) -> HighLevelCommand:
