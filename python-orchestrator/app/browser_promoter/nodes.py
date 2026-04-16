@@ -9,6 +9,7 @@ from typing import Any, Literal
 from playwright.async_api import Page
 
 from app.browser_promoter.browser_runtime import BrowserRuntime
+from app.browser_promoter.database import count_locked_target_communities
 from app.browser_promoter.state import AgentState, BrowserAction, InteractiveRegion, ScreenshotFrame, WorkerFeedback
 from app.browser_promoter.supervisor_subgraph import run_supervisor_subgraph
 from app.browser_promoter.worker_planner import WorkerVisionPlanner
@@ -118,10 +119,30 @@ def router_node(state: AgentState) -> dict[str, Any]:
     """Minimal router node; decisions are made in router_function."""
     print("[router_node] evaluating routing flags")
     next_cycle = state.cycle_count + 1
-    still_allowed = state.should_continue and next_cycle < state.max_cycles
+    hard_max = min(state.max_cycles, 15)
+    still_allowed = state.should_continue and next_cycle < hard_max
+    _print_terminal_dashboard(state=state, cycle_value=next_cycle, hard_max=hard_max)
+
+    ephemeral = dict(state.ephemeral)
+    if _has_pending_manual_intervention_action(state):
+        _pause_for_manual_intervention(state=state, cycle_value=next_cycle, hard_max=hard_max)
+        remaining_actions = list(state.worker_action_queue)
+        if remaining_actions and remaining_actions[0].action == "manual_intervention_required":
+            remaining_actions.pop(0)
+
+        ephemeral["manual_intervention_just_completed"] = True
+        return {
+            "cycle_count": next_cycle,
+            "should_continue": still_allowed,
+            "worker_action_queue": remaining_actions,
+            "ephemeral": ephemeral,
+        }
+
+    ephemeral.pop("manual_intervention_just_completed", None)
     return {
         "cycle_count": next_cycle,
         "should_continue": still_allowed,
+        "ephemeral": ephemeral,
     }
 
 
@@ -130,6 +151,9 @@ def router_function(state: AgentState) -> Literal["browser_controller", "supervi
     hard_max = min(state.max_cycles, 15)
     if state.routing.stop_requested:
         return "end"
+
+    if state.ephemeral.get("manual_intervention_just_completed"):
+        return "browser_controller"
 
     if not state.should_continue:
         return "end"
@@ -163,6 +187,68 @@ def _worker_has_valid_browser_action(state: AgentState) -> bool:
     except Exception:
         return False
     return True
+
+
+def _has_pending_manual_intervention_action(state: AgentState) -> bool:
+    if not state.worker_action_queue:
+        return False
+    return state.worker_action_queue[0].action == "manual_intervention_required"
+
+
+def _pause_for_manual_intervention(state: AgentState, cycle_value: int, hard_max: int) -> None:
+    """Pause graph execution so a human can complete login/captcha manually."""
+    platform = _resolve_platform_name(state).upper()
+    print("\n" + "=" * 86)
+    print(
+        f"HITL PAUSE | Cycle {cycle_value}/{hard_max} | Platform: {platform} | "
+        "Action: Manual Intervention Required"
+    )
+    print("Reason: Login wall, Gmail auth, captcha, or MFA requires manual completion.")
+    print("Please complete the required manual browser actions, then press ENTER to resume.")
+    print("=" * 86)
+    try:
+        input("[HITL] Press ENTER when manual intervention is complete: ")
+    except EOFError:
+        print("[HITL] No interactive stdin detected; continuing without blocking.")
+
+
+def _print_terminal_dashboard(state: AgentState, cycle_value: int, hard_max: int) -> None:
+    """Render concise real-time orchestration status in terminal."""
+    mode = "Recon" if _is_recon_mode(state) else "Engage"
+    platform = _resolve_platform_name(state).capitalize()
+    action = _resolve_dashboard_action(state, mode)
+
+    try:
+        locked_targets = count_locked_target_communities()
+    except Exception:
+        locked_targets = 0
+
+    print(
+        f"Cycle {cycle_value}/{hard_max} | Mode: {mode} | Platform: {platform} | "
+        f"Action: {action} | Locked Targets: {locked_targets}"
+    )
+
+
+def _is_recon_mode(state: AgentState) -> bool:
+    if state.high_level_command is None:
+        return False
+    action_type = state.high_level_command.action_type.lower()
+    return action_type in {"reconnaissance", "recon", "discovery", "community_recon"}
+
+
+def _resolve_dashboard_action(state: AgentState, mode: str) -> str:
+    if state.worker_action_queue:
+        if state.worker_action_queue[0].action == "manual_intervention_required":
+            return "Manual Pause"
+        return state.worker_action_queue[0].action.replace("_", " ").title()
+
+    if mode == "Recon":
+        return "Searching"
+
+    if state.high_level_command is not None:
+        return state.high_level_command.action_type.replace("_", " ").title()
+
+    return "Planning"
 
 
 def _get_worker_planner() -> WorkerVisionPlanner:
@@ -242,6 +328,21 @@ def _normalize_url(url: str) -> str:
     if re.match(r"^https?://", url):
         return url
     return f"https://{url}"
+
+
+def _resolve_platform_name(state: AgentState) -> str:
+    """Resolve stable platform key for persistent browser session storage."""
+    if state.campaign.target_platforms:
+        return state.campaign.target_platforms[0]
+
+    url = state.current_url.lower()
+    if "reddit.com" in url:
+        return "reddit"
+    if "x.com" in url or "twitter.com" in url:
+        return "x"
+    if "github.com" in url:
+        return "github"
+    return "default"
 
 
 def _trim_accessibility_tree(tree: dict[str, Any] | None, max_nodes: int = 250) -> dict[str, Any]:
@@ -380,8 +481,20 @@ async def _capture_snapshot(page: Page) -> ScreenshotFrame:
     )
 
 
-async def _execute_worker_action(page: Page, action: BrowserAction) -> dict[str, Any]:
+async def _execute_worker_action(
+    page: Page,
+    action: BrowserAction,
+    *,
+    dry_run_mode: bool,
+) -> dict[str, Any]:
     """Execute a single worker action on the persistent page."""
+    if action.action == "manual_intervention_required":
+        await page.wait_for_timeout(200)
+        return {
+            "action": "manual_intervention_required",
+            "message": "Manual intervention acknowledged; refreshing post-intervention state.",
+        }
+
     if action.action == "goto":
         if not action.url:
             raise ValueError("goto action requires url")
@@ -398,6 +511,17 @@ async def _execute_worker_action(page: Page, action: BrowserAction) -> dict[str,
         return {"action": "scroll", "delta_y": action.delta_y}
 
     if action.action == "click":
+        if dry_run_mode and _is_destructive_action(action):
+            await _preview_action_target(page, action)
+            return {
+                "action": "click",
+                "dry_run_mode": True,
+                "dry_run_skip_reason": "Potentially destructive click (post/reply/submit) skipped.",
+                "selector": action.selector,
+                "x": action.x,
+                "y": action.y,
+            }
+
         if action.selector:
             await page.click(action.selector, timeout=action.timeout_ms)
             return {"action": "click", "selector": action.selector}
@@ -407,6 +531,16 @@ async def _execute_worker_action(page: Page, action: BrowserAction) -> dict[str,
         raise ValueError("click action requires selector or x/y coordinates")
 
     if action.action == "type":
+        if dry_run_mode and _is_destructive_action(action):
+            await _preview_action_target(page, action)
+            return {
+                "action": "type",
+                "dry_run_mode": True,
+                "dry_run_skip_reason": "Potentially destructive text submission skipped.",
+                "selector": action.selector,
+                "typed_characters": len(action.text),
+            }
+
         if not action.selector:
             raise ValueError("type action requires selector")
         if action.clear_before_type:
@@ -429,6 +563,74 @@ async def _execute_worker_action(page: Page, action: BrowserAction) -> dict[str,
     raise ValueError(f"Unsupported action: {action.action}")
 
 
+def _is_destructive_action(action: BrowserAction) -> bool:
+    """Detect likely post/reply submission actions that should be dry-run protected."""
+    if action.action not in {"click", "type"}:
+        return False
+
+    haystack = " ".join([action.selector, action.text, action.url]).lower()
+    destructive_keywords = (
+        "post",
+        "reply",
+        "comment",
+        "submit",
+        "send",
+        "tweet",
+        "publish",
+        "create",
+        "share",
+        "commit",
+        "merge",
+        "new discussion",
+    )
+    return any(keyword in haystack for keyword in destructive_keywords)
+
+
+async def _preview_action_target(page: Page, action: BrowserAction) -> None:
+    """Highlight intended target in dry-run mode instead of executing destructive action."""
+    if action.selector:
+        await page.evaluate(
+            """
+(selector) => {
+  const element = document.querySelector(selector);
+  if (!element) return false;
+
+  element.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
+  const previous = element.style.outline;
+  element.style.outline = '3px solid #ff9800';
+  setTimeout(() => { element.style.outline = previous; }, 1600);
+  return true;
+}
+""",
+            action.selector,
+        )
+        await page.wait_for_timeout(400)
+        return
+
+    if action.x is not None and action.y is not None:
+        await page.evaluate(
+            """
+([x, y]) => {
+  const marker = document.createElement('div');
+  marker.style.position = 'absolute';
+  marker.style.left = `${x - 8}px`;
+  marker.style.top = `${y - 8}px`;
+  marker.style.width = '16px';
+  marker.style.height = '16px';
+  marker.style.borderRadius = '50%';
+  marker.style.border = '2px solid #ff9800';
+  marker.style.background = 'rgba(255, 152, 0, 0.25)';
+  marker.style.zIndex = '2147483647';
+  marker.id = '__agent_dry_run_marker';
+  document.body.appendChild(marker);
+  setTimeout(() => marker.remove(), 1600);
+}
+""",
+            [action.x, action.y],
+        )
+        await page.wait_for_timeout(400)
+
+
 async def browser_controller_node(state: AgentState) -> dict[str, Any]:
     """
     Execute queued worker browser actions on a persistent stealth Playwright page.
@@ -436,11 +638,43 @@ async def browser_controller_node(state: AgentState) -> dict[str, Any]:
     This node updates compressed screenshot payload, accessibility metadata,
     and interactive bounding boxes each cycle.
     """
-    page = await BrowserRuntime.ensure_page()
-
     pending_actions = list(state.worker_action_queue)
     screenshot_history = list(state.screenshot_history)
     feedback_history = list(state.worker_feedback)
+
+    try:
+        page = await BrowserRuntime.ensure_page(
+            browser_config=state.browser_config,
+            platform_name=_resolve_platform_name(state),
+            thread_id=state.thread_id,
+        )
+    except Exception as exc:
+        feedback = WorkerFeedback(
+            command_id="browser_runtime",
+            status="failed",
+            message="Browser runtime initialization failed.",
+            details={
+                "error_type": type(exc).__name__,
+                "error_message": str(exc),
+                "mode": state.browser_config.mode.value,
+            },
+        )
+        feedback_history = [*feedback_history, feedback][-state.feedback_window_size :]
+
+        updated_routing = state.routing.model_copy(
+            update={
+                "next_hop": "router",
+                "requires_browser_action": False,
+                "requires_supervisor_review": True,
+            }
+        )
+        return {
+            "worker_action_queue": [],
+            "worker_feedback": feedback_history,
+            "worker_last_confused": True,
+            "worker_last_confusion_reason": "Browser runtime initialization failed.",
+            "routing": updated_routing,
+        }
 
     if not pending_actions:
         snapshot = await _capture_snapshot(page)
@@ -477,7 +711,11 @@ async def browser_controller_node(state: AgentState) -> dict[str, Any]:
     details: dict[str, Any]
 
     try:
-        details = await _execute_worker_action(page, action)
+        details = await _execute_worker_action(
+            page,
+            action,
+            dry_run_mode=state.dry_run_mode,
+        )
     except Exception as exc:
         status = "failed"
         details = {
