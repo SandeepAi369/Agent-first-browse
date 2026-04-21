@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import functools
 import json
-import os
 from typing import Any, TypeVar
 from urllib.parse import urlparse
 
@@ -11,8 +10,11 @@ from langchain_openai import ChatOpenAI
 from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.call_pacing import AsyncGapLimiter
 from app.browser_promoter.database import lock_target_community
 from app.browser_promoter.state import AgentState, HighLevelCommand
+from app import config
+from app.observability import build_llm_config
 from app.logger import get_logger
 
 logger = get_logger(__name__)
@@ -39,6 +41,18 @@ class StrategyPlanOutput(BaseModel):
     reconnaissance_query: str = ""
     community_niche: str = ""
     candidate_community_url: str = ""
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class StrategyChallengeOutput(BaseModel):
+    """Critical discussion output that challenges and improves strategy choices."""
+
+    revised_action_type: str = ""
+    revised_target_description: str = ""
+    revised_behavior_plan: str = ""
+    confidence_delta: float = Field(default=0.0, ge=-0.35, le=0.35)
+    discussion_points: list[str] = Field(default_factory=list)
 
     model_config = ConfigDict(extra="forbid")
 
@@ -78,6 +92,7 @@ class SupervisorInternalState(BaseModel):
 
     context_analysis: ContextAnalysisOutput | None = None
     strategy_plan: StrategyPlanOutput | None = None
+    strategy_challenge: StrategyChallengeOutput | None = None
     copy_draft: CopyDraftOutput | None = None
     risk_assessment: RiskStealthOutput | None = None
     final_command: HighLevelCommand | None = None
@@ -87,26 +102,89 @@ class SupervisorInternalState(BaseModel):
 
 TModel = TypeVar("TModel", bound=BaseModel)
 
-_SUPERVISOR_LLM: ChatOpenAI | None = None
+_SUPERVISOR_LLM_CLIENTS: list[Any] | None = None
+_SUPERVISOR_LLM_CURSOR: int = 0
+_SUPERVISOR_LLM_GAP = AsyncGapLimiter(config.SUPERVISOR_LLM_MIN_GAP_SECONDS)
 
 
-def _get_supervisor_llm() -> ChatOpenAI | None:
-    """Create one shared big-model client for Supervisor sub-agents."""
-    global _SUPERVISOR_LLM
-    if _SUPERVISOR_LLM is not None:
-        return _SUPERVISOR_LLM
+def _is_google_model_name(model_name: str) -> bool:
+    lowered = model_name.strip().lower()
+    return "gemini" in lowered or "gemma" in lowered
 
-    api_key = os.getenv("SUPERVISOR_MODEL_API_KEY") or os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        return None
 
-    _SUPERVISOR_LLM = ChatOpenAI(
-        model=os.getenv("SUPERVISOR_BIG_MODEL", "gpt-4o"),
-        api_key=api_key,
-        temperature=0.2,
-        timeout=40,
-    )
-    return _SUPERVISOR_LLM
+def _get_supervisor_llm_clients() -> list[Any]:
+    """Create shared big-model clients with API-key failover."""
+    global _SUPERVISOR_LLM_CLIENTS
+    if _SUPERVISOR_LLM_CLIENTS is not None:
+        return _SUPERVISOR_LLM_CLIENTS
+
+    model_name = config.SUPERVISOR_LLM_MODEL.strip()
+    wants_google_model = _is_google_model_name(model_name)
+
+    google_keys = config.GOOGLE_API_KEYS
+
+    if wants_google_model and google_keys:
+        try:
+            from langchain_google_genai import ChatGoogleGenerativeAI
+
+            if model_name.startswith("models/"):
+                model_name = model_name[len("models/"):]
+
+            _SUPERVISOR_LLM_CLIENTS = [
+                ChatGoogleGenerativeAI(
+                    model=model_name,
+                    google_api_key=google_key,
+                    temperature=0.2,
+                    timeout=40,
+                )
+                for google_key in google_keys
+            ]
+            return _SUPERVISOR_LLM_CLIENTS
+        except Exception as exc:
+            logger.warning("Supervisor Google model bootstrap failed: %s", exc)
+
+    api_keys = config.SUPERVISOR_MODEL_API_KEYS or config.OPENAI_API_KEYS
+    if not api_keys:
+        logger.warning("Supervisor model is not configured: missing API keys for Google and OpenAI paths.")
+        _SUPERVISOR_LLM_CLIENTS = []
+        return _SUPERVISOR_LLM_CLIENTS
+
+    resolved_model_name = model_name
+    if wants_google_model:
+        resolved_model_name = config.SUPERVISOR_FALLBACK_MODEL or "gpt-4.1-mini"
+        logger.warning(
+            "Supervisor model '%s' looks Google-specific but GOOGLE_API_KEY is unavailable. "
+            "Falling back to '%s'.",
+            model_name,
+            resolved_model_name,
+        )
+
+    base_url = config.OPENAI_BASE_URL.strip() or None
+    _SUPERVISOR_LLM_CLIENTS = [
+        ChatOpenAI(
+            model=resolved_model_name,
+            api_key=api_key,
+            base_url=base_url,
+            temperature=0.2,
+            timeout=40,
+        )
+        for api_key in api_keys
+    ]
+    return _SUPERVISOR_LLM_CLIENTS
+
+
+def _ordered_supervisor_llms(clients: list[Any]) -> list[tuple[int, Any]]:
+    global _SUPERVISOR_LLM_CURSOR
+    if not clients:
+        return []
+
+    total = len(clients)
+    start = _SUPERVISOR_LLM_CURSOR % total
+    ordered: list[tuple[int, Any]] = []
+    for offset in range(total):
+        idx = (start + offset) % total
+        ordered.append((idx, clients[idx]))
+    return ordered
 
 
 async def _invoke_structured(
@@ -115,25 +193,108 @@ async def _invoke_structured(
     system_prompt: str,
     payload: dict[str, Any],
     fallback: TModel,
+    run_name: str,
+    trace_metadata: dict[str, Any] | None = None,
 ) -> TModel:
     """Run a structured LLM chain with resilient fallback behavior."""
-    llm = _get_supervisor_llm()
-    if llm is None:
+    clients = _get_supervisor_llm_clients()
+    if not clients:
         return fallback
 
-    chain = llm.with_structured_output(schema)
+    global _SUPERVISOR_LLM_CURSOR
+
     messages = [
         SystemMessage(content=system_prompt),
         HumanMessage(content=json.dumps(payload, ensure_ascii=True)),
     ]
+    invoke_config = build_llm_config(
+        run_name=run_name,
+        tags=["supervisor", schema.__name__],
+        metadata=trace_metadata,
+    )
 
+    wait_seconds = await _SUPERVISOR_LLM_GAP.wait_turn()
+    if wait_seconds > 0.0:
+        logger.info("Supervisor LLM pacing wait applied: %.2fs (%s)", wait_seconds, run_name)
+
+    total_clients = len(clients)
+    last_exc: Exception | None = None
+    for idx, llm in _ordered_supervisor_llms(clients):
+        try:
+            chain = llm.with_structured_output(schema)
+            raw = await chain.ainvoke(messages, config=invoke_config)
+            _SUPERVISOR_LLM_CURSOR = idx
+            if isinstance(raw, BaseModel):
+                return schema.model_validate(raw.model_dump(mode="json"))
+            return schema.model_validate(raw)
+        except Exception as exc:
+            logger.warning(
+                "Structured supervisor invoke failed (%s) on key %d/%d: %s",
+                run_name,
+                idx + 1,
+                total_clients,
+                exc,
+            )
+            try:
+                fallback_messages = [
+                    SystemMessage(content=system_prompt + f"\n\nCRITICAL INSTRUCTION: You MUST format your response as a pure JSON object string conforming exactly to this schema:\n{json.dumps(schema.model_json_schema())}"),
+                    HumanMessage(content=json.dumps(payload, ensure_ascii=True)),
+                ]
+                raw = await llm.ainvoke(fallback_messages, config=invoke_config)
+                raw_text = _extract_response_text(raw)
+                parsed = _extract_json_payload(raw_text)
+                _SUPERVISOR_LLM_CURSOR = idx
+                return schema.model_validate(parsed)
+            except Exception as raw_exc:
+                last_exc = raw_exc
+                logger.warning(
+                    "Supervisor raw-JSON fallback failed (%s) on key %d/%d: %s",
+                    run_name,
+                    idx + 1,
+                    total_clients,
+                    raw_exc,
+                )
+
+    logger.error("SUPERVISOR LLM FAILED ALL KEYS (%s): %s", run_name, last_exc)
+    return fallback
+
+
+def _extract_response_text(raw_response: Any) -> str:
+    content = getattr(raw_response, "content", raw_response)
+    if isinstance(content, str):
+        return content
+
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+                continue
+            if isinstance(item, dict):
+                text = item.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+        return "\n".join(parts)
+
+    return str(content)
+
+
+def _extract_json_payload(text: str) -> dict[str, Any]:
+    candidate = text.strip()
+    if "```json" in candidate:
+        candidate = candidate.split("```json", maxsplit=1)[1].split("```", maxsplit=1)[0]
+    elif "```" in candidate:
+        candidate = candidate.split("```", maxsplit=1)[1].split("```", maxsplit=1)[0]
+
+    candidate = candidate.strip()
     try:
-        raw = await chain.ainvoke(messages)
-        if isinstance(raw, BaseModel):
-            return schema.model_validate(raw.model_dump(mode="json"))
-        return schema.model_validate(raw)
-    except Exception:
-        return fallback
+        return json.loads(candidate)
+    except json.JSONDecodeError:
+        start = candidate.find("{")
+        end = candidate.rfind("}")
+        if start == -1 or end == -1 or end <= start:
+            raise
+        return json.loads(candidate[start : end + 1])
 
 
 def _infer_platform_hint(state: SupervisorInternalState) -> str:
@@ -177,6 +338,11 @@ async def context_analyzer_node(state: SupervisorInternalState) -> dict[str, Any
             },
         },
         fallback=fallback,
+        run_name="supervisor.context_analyzer",
+        trace_metadata={
+            "platform_hint": platform,
+            "current_url": state.current_url,
+        },
     )
     return {"context_analysis": result}
 
@@ -210,7 +376,8 @@ async def strategy_planner_node(state: SupervisorInternalState) -> dict[str, Any
             "You are Strategy Planner. Choose one next action_type and behavior plan. "
             "Supported action types include reconnaissance and engage. "
             "When discovery is needed, choose reconnaissance and provide a concrete recon query plus "
-            "candidate_community_url if visible. Prioritize stealth and organic behavior."
+            "candidate_community_url if visible. Prioritize stealth and organic behavior. "
+            "You MUST return a valid JSON object matching the requested schema exactly."
         ),
         payload={
             "objective": state.objective,
@@ -223,18 +390,65 @@ async def strategy_planner_node(state: SupervisorInternalState) -> dict[str, Any
             "target_platforms": state.target_platforms,
         },
         fallback=fallback,
+        run_name="supervisor.strategy_planner",
+        trace_metadata={
+            "current_url": state.current_url,
+            "worker_last_confused": state.worker_last_confused,
+        },
     )
     return {"strategy_plan": result}
 
 
-async def copywriter_node(state: SupervisorInternalState) -> dict[str, Any]:
-    """Sub-agent C: Draft short human-like copy when text is needed."""
+async def strategy_challenger_node(state: SupervisorInternalState) -> dict[str, Any]:
+    """Sub-agent B2: Challenge strategy and propose safer, higher-signal alternatives."""
     strategy = state.strategy_plan or StrategyPlanOutput(
-        action_type="engage",
-        target_description="Relevant target element",
-        behavior_plan="Act naturally.",
+        action_type="reconnaissance",
+        target_description="Most relevant active thread",
+        behavior_plan="Collect context before engagement.",
         base_confidence=0.5,
     )
+
+    fallback = StrategyChallengeOutput(
+        revised_action_type=strategy.action_type,
+        revised_target_description=strategy.target_description,
+        revised_behavior_plan=strategy.behavior_plan,
+        confidence_delta=0.0,
+        discussion_points=[
+            "Prefer one reversible action before any irreversible submission.",
+            "If signals conflict, gather one more observation cycle.",
+        ],
+    )
+
+    result = await _invoke_structured(
+        schema=StrategyChallengeOutput,
+        system_prompt=(
+            "You are Strategy Challenger. Critique the proposed strategy and improve it. "
+            "You may keep the same plan if it is already strong. "
+            "Return concrete discussion_points and confidence_delta adjustments."
+        ),
+        payload={
+            "objective": state.objective,
+            "current_url": state.current_url,
+            "scene_summary": state.current_scene_summary,
+            "strategy": strategy.model_dump(mode="json"),
+            "worker_confusion": {
+                "flag": state.worker_last_confused,
+                "reason": state.worker_last_confusion_reason,
+            },
+        },
+        fallback=fallback,
+        run_name="supervisor.strategy_challenger",
+        trace_metadata={
+            "current_url": state.current_url,
+            "action_type": strategy.action_type,
+        },
+    )
+    return {"strategy_challenge": result}
+
+
+async def copywriter_node(state: SupervisorInternalState) -> dict[str, Any]:
+    """Sub-agent C: Draft short human-like copy when text is needed."""
+    strategy = _resolve_effective_strategy(state)
 
     fallback_text: str | None = None
     if strategy.action_type.lower() in {"type", "comment", "reply", "post", "message", "engage"}:
@@ -256,18 +470,18 @@ async def copywriter_node(state: SupervisorInternalState) -> dict[str, Any]:
             "scene_summary": state.current_scene_summary,
         },
         fallback=fallback,
+        run_name="supervisor.copywriter",
+        trace_metadata={
+            "action_type": strategy.action_type,
+            "current_url": state.current_url,
+        },
     )
     return {"copy_draft": result}
 
 
 async def risk_stealth_assessor_node(state: SupervisorInternalState) -> dict[str, Any]:
     """Sub-agent D: Score anti-bot risk and propose stealth adjustments."""
-    strategy = state.strategy_plan or StrategyPlanOutput(
-        action_type="engage",
-        target_description="Relevant target element",
-        behavior_plan="Act naturally.",
-        base_confidence=0.5,
-    )
+    strategy = _resolve_effective_strategy(state)
 
     fallback = RiskStealthOutput(
         confidence=max(0.35, min(0.85, strategy.base_confidence)),
@@ -294,18 +508,19 @@ async def risk_stealth_assessor_node(state: SupervisorInternalState) -> dict[str
             "scene_summary": state.current_scene_summary,
         },
         fallback=fallback,
+        run_name="supervisor.risk_stealth_assessor",
+        trace_metadata={
+            "action_type": strategy.action_type,
+            "worker_last_confused": state.worker_last_confused,
+        },
     )
     return {"risk_assessment": result}
 
 
 async def final_merge_node(state: SupervisorInternalState) -> dict[str, Any]:
     """Merge all sub-agent outputs into the final HighLevelCommand."""
-    strategy = state.strategy_plan or StrategyPlanOutput(
-        action_type="engage",
-        target_description="Relevant target element",
-        behavior_plan="Act naturally with minimal interaction.",
-        base_confidence=0.45,
-    )
+    strategy = _resolve_effective_strategy(state)
+    challenge = state.strategy_challenge or StrategyChallengeOutput()
     copy = state.copy_draft or CopyDraftOutput(draft_text=None)
     risk = state.risk_assessment or RiskStealthOutput(
         confidence=0.45,
@@ -313,8 +528,17 @@ async def final_merge_node(state: SupervisorInternalState) -> dict[str, Any]:
         risk_summary="Fallback risk profile.",
     )
 
-    merged_confidence = max(0.0, min(1.0, (strategy.base_confidence + risk.confidence) / 2.0))
+    merged_confidence = max(
+        0.0,
+        min(1.0, ((strategy.base_confidence + risk.confidence) / 2.0) + challenge.confidence_delta),
+    )
     behavior_plan = _compose_behavior_plan(strategy=strategy, state=state)
+    if challenge.discussion_points:
+        behavior_plan = (
+            behavior_plan
+            + " Discussion notes: "
+            + " | ".join(point for point in challenge.discussion_points[:3] if point.strip())
+        )
 
     command = HighLevelCommand(
         action_type=strategy.action_type,
@@ -335,6 +559,27 @@ def _should_default_to_recon(state: SupervisorInternalState) -> bool:
     if state.worker_last_confused:
         return True
     return False
+
+
+def _resolve_effective_strategy(state: SupervisorInternalState) -> StrategyPlanOutput:
+    """Merge planner proposal with challenger revisions for stronger decision quality."""
+    base = state.strategy_plan or StrategyPlanOutput(
+        action_type="engage",
+        target_description="Relevant target element",
+        behavior_plan="Act naturally with minimal interaction.",
+        base_confidence=0.45,
+    )
+    challenge = state.strategy_challenge
+    if challenge is None:
+        return base
+
+    return base.model_copy(
+        update={
+            "action_type": challenge.revised_action_type.strip() or base.action_type,
+            "target_description": challenge.revised_target_description.strip() or base.target_description,
+            "behavior_plan": challenge.revised_behavior_plan.strip() or base.behavior_plan,
+        }
+    )
 
 
 def _is_recon_action(action_type: str) -> bool:
@@ -421,15 +666,17 @@ def build_supervisor_subgraph():
 
     graph.add_node("context_analyzer", context_analyzer_node)
     graph.add_node("strategy_planner", strategy_planner_node)
+    graph.add_node("strategy_challenger", strategy_challenger_node)
     graph.add_node("copywriter", copywriter_node)
     graph.add_node("risk_stealth_assessor", risk_stealth_assessor_node)
     graph.add_node("final_merge", final_merge_node)
 
     graph.add_edge(START, "context_analyzer")
     graph.add_edge("context_analyzer", "strategy_planner")
+    graph.add_edge("strategy_planner", "strategy_challenger")
 
-    graph.add_edge("strategy_planner", "copywriter")
-    graph.add_edge("strategy_planner", "risk_stealth_assessor")
+    graph.add_edge("strategy_challenger", "copywriter")
+    graph.add_edge("strategy_challenger", "risk_stealth_assessor")
 
     graph.add_edge("copywriter", "final_merge")
     graph.add_edge("risk_stealth_assessor", "final_merge")
@@ -475,7 +722,21 @@ async def run_supervisor_subgraph(main_state: AgentState) -> HighLevelCommand:
     )
 
     graph = _get_supervisor_subgraph()
-    result = await graph.ainvoke(internal_state.model_dump(mode="json"))
+    result = await graph.ainvoke(
+        internal_state.model_dump(mode="json"),
+        config=build_llm_config(
+            run_name="supervisor.subgraph",
+            tags=[
+                "supervisor",
+                main_state.campaign.campaign_id,
+            ],
+            metadata={
+                "thread_id": main_state.thread_id,
+                "cycle_count": main_state.cycle_count,
+                "current_url": main_state.current_url,
+            },
+        ),
+    )
     parsed = SupervisorInternalState.model_validate(result)
 
     if parsed.final_command is None:

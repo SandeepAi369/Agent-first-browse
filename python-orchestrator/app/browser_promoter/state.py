@@ -175,12 +175,14 @@ class AgentState(BaseModel):
     worker_last_confidence: float = Field(default=0.0, ge=0.0, le=1.0)
     worker_last_confused: bool = False
     worker_last_confusion_reason: str = ""
+    vision_calls: int = Field(default=0, ge=0)
 
     should_continue: bool = True
     cycle_count: int = Field(default=0, ge=0)
     max_cycles: int = Field(default=15, ge=1, le=1000)
     worker_confidence_threshold: float = Field(default=0.4, ge=0.0, le=1.0)
     dry_run_mode: bool = True
+    autonomous_continuation: bool = True
 
     routing: RoutingFlags = Field(default_factory=RoutingFlags)
     ephemeral: dict[str, Any] = Field(default_factory=dict)
