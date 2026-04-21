@@ -47,3 +47,10 @@ test-results/
 *.log
 *.bak
 *.tmp
+
+# ─── Windows venv ─────────────────────────────────────────
+.venv-windows/
+
+# ─── Test artifacts ───────────────────────────────────────
+live_test_screenshots/
+verification_screenshot.jpg
