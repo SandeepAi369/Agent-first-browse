@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from typing import Iterable
 
 from dotenv import load_dotenv
 
@@ -19,26 +20,139 @@ if _ENV_PATH.is_file():
     load_dotenv(_ENV_PATH)
 
 
+def _split_env_list(raw: str) -> list[str]:
+    """Split comma/semicolon-delimited env values into trimmed non-empty items."""
+    if not raw.strip():
+        return []
+    normalized = raw.replace(";", ",")
+    return [item.strip() for item in normalized.split(",") if item.strip()]
+
+
+def _merge_unique_keys(*groups: str | Iterable[str]) -> list[str]:
+    """Merge key groups while preserving order and removing duplicates."""
+    merged: list[str] = []
+    for group in groups:
+        items: list[str]
+        if isinstance(group, str):
+            items = [group]
+        else:
+            items = list(group)
+
+        for item in items:
+            candidate = item.strip()
+            if candidate and candidate not in merged:
+                merged.append(candidate)
+    return merged
+
+
 # ─── OpenAI / LLM Provider ───────────────────────────────────────────────────
 OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")
+OPENAI_BASE_URL: str = os.getenv("OPENAI_BASE_URL", "") or os.getenv("OPENAI_API_BASE", "")
+OPENAI_API_KEY_FALLBACKS: list[str] = _split_env_list(os.getenv("OPENAI_API_KEY_FALLBACKS", ""))
+OPENAI_API_KEYS: list[str] = _merge_unique_keys(OPENAI_API_KEY, OPENAI_API_KEY_FALLBACKS)
+
+# ─── Google LLM Provider (Gemma / Gemini) ───────────────────────────────────
+GOOGLE_API_KEY: str = os.getenv("GOOGLE_API_KEY", "") or os.getenv("GEMINI_API_KEY", "")
+GOOGLE_API_KEY_FALLBACKS: list[str] = _split_env_list(os.getenv("GOOGLE_API_KEY_FALLBACKS", ""))
+GEMINI_API_KEY_FALLBACKS: list[str] = _split_env_list(os.getenv("GEMINI_API_KEY_FALLBACKS", ""))
+GOOGLE_API_KEYS: list[str] = _merge_unique_keys(
+    GOOGLE_API_KEY,
+    GOOGLE_API_KEY_FALLBACKS,
+    GEMINI_API_KEY_FALLBACKS,
+)
 
 # ─── Worker Vision-Language Model ─────────────────────────────────────────────
 WORKER_VLM_API_KEY: str = os.getenv("WORKER_VLM_API_KEY", "") or OPENAI_API_KEY
-WORKER_VLM_MODEL: str = os.getenv("WORKER_VLM_MODEL", "gpt-4.1-mini")
+WORKER_VLM_API_KEY_FALLBACKS: list[str] = _split_env_list(os.getenv("WORKER_VLM_API_KEY_FALLBACKS", ""))
+WORKER_VLM_API_KEYS: list[str] = _merge_unique_keys(
+    WORKER_VLM_API_KEY,
+    WORKER_VLM_API_KEY_FALLBACKS,
+    OPENAI_API_KEYS,
+)
+WORKER_VLM_MODEL: str = os.getenv("WORKER_VLM_MODEL", "gemma-4-27b-it")
+WORKER_VLM_FALLBACK_MODEL: str = os.getenv("WORKER_VLM_FALLBACK_MODEL", "gemma-3-27b-it")
 
 # ─── Supervisor LLM ──────────────────────────────────────────────────────────
-SUPERVISOR_LLM_MODEL: str = os.getenv("SUPERVISOR_LLM_MODEL", "gpt-4.1-mini")
+SUPERVISOR_LLM_MODEL: str = os.getenv("SUPERVISOR_LLM_MODEL", "gemma-4-27b-it")
+SUPERVISOR_FALLBACK_MODEL: str = os.getenv("SUPERVISOR_FALLBACK_MODEL", "gpt-4.1-mini")
+SUPERVISOR_MODEL_API_KEY: str = os.getenv("SUPERVISOR_MODEL_API_KEY", "")
+SUPERVISOR_MODEL_API_KEY_FALLBACKS: list[str] = _split_env_list(
+    os.getenv("SUPERVISOR_MODEL_API_KEY_FALLBACKS", "")
+)
+SUPERVISOR_MODEL_API_KEYS: list[str] = _merge_unique_keys(
+    SUPERVISOR_MODEL_API_KEY,
+    SUPERVISOR_MODEL_API_KEY_FALLBACKS,
+    OPENAI_API_KEYS,
+)
 
 # ─── Browser Runtime ─────────────────────────────────────────────────────────
 BROWSER_MODE: str = os.getenv("BROWSER_MODE", "ISOLATED_SERVER")
 BROWSER_HEADLESS: bool = os.getenv("BROWSER_HEADLESS", "true").lower() in ("true", "1", "yes")
 LOCAL_CDP_ENDPOINT: str = os.getenv("LOCAL_CDP_ENDPOINT", "http://localhost:9222")
 REMOTE_WEBSOCKET_URL: str = os.getenv("REMOTE_WEBSOCKET_URL", "")
+LOCAL_BROWSER_AUTOSTART: bool = os.getenv("LOCAL_BROWSER_AUTOSTART", "true").lower() in (
+    "true",
+    "1",
+    "yes",
+)
+LOCAL_BROWSER_PREFERENCE: str = os.getenv("LOCAL_BROWSER_PREFERENCE", "edge").strip().lower()
+LOCAL_BROWSER_STARTUP_TIMEOUT_SECONDS: float = float(
+    os.getenv("LOCAL_BROWSER_STARTUP_TIMEOUT_SECONDS", "18")
+)
+LOCAL_BROWSER_FALLBACK_TO_ISOLATED: bool = os.getenv("LOCAL_BROWSER_FALLBACK_TO_ISOLATED", "true").lower() in (
+    "true",
+    "1",
+    "yes",
+)
+FORCE_VISIBLE_LOCAL_BROWSER: bool = os.getenv("FORCE_VISIBLE_LOCAL_BROWSER", "true").lower() in (
+    "true",
+    "1",
+    "yes",
+)
+
+# ─── Human-Like Action Pacing ────────────────────────────────────────────────
+HUMAN_ACTION_DELAY_MIN_SECONDS: float = float(os.getenv("HUMAN_ACTION_DELAY_MIN_SECONDS", "1.4"))
+HUMAN_ACTION_DELAY_MAX_SECONDS: float = float(os.getenv("HUMAN_ACTION_DELAY_MAX_SECONDS", "3.2"))
 
 # ─── Agent Safety ─────────────────────────────────────────────────────────────
 DRY_RUN_MODE: bool = os.getenv("DRY_RUN_MODE", "true").lower() in ("true", "1", "yes")
+AUTONOMOUS_CONTINUATION: bool = os.getenv("AUTONOMOUS_CONTINUATION", "true").lower() in (
+    "true",
+    "1",
+    "yes",
+)
 MAX_CYCLES: int = int(os.getenv("MAX_CYCLES", "15"))
 WORKER_CONFIDENCE_THRESHOLD: float = float(os.getenv("WORKER_CONFIDENCE_THRESHOLD", "0.4"))
+PERSISTENT_THREAD_ID: str = os.getenv("PERSISTENT_THREAD_ID", "").strip()
+
+# ─── LLM API Pacing (to reduce provider limit spikes) ───────────────────────
+WORKER_LLM_MIN_GAP_SECONDS: float = float(os.getenv("WORKER_LLM_MIN_GAP_SECONDS", "2.0"))
+SUPERVISOR_LLM_MIN_GAP_SECONDS: float = float(os.getenv("SUPERVISOR_LLM_MIN_GAP_SECONDS", "2.5"))
+
+# ─── Zero-Token Executor Fallback Models ─────────────────────────────────────
+DOM_SELECTOR_ENABLED: bool = os.getenv("DOM_SELECTOR_ENABLED", "true").lower() in (
+    "true",
+    "1",
+    "yes",
+)
+DOM_SELECTOR_MODEL: str = os.getenv("DOM_SELECTOR_MODEL", "gemma-3-12b-it")
+DOM_SELECTOR_FALLBACK_MODEL: str = os.getenv("DOM_SELECTOR_FALLBACK_MODEL", "gpt-4.1-mini")
+DOM_SELECTOR_MAX_CANDIDATES: int = int(os.getenv("DOM_SELECTOR_MAX_CANDIDATES", "72"))
+VISION_FALLBACK_ENABLED: bool = os.getenv("VISION_FALLBACK_ENABLED", "true").lower() in (
+    "true",
+    "1",
+    "yes",
+)
+
+# ─── LangSmith / Tracing ─────────────────────────────────────────────────────
+LANGCHAIN_TRACING_V2: bool = os.getenv("LANGCHAIN_TRACING_V2", "true").lower() in (
+    "true",
+    "1",
+    "yes",
+)
+LANGCHAIN_API_KEY: str = os.getenv("LANGCHAIN_API_KEY", "")
+LANGCHAIN_PROJECT: str = os.getenv("LANGCHAIN_PROJECT", "agent-first-ide")
+LANGCHAIN_ENDPOINT: str = os.getenv("LANGCHAIN_ENDPOINT", "")
 
 # ─── Persistence ──────────────────────────────────────────────────────────────
 PERSISTENCE_DIR: Path = _PROJECT_ROOT / "persistence"

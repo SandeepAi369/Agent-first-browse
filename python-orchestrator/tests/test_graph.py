@@ -39,6 +39,7 @@ class TestBuildSupervisorSubgraph:
         node_names = set(subgraph.get_graph().nodes.keys())
         assert "context_analyzer" in node_names
         assert "strategy_planner" in node_names
+        assert "strategy_challenger" in node_names
         assert "copywriter" in node_names
         assert "risk_stealth_assessor" in node_names
         assert "final_merge" in node_names
