@@ -11,7 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from playwright.async_api import Page
 
 from app import config
-from app.browser_promoter.cdp_human_behavior import CDPHumanBehavior
+from app.browser_promoter.playwright_human_input import PlaywrightHumanInput
 from app.browser_promoter.shadow_dom_piercer import TargetPoint, locate_target_point
 from app.browser_promoter.state import BrowserAction, InteractiveRegion
 from app.browser_promoter.worker_planner import WorkerDecision, WorkerVisionPlanner
@@ -193,10 +193,20 @@ class LowTokenDOMSelector:
 
 
 class ZeroTokenActionExecutor:
-    """Module-4 executor: A=selector, B=AI text DOM, C=vision fallback."""
+    """Module-4 executor: A=selector, B=AI text DOM, C=vision fallback.
+
+    Uses PlaywrightHumanInput for all browser interactions.  This driver
+    communicates directly with the browser engine via Playwright's native
+    API — no OS-level window focus required, no PowerShell subprocess.
+    """
 
     def __init__(self) -> None:
-        self._human = CDPHumanBehavior()
+        self._input = PlaywrightHumanInput(
+            typing_delay_min_ms=config.HUMAN_TYPING_DELAY_MIN_MS,
+            typing_delay_max_ms=config.HUMAN_TYPING_DELAY_MAX_MS,
+            enable_bezier_movement=True,
+            enable_typo_simulation=True,
+        )
         self._dom_selector = LowTokenDOMSelector()
         self._vision = WorkerVisionPlanner()
 
@@ -306,20 +316,18 @@ class ZeroTokenActionExecutor:
         target: TargetPoint,
     ) -> dict[str, Any]:
         if action.action == "click":
-            await self._human.human_click(page, x=target.x, y=target.y)
-            return {
-                "action": "click",
-                "x": target.x,
-                "y": target.y,
+            result = await self._input.click(page, x=target.x, y=target.y)
+            result.update({
                 "target_method": target.method,
                 "selector": target.selector_used,
-            }
+            })
+            return result
 
         if action.action == "type":
-            await self._human.human_click(page, x=target.x, y=target.y)
+            await self._input.click(page, x=target.x, y=target.y)
             if action.clear_before_type:
-                await _clear_with_cdp_shortcut(page)
-            typed = await self._human.human_type(page, action.text)
+                await self._input.clear_field(page)
+            typed = await self._input.type_text(page, action.text)
             return {
                 "action": "type",
                 "x": target.x,
@@ -359,7 +367,7 @@ class ZeroTokenActionExecutor:
             return {"action": "screenshot"}
 
         if action.action == "scroll":
-            physics = await self._human.human_scroll(page, action.delta_y)
+            physics = await self._input.scroll(page, action.delta_y)
             return {"action": "scroll", "physics": physics}
 
         raise ValueError(f"Unsupported non-targeted action: {action.action}")
@@ -504,47 +512,9 @@ async def _extract_dom_candidates(page: Page, max_candidates: int) -> list[dict[
     )
 
 
-async def _clear_with_cdp_shortcut(page: Page) -> None:
-    session = await page.context.new_cdp_session(page)
-    await session.send(
-        "Input.dispatchKeyEvent",
-        {
-            "type": "keyDown",
-            "key": "a",
-            "code": "KeyA",
-            "windowsVirtualKeyCode": 65,
-            "modifiers": 2,
-        },
-    )
-    await session.send(
-        "Input.dispatchKeyEvent",
-        {
-            "type": "keyUp",
-            "key": "a",
-            "code": "KeyA",
-            "windowsVirtualKeyCode": 65,
-            "modifiers": 2,
-        },
-    )
-
-    await session.send(
-        "Input.dispatchKeyEvent",
-        {
-            "type": "keyDown",
-            "key": "Backspace",
-            "code": "Backspace",
-            "windowsVirtualKeyCode": 8,
-        },
-    )
-    await session.send(
-        "Input.dispatchKeyEvent",
-        {
-            "type": "keyUp",
-            "key": "Backspace",
-            "code": "Backspace",
-            "windowsVirtualKeyCode": 8,
-        },
-    )
+# NOTE: _clear_with_cdp_shortcut has been removed.
+# Field clearing is now handled by PhysicalInputDriver.physical_clear_field()
+# which sends real OS-level Ctrl+A → Backspace via PowerShell.
 
 
 def _extract_response_text(raw_response: Any) -> str:

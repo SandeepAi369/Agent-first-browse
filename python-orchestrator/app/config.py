@@ -154,5 +154,19 @@ LANGCHAIN_API_KEY: str = os.getenv("LANGCHAIN_API_KEY", "")
 LANGCHAIN_PROJECT: str = os.getenv("LANGCHAIN_PROJECT", "agent-first-ide")
 LANGCHAIN_ENDPOINT: str = os.getenv("LANGCHAIN_ENDPOINT", "")
 
+# ─── Input Driver ─────────────────────────────────────────────────────────────
+# "playwright" = Playwright native API (recommended, no OS focus needed)
+# "physical"   = Legacy WSL → PowerShell → user32.dll (deprecated)
+INPUT_DRIVER: str = os.getenv("INPUT_DRIVER", "playwright").strip().lower()
+
+# ─── Human Typing Delays (Playwright driver) ─────────────────────────────────
+HUMAN_TYPING_DELAY_MIN_MS: int = int(os.getenv("HUMAN_TYPING_DELAY_MIN_MS", "28"))
+HUMAN_TYPING_DELAY_MAX_MS: int = int(os.getenv("HUMAN_TYPING_DELAY_MAX_MS", "115"))
+
+# ─── Physical Input Driver (DEPRECATED — WSL → Windows OS-level input) ───────
+# Retained for backward compatibility. Set INPUT_DRIVER=physical to use.
+PHYSICAL_INPUT_CHROME_HEIGHT_PX: int = int(os.getenv("PHYSICAL_INPUT_CHROME_HEIGHT_PX", "0"))
+PHYSICAL_INPUT_DPI_MULTIPLIER: float = float(os.getenv("PHYSICAL_INPUT_DPI_MULTIPLIER", "1.0"))
+
 # ─── Persistence ──────────────────────────────────────────────────────────────
 PERSISTENCE_DIR: Path = _PROJECT_ROOT / "persistence"

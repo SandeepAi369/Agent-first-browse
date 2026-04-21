@@ -1,13 +1,24 @@
+"""Persistent Async Playwright browser runtime for Agent First IDE.
+
+Manages browser lifecycle, CDP connections, and session reuse.
+Supports both LOCAL_NATIVE_CDP (connect to user's real browser) and
+ISOLATED_SERVER (Playwright's own Chromium with persistent profiles).
+
+Designed to work natively on Windows, WSL, or Linux — with automatic
+environment detection and endpoint resolution.
+"""
+
 from __future__ import annotations
 
 import asyncio
 import os
-from pathlib import Path
+import platform
 import re
 import shutil
 import socket
 import subprocess
 import time
+from pathlib import Path
 from urllib.parse import urlparse
 
 from playwright.async_api import Browser, BrowserContext, Page, Playwright, async_playwright
@@ -47,13 +58,13 @@ class BrowserRuntime:
         """Return a live page for the requested browser mode and session."""
         normalized_platform = _normalize_platform_name(platform_name)
         normalized_thread = _normalize_thread_id(thread_id)
-        
+
         # Dual-Mode Override
         is_local = os.getenv("ENVIRONMENT", "local").lower() == "local"
         if is_local and browser_config.mode == BrowserMode.ISOLATED_SERVER:
             logger.info("ENVIRONMENT=local detected. Upgrading BrowserMode to LOCAL_NATIVE_CDP for authentic fingerprinting.")
             browser_config = browser_config.model_copy(update={"mode": BrowserMode.LOCAL_NATIVE_CDP})
-            
+
         requested_session_key = _build_session_key(
             browser_config=browser_config,
             platform_name=normalized_platform,
@@ -88,17 +99,12 @@ class BrowserRuntime:
                 cls._page = await cls._context.new_page()
 
             await cls._apply_stealth(cls._page)
-            
-            # FORCE FOCUS — this fixes 95% of CDP interaction freezes
-            await cls._page.bring_to_front()
-            
-            # Optional: Raw CDP window activation (extra insurance on Windows)
+
+            # Bring page to front (best-effort, not required for Playwright native API)
             try:
-                cdp_session = await cls._context.new_cdp_session(cls._page)
-                await cdp_session.send("Page.bringToFront")
-                await cdp_session.detach()
-            except Exception as exc:
-                logger.debug("Raw CDP bringToFront float failed (sandbox): %s", exc)
+                await cls._page.bring_to_front()
+            except Exception:
+                pass
 
             return cls._page
 
@@ -123,23 +129,20 @@ class BrowserRuntime:
 
         endpoint = _resolve_cdp_endpoint(browser_config)
         if browser_config.mode == BrowserMode.LOCAL_NATIVE_CDP:
-            # Strictly wait for CDP to become available
+            # Wait for CDP to become available
             endpoint = await _ensure_local_cdp_available(endpoint)
 
-        # Force connection and fail hard if unavailable (No fallback)
+        # Connect to existing browser via CDP
         browser = await playwright.chromium.connect_over_cdp(
             endpoint_url=endpoint,
             timeout=browser_config.cdp_timeout_ms,
         )
 
-        # IMPORTANT: Reuse the user's EXISTING browser context so all logged-in
+        # Reuse the user's EXISTING browser context so all logged-in
         # sessions (Reddit, Gmail, etc.) are available to the agent.
-        # The first context in browser.contexts is always the user's real one.
         if browser.contexts:
             context = browser.contexts[0]
         else:
-            # Fallback: create a new context only if none exist (shouldn't happen
-            # with a real browser, but just in case)
             context = await browser.new_context(
                 viewport={"width": 1440, "height": 900},
                 locale="en-US",
@@ -150,8 +153,7 @@ class BrowserRuntime:
             )
 
         await context.add_init_script(STEALTH_INIT_SCRIPT)
-        # Always create a NEW tab inside the real context so we don't hijack
-        # whatever tab the user is currently looking at
+        # Always create a NEW tab so we don't hijack whatever the user is looking at
         return context, browser, True
 
     @classmethod
@@ -229,6 +231,15 @@ def _persistent_profile_dir(*, platform_name: str, thread_id: str) -> Path:
     return base
 
 
+def _is_wsl() -> bool:
+    """Detect if we are running inside WSL."""
+    return "WSL_DISTRO_NAME" in os.environ
+
+
+def _is_windows_native() -> bool:
+    """Detect if we are running natively on Windows (not WSL)."""
+    return platform.system() == "Windows"
+
 
 def _get_wsl_host_ip() -> str | None:
     """Read the Windows Host IP automatically from WSL resolv.conf."""
@@ -240,6 +251,7 @@ def _get_wsl_host_ip() -> str | None:
     except Exception:
         pass
     return None
+
 
 def _resolve_cdp_endpoint(browser_config: BrowserConfig) -> str:
     """Resolve CDP endpoint according to selected BrowserMode."""
@@ -293,7 +305,7 @@ async def _ensure_local_cdp_available(endpoint: str) -> str:
         )
 
     launched = await asyncio.to_thread(
-        _launch_windows_browser_for_cdp,
+        _launch_browser_for_cdp,
         endpoint,
         config.LOCAL_BROWSER_PREFERENCE,
     )
@@ -334,7 +346,7 @@ def _is_cdp_reachable(endpoint: str) -> bool:
 
 
 def _candidate_cdp_endpoints(endpoint: str) -> list[str]:
-    """Generate CDP endpoint variants to handle WSL forwarding differences."""
+    """Generate CDP endpoint variants to handle different networking setups."""
     parsed = urlparse(endpoint)
     host = parsed.hostname or "localhost"
     scheme = parsed.scheme or "http"
@@ -344,11 +356,11 @@ def _candidate_cdp_endpoints(endpoint: str) -> list[str]:
     if host in {"localhost", "127.0.0.1"}:
         candidates.append(f"{scheme}://127.0.0.1:{port}")
         candidates.append(f"{scheme}://localhost:{port}")
-        if "WSL_DISTRO_NAME" in os.environ:
+        if _is_wsl():
             wsl_ip = _get_wsl_host_ip()
             if wsl_ip:
                 candidates.append(f"{scheme}://{wsl_ip}:{port}")
-    elif "WSL_DISTRO_NAME" in os.environ:
+    elif _is_wsl():
         candidates.append(f"{scheme}://localhost:{port}")
         candidates.append(f"{scheme}://127.0.0.1:{port}")
 
@@ -359,11 +371,60 @@ def _candidate_cdp_endpoints(endpoint: str) -> list[str]:
     return ordered
 
 
-def _launch_windows_browser_for_cdp(endpoint: str, preference: str) -> str | None:
-    """Best-effort launch of Windows Edge/Chrome from WSL for CDP control."""
-    if "WSL_DISTRO_NAME" not in os.environ:
-        return None
+def _launch_browser_for_cdp(endpoint: str, preference: str) -> str | None:
+    """Best-effort launch of Edge/Chrome for CDP control.
 
+    Detects whether we're running on Windows natively or inside WSL and
+    uses the appropriate launch strategy.
+    """
+    if _is_windows_native():
+        return _launch_browser_windows_native(endpoint, preference)
+    elif _is_wsl():
+        return _launch_browser_from_wsl(endpoint, preference)
+    return None
+
+
+def _launch_browser_windows_native(endpoint: str, preference: str) -> str | None:
+    """Launch browser directly on Windows using subprocess."""
+    parsed = urlparse(endpoint)
+    port = parsed.port or 9222
+    candidates = _windows_browser_candidates(preference)
+
+    for exe_path in candidates:
+        if os.path.exists(exe_path):
+            profile_dir = os.path.join(os.environ.get("USERPROFILE", ""), ".agent-first-ide-cdp")
+            os.makedirs(profile_dir, exist_ok=True)
+
+            args = [
+                exe_path,
+                f"--remote-debugging-port={port}",
+                "--remote-debugging-address=0.0.0.0",
+                "--no-first-run",
+                "--no-default-browser-check",
+                "--disable-blink-features=AutomationControlled",
+                "--disable-features=IsolateOrigins,SitePerProcess,OptimizeImageLoading",
+                "--password-store=basic",
+                "--start-maximized",
+                f"--user-data-dir={profile_dir}",
+            ]
+
+            try:
+                subprocess.Popen(
+                    args,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    creationflags=getattr(subprocess, "DETACHED_PROCESS", 0)
+                    | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
+                )
+                return exe_path
+            except Exception as exc:
+                logger.warning("Failed to launch %s: %s", exe_path, exc)
+
+    return None
+
+
+def _launch_browser_from_wsl(endpoint: str, preference: str) -> str | None:
+    """Launch Windows browser from WSL using powershell.exe."""
     if shutil.which("powershell.exe") is None:
         return None
 

@@ -3,10 +3,14 @@
 Agent First IDE — Campaign Launcher
 Uses Playwright's own Chromium with a persistent profile.
 Your logins are saved — log in once, it remembers forever.
+
+Supports running natively on Windows or from WSL.
 """
 
 from __future__ import annotations
 
+import os
+import platform
 import sys
 import asyncio
 from pathlib import Path
@@ -35,6 +39,15 @@ from app.logger import get_logger
 logger = get_logger("campaign_launcher")
 
 
+def _detect_environment() -> str:
+    """Detect runtime environment for diagnostic display."""
+    if platform.system() == "Windows":
+        return "Windows Native"
+    if "WSL_DISTRO_NAME" in os.environ:
+        return f"WSL ({os.environ['WSL_DISTRO_NAME']})"
+    return platform.system()
+
+
 def _resolve_browser_mode() -> BrowserMode:
     if config.FORCE_VISIBLE_LOCAL_BROWSER:
         return BrowserMode.LOCAL_NATIVE_CDP
@@ -49,9 +62,13 @@ def _resolve_browser_mode() -> BrowserMode:
 async def main():
     initialize_persistence_database()
 
+    env_name = _detect_environment()
+
     print("\n=======================================================")
     print("  AGENT FIRST IDE — CAMPAIGN STARTING")
     print("=======================================================")
+    print(f"  Runtime: {env_name}")
+    print(f"  Input:   {config.INPUT_DRIVER} (Playwright native API)")
     print(f"  Browser: {_resolve_browser_mode().value}")
     print(f"  Brain:   {config.SUPERVISOR_LLM_MODEL}")
     print(f"  Eyes:    {config.WORKER_VLM_MODEL}")
@@ -61,15 +78,14 @@ async def main():
     print("=======================================================\n")
 
     campaign = CampaignContext(
-        campaign_id="real-task-002",
-        campaign_name="Live Community Recon Task",
+        campaign_id="real-task-test-playwright",
+        campaign_name="Test Playwright Native Input Driver",
         objective=(
-            "Open Reddit and find one active software-engineering discussion where practical browser "
-            "automation or scraping tips are being requested. Read the top context and prepare a short, helpful "
-            "draft response without submitting it."
+            "Open https://github.com. Find the search bar in the header, type 'Playwright Input Test' "
+            "into it, and press Enter to search. Verify the search results page loads."
         ),
-        target_platforms=["reddit"],
-        session_id="recon-session-002",
+        target_platforms=["github"],
+        session_id="recon-session-test",
     )
 
     state = AgentState(

@@ -1,3 +1,25 @@
+"""Human-like browser interaction using Playwright's native API.
+
+Refactored from raw CDP ``Input.dispatchMouseEvent`` / ``Input.dispatchKeyEvent``
+to Playwright's high-level ``page.mouse`` and ``page.keyboard`` APIs.
+
+Previous CDP-based approach failed because:
+  - ``Input.dispatchMouseEvent`` requires OS-level window focus to be received
+  - WSL → Windows CDP connections lack this focus guarantee
+  - Raw CDP events bypass Playwright's actionability checks
+
+Current Playwright-based approach:
+  - ``page.mouse.move/click()`` — delivered through the rendering engine
+  - ``page.keyboard.type/press()`` — works without OS focus
+  - All actions include human-like timing (random delays, Bézier curves)
+
+.. note::
+    For production use, prefer ``PlaywrightHumanInput`` from
+    ``playwright_human_input.py`` which provides a cleaner API.
+    This module is retained for backward compatibility with code
+    that directly imports ``CDPHumanBehavior``.
+"""
+
 from __future__ import annotations
 
 import asyncio
@@ -5,7 +27,7 @@ import math
 import random
 from dataclasses import dataclass
 
-from playwright.async_api import CDPSession, Page
+from playwright.async_api import Page
 
 
 @dataclass(slots=True)
@@ -15,18 +37,26 @@ class PointerState:
 
 
 class CDPHumanBehavior:
-    """Physics-based human interaction using raw CDP input events."""
+    """Human-like interaction using Playwright's native mouse/keyboard API.
+
+    Provides Bézier curve mouse movement, natural typing delays, and
+    physics-based scrolling.  All interactions go through Playwright's
+    engine — no CDP session management or OS-level focus required.
+
+    .. deprecated::
+        Prefer ``PlaywrightHumanInput`` for new code.  This class is
+        maintained for backward compatibility.
+    """
 
     def __init__(self) -> None:
-        self._cdp_by_page: dict[int, CDPSession] = {}
         self._pointer_by_page: dict[int, PointerState] = {}
 
     async def human_scroll(self, page: Page, delta_y: float) -> dict[str, float]:
         """Scroll with accelerate-cruise-decelerate profile using cubic Bezier math.
 
         Includes slight overshoot and correction to mimic human wheel behavior.
+        Uses ``page.mouse.wheel()`` which works without OS focus.
         """
-        cdp = await self._cdp(page)
         pointer = self._pointer(page)
 
         if abs(delta_y) < 1.0:
@@ -43,41 +73,20 @@ class CDPHumanBehavior:
         for step in range(1, steps + 1):
             t0 = (step - 1) / steps
             t1 = step / steps
-            # Cubic Bezier ease for accelerate-cruise-decelerate shape.
             p0 = self._cubic_bezier(t0, 0.0, 0.02, 0.98, 1.0)
             p1 = self._cubic_bezier(t1, 0.0, 0.02, 0.98, 1.0)
             chunk = (p1 - p0) * overshoot_target * direction
             moved += chunk
 
-            await cdp.send(
-                "Input.dispatchMouseEvent",
-                {
-                    "type": "mouseWheel",
-                    "x": pointer.x,
-                    "y": pointer.y,
-                    "deltaX": random.uniform(-0.35, 0.35),
-                    "deltaY": chunk,
-                    "pointerType": "mouse",
-                },
-            )
+            await page.mouse.wheel(0, chunk)
             await asyncio.sleep(random.uniform(0.012, 0.026))
 
+        # Correction scroll (reverse the overshoot)
         correction_total = (target * direction) - moved
-        # Small corrective wheel ticks after overshoot.
         correction_steps = random.randint(3, 6)
         for _ in range(correction_steps):
             chunk = correction_total / correction_steps
-            await cdp.send(
-                "Input.dispatchMouseEvent",
-                {
-                    "type": "mouseWheel",
-                    "x": pointer.x,
-                    "y": pointer.y,
-                    "deltaX": random.uniform(-0.2, 0.2),
-                    "deltaY": chunk,
-                    "pointerType": "mouse",
-                },
-            )
+            await page.mouse.wheel(0, chunk)
             await asyncio.sleep(random.uniform(0.014, 0.03))
 
         return {
@@ -86,59 +95,45 @@ class CDPHumanBehavior:
         }
 
     async def human_click(self, page: Page, x: float, y: float) -> None:
-        """Move using curved trajectory and click via CDP mouse events."""
-        cdp = await self._cdp(page)
+        """Move using curved trajectory and click via Playwright mouse API.
+
+        Uses ``page.mouse.move()`` for Bézier movement and
+        ``page.mouse.click()`` for the actual click event.
+        """
         pointer = self._pointer(page)
 
         await self._move_pointer(page, x=x, y=y)
         pointer.x = x
         pointer.y = y
 
-        await cdp.send(
-            "Input.dispatchMouseEvent",
-            {
-                "type": "mousePressed",
-                "x": x,
-                "y": y,
-                "button": "left",
-                "clickCount": 1,
-            },
-        )
-        await asyncio.sleep(random.uniform(0.045, 0.11))
-        await cdp.send(
-            "Input.dispatchMouseEvent",
-            {
-                "type": "mouseReleased",
-                "x": x,
-                "y": y,
-                "button": "left",
-                "clickCount": 1,
-            },
-        )
+        await page.mouse.click(x, y)
 
     async def human_type(self, page: Page, text: str) -> dict[str, int]:
-        """Type with natural pauses and occasional correction via backspace."""
-        cdp = await self._cdp(page)
+        """Type with natural pauses and occasional correction via backspace.
+
+        Uses ``page.keyboard.type()`` and ``page.keyboard.press()``
+        which work without OS focus.
+        """
         typed = 0
         corrections = 0
 
         for char in text:
             if char.isalpha() and random.random() < 0.08:
                 typo = random.choice("abcdefghijklmnopqrstuvwxyz")
-                await self._dispatch_text_char(cdp, typo)
+                await page.keyboard.type(typo, delay=0)
                 await asyncio.sleep(random.uniform(0.03, 0.12))
-                await self._dispatch_backspace(cdp)
+                await page.keyboard.press("Backspace")
                 corrections += 1
                 await asyncio.sleep(random.uniform(0.03, 0.12))
 
-            await self._dispatch_text_char(cdp, char)
+            await page.keyboard.type(char, delay=0)
             typed += 1
             await asyncio.sleep(random.uniform(0.03, 0.12))
 
         return {"typed": typed, "corrections": corrections}
 
     async def _move_pointer(self, page: Page, *, x: float, y: float) -> None:
-        cdp = await self._cdp(page)
+        """Move the mouse along a cubic Bézier curve via page.mouse.move()."""
         pointer = self._pointer(page)
 
         start_x = pointer.x
@@ -155,58 +150,9 @@ class CDPHumanBehavior:
             t = step / steps
             px = self._cubic_bezier(t, start_x, ctrl1_x, ctrl2_x, x)
             py = self._cubic_bezier(t, start_y, ctrl1_y, ctrl2_y, y)
-            await cdp.send(
-                "Input.dispatchMouseEvent",
-                {
-                    "type": "mouseMoved",
-                    "x": px,
-                    "y": py,
-                    "buttons": 1,
-                },
-            )
+
+            await page.mouse.move(px, py)
             await asyncio.sleep(random.uniform(0.004, 0.018))
-
-    async def _dispatch_text_char(self, cdp: CDPSession, char: str) -> None:
-        code = self._code_for_char(char)
-        vk = ord(char.upper()) if len(char) == 1 and char.isprintable() else 0
-
-        await cdp.send(
-            "Input.dispatchKeyEvent",
-            {
-                "type": "keyDown",
-                "text": char,
-                "unmodifiedText": char,
-                "key": char,
-                "code": code,
-                "windowsVirtualKeyCode": vk,
-            },
-        )
-        await cdp.send(
-            "Input.dispatchKeyEvent",
-            {
-                "type": "keyUp",
-                "key": char,
-                "code": code,
-                "windowsVirtualKeyCode": vk,
-            },
-        )
-
-    async def _dispatch_backspace(self, cdp: CDPSession) -> None:
-        payload = {
-            "key": "Backspace",
-            "code": "Backspace",
-            "windowsVirtualKeyCode": 8,
-        }
-        await cdp.send("Input.dispatchKeyEvent", {"type": "keyDown", **payload})
-        await cdp.send("Input.dispatchKeyEvent", {"type": "keyUp", **payload})
-
-    async def _cdp(self, page: Page) -> CDPSession:
-        key = id(page)
-        session = self._cdp_by_page.get(key)
-        if session is None:
-            session = await page.context.new_cdp_session(page)
-            self._cdp_by_page[key] = session
-        return session
 
     def _pointer(self, page: Page) -> PointerState:
         key = id(page)
@@ -225,15 +171,3 @@ class CDPHumanBehavior:
             + 3 * u * (t ** 2) * p2
             + (t ** 3) * p3
         )
-
-    @staticmethod
-    def _code_for_char(char: str) -> str:
-        if char == " ":
-            return "Space"
-        if char == "\n":
-            return "Enter"
-        if len(char) == 1 and char.isalpha():
-            return f"Key{char.upper()}"
-        if len(char) == 1 and char.isdigit():
-            return f"Digit{char}"
-        return "Unidentified"
