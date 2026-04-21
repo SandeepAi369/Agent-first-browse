@@ -48,7 +48,8 @@ graph TD
 
 - **Python** 3.11 or higher
 - **Playwright** Chromium browser (installed via `playwright install chromium`)
-- **OpenAI API key** (or compatible provider)
+- **Google API key** for Gemma models (recommended)
+- Optional OpenAI-compatible API key fallback
 
 ---
 
@@ -85,8 +86,7 @@ cp .env.example .env
 ### 5. Run Dry Demo
 
 ```bash
-cd python-orchestrator
-python -m scripts.run_dry_demo
+python scripts/run_dry_demo.py
 ```
 
 ---
@@ -95,14 +95,22 @@ python -m scripts.run_dry_demo
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
-| `OPENAI_API_KEY` | ✅ | — | OpenAI API key for LLM calls |
+| `GOOGLE_API_KEY` | ✅ (recommended) | — | Google key for Gemma/Gemini models |
+| `OPENAI_API_KEY` | ❌ | — | Fallback key for OpenAI-compatible providers |
 | `WORKER_VLM_API_KEY` | ❌ | Falls back to `OPENAI_API_KEY` | Separate key for Worker VLM |
-| `WORKER_VLM_MODEL` | ❌ | `gpt-4.1-mini` | Model name for Worker planning |
-| `SUPERVISOR_LLM_MODEL` | ❌ | `gpt-4.1-mini` | Model name for Supervisor sub-agents |
+| `WORKER_VLM_MODEL` | ❌ | `gemma-4-27b-it` | Model name for Worker planning |
+| `WORKER_VLM_FALLBACK_MODEL` | ❌ | `gemma-3-27b-it` | Fallback model when Google route is unavailable |
+| `SUPERVISOR_MODEL_API_KEY` | ❌ | Falls back to `OPENAI_API_KEY` | Separate key for Supervisor model |
+| `SUPERVISOR_LLM_MODEL` | ❌ | `gemma-4-27b-it` | Model name for Supervisor discussion sub-agents |
+| `SUPERVISOR_FALLBACK_MODEL` | ❌ | `gpt-4.1-mini` | Fallback when Google supervisor model is unavailable |
 | `BROWSER_MODE` | ❌ | `ISOLATED_SERVER` | `LOCAL_NATIVE_CDP` / `ISOLATED_SERVER` / `REMOTE_WEBSOCKET` |
 | `BROWSER_HEADLESS` | ❌ | `true` | Run browser in headless mode |
 | `DRY_RUN_MODE` | ❌ | `true` | Skip destructive actions (post/reply/submit) |
+| `AUTONOMOUS_CONTINUATION` | ❌ | `true` | Auto-skip manual pause and continue with Supervisor re-plan |
 | `MAX_CYCLES` | ❌ | `15` | Maximum graph execution cycles |
+| `LANGCHAIN_TRACING_V2` | ❌ | `true` | Enable LangSmith tracing |
+| `LANGCHAIN_API_KEY` | ❌ | — | LangSmith API key |
+| `LANGCHAIN_PROJECT` | ❌ | `agent-first-ide` | LangSmith project name |
 
 ---
 

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import base64
-import re
 import zlib
 from datetime import UTC, datetime
 from typing import Any, Literal
@@ -14,15 +13,22 @@ from app.browser_promoter.dashboard import (
     print_terminal_dashboard,
     resolve_platform_name,
 )
+from app.observability import build_llm_config
 from app.browser_promoter.state import AgentState, BrowserAction, InteractiveRegion, ScreenshotFrame, WorkerFeedback
 from app.browser_promoter.supervisor_subgraph import run_supervisor_subgraph
 from app.browser_promoter.worker_planner import WorkerVisionPlanner
+from app.browser_promoter.zero_token_executor import (
+    ActionExecutionError,
+    ActionExecutionResult,
+    ZeroTokenActionExecutor,
+)
 from app.logger import get_logger
 
 logger = get_logger(__name__)
 
 
 _WORKER_PLANNER: WorkerVisionPlanner | None = None
+_ZERO_TOKEN_EXECUTOR: ZeroTokenActionExecutor | None = None
 
 
 async def supervisor_node(state: AgentState) -> dict[str, Any]:
@@ -43,6 +49,20 @@ async def worker_node(state: AgentState) -> dict[str, Any]:
 
     high_level_command = _resolve_high_level_command(state)
     planner = _get_worker_planner()
+    llm_config = build_llm_config(
+        run_name="worker.tactical_decision",
+        tags=[
+            "worker",
+            "decision",
+            resolve_platform_name(state),
+        ],
+        metadata={
+            "thread_id": state.thread_id,
+            "cycle_count": state.cycle_count,
+            "worker_model": planner.model_name,
+            "current_url": state.current_url,
+        },
+    )
 
     decision = await planner.decide_action(
         high_level_command=high_level_command,
@@ -51,6 +71,7 @@ async def worker_node(state: AgentState) -> dict[str, Any]:
         interactive_regions=state.current_interactive_regions,
         current_url=state.current_url,
         accessibility_tree=state.current_accessibility_tree,
+        llm_config=llm_config,
     )
 
     summary = decision.scene_summary.strip() or f"Worker analyzed command: {high_level_command[:180]}"
@@ -132,12 +153,53 @@ def router_node(state: AgentState) -> dict[str, Any]:
 
     ephemeral = dict(state.ephemeral)
     if _has_pending_manual_intervention_action(state):
+        if state.autonomous_continuation:
+            remaining_actions = list(state.worker_action_queue)
+            if remaining_actions and remaining_actions[0].action == "manual_intervention_required":
+                remaining_actions.pop(0)
+
+            feedback_history = list(state.worker_feedback)
+            feedback_history = [
+                *feedback_history,
+                WorkerFeedback(
+                    command_id="manual_intervention_autonomous_skip",
+                    status="completed",
+                    message="Autonomous continuation skipped manual pause and requested supervisor re-plan.",
+                    details={
+                        "cycle": next_cycle,
+                        "platform": resolve_platform_name(state),
+                    },
+                ),
+            ][-state.feedback_window_size :]
+
+            ephemeral["manual_intervention_auto_skipped"] = True
+            updated_routing = state.routing.model_copy(
+                update={
+                    "next_hop": "supervisor",
+                    "requires_browser_action": False,
+                    "requires_supervisor_review": True,
+                }
+            )
+            return {
+                "cycle_count": next_cycle,
+                "should_continue": still_allowed,
+                "worker_action_queue": remaining_actions,
+                "worker_feedback": feedback_history,
+                "worker_last_confused": True,
+                "worker_last_confusion_reason": (
+                    "Autonomous continuation bypassed manual intervention; supervisor should re-plan."
+                ),
+                "routing": updated_routing,
+                "ephemeral": ephemeral,
+            }
+
         pause_for_manual_intervention(state=state, cycle_value=next_cycle, hard_max=hard_max)
         remaining_actions = list(state.worker_action_queue)
         if remaining_actions and remaining_actions[0].action == "manual_intervention_required":
             remaining_actions.pop(0)
 
         ephemeral["manual_intervention_just_completed"] = True
+        ephemeral.pop("manual_intervention_auto_skipped", None)
         return {
             "cycle_count": next_cycle,
             "should_continue": still_allowed,
@@ -146,6 +208,7 @@ def router_node(state: AgentState) -> dict[str, Any]:
         }
 
     ephemeral.pop("manual_intervention_just_completed", None)
+    ephemeral.pop("manual_intervention_auto_skipped", None)
     return {
         "cycle_count": next_cycle,
         "should_continue": still_allowed,
@@ -161,6 +224,9 @@ def router_function(state: AgentState) -> Literal["browser_controller", "supervi
 
     if state.ephemeral.get("manual_intervention_just_completed"):
         return "browser_controller"
+
+    if state.ephemeral.get("manual_intervention_auto_skipped"):
+        return "supervisor"
 
     if not state.should_continue:
         return "end"
@@ -207,6 +273,13 @@ def _get_worker_planner() -> WorkerVisionPlanner:
     if _WORKER_PLANNER is None:
         _WORKER_PLANNER = WorkerVisionPlanner()
     return _WORKER_PLANNER
+
+
+def _get_zero_token_executor() -> ZeroTokenActionExecutor:
+    global _ZERO_TOKEN_EXECUTOR
+    if _ZERO_TOKEN_EXECUTOR is None:
+        _ZERO_TOKEN_EXECUTOR = ZeroTokenActionExecutor()
+    return _ZERO_TOKEN_EXECUTOR
 
 
 def _resolve_high_level_command(state: AgentState) -> str:
@@ -273,12 +346,6 @@ def _garbage_collect_visual_state(state: AgentState, scene_summary: str) -> dict
         "current_accessibility_tree": {},
         "current_interactive_regions": [],
     }
-
-
-def _normalize_url(url: str) -> str:
-    if re.match(r"^https?://", url):
-        return url
-    return f"https://{url}"
 
 
 # _resolve_platform_name is now imported from app.browser_promoter.dashboard
@@ -400,14 +467,34 @@ async def _capture_snapshot(page: Page) -> ScreenshotFrame:
 
     The screenshot is JPEG-compressed first, then zlib-compressed before base64
     encoding so state transport remains compact.
+    Resilient to navigation race conditions — returns minimal snapshot on failure.
     """
+    # Wait for the page to be in a stable state before capturing
+    try:
+        await page.wait_for_load_state("domcontentloaded", timeout=10000)
+    except Exception:
+        pass  # Best-effort; page may still be loading
+
+    # Small delay for JS rendering to settle
+    await page.wait_for_timeout(500)
+
     screenshot_bytes = await page.screenshot(type="jpeg", quality=55, full_page=False)
     compressed_bytes = zlib.compress(screenshot_bytes, level=6)
     encoded_image = base64.b64encode(compressed_bytes).decode("ascii")
 
-    raw_tree = await page.accessibility.snapshot(interesting_only=False)
-    trimmed_tree = _trim_accessibility_tree(raw_tree, max_nodes=250)
-    interactive_regions = await _extract_interactive_regions(page, max_regions=120)
+    # These can fail if a navigation just happened — catch and return empty
+    trimmed_tree: dict[str, Any] = {}
+    interactive_regions: list[InteractiveRegion] = []
+    try:
+        try:
+            raw_tree = await getattr(page, "accessibility").snapshot(interesting_only=False)
+        except AttributeError:
+            raw_tree = {}
+        trimmed_tree = _trim_accessibility_tree(raw_tree, max_nodes=250)
+        interactive_regions = await _extract_interactive_regions(page, max_regions=120)
+    except Exception:
+        # Navigation destroyed the execution context — return what we have
+        pass
 
     return ScreenshotFrame(
         captured_at=datetime.now(UTC),
@@ -421,86 +508,30 @@ async def _capture_snapshot(page: Page) -> ScreenshotFrame:
     )
 
 
-async def _execute_worker_action(
+async def _execute_action_with_fallbacks(
     page: Page,
     action: BrowserAction,
     *,
     dry_run_mode: bool,
-) -> dict[str, Any]:
-    """Execute a single worker action on the persistent page."""
-    if action.action == "manual_intervention_required":
-        await page.wait_for_timeout(200)
-        return {
-            "action": "manual_intervention_required",
-            "message": "Manual intervention acknowledged; refreshing post-intervention state.",
-        }
-
-    if action.action == "goto":
-        if not action.url:
-            raise ValueError("goto action requires url")
-        response = await page.goto(_normalize_url(action.url), timeout=action.timeout_ms, wait_until="domcontentloaded")
-        return {
-            "action": "goto",
-            "final_url": page.url,
-            "status_code": response.status if response is not None else None,
-        }
-
-    if action.action == "scroll":
-        await page.mouse.wheel(0, action.delta_y)
-        await page.wait_for_timeout(120)
-        return {"action": "scroll", "delta_y": action.delta_y}
-
-    if action.action == "click":
-        if dry_run_mode and _is_destructive_action(action):
-            await _preview_action_target(page, action)
-            return {
-                "action": "click",
+) -> ActionExecutionResult:
+    """Execute one browser action with A/B/C fallback flow and dry-run guardrails."""
+    if dry_run_mode and _is_destructive_action(action):
+        await _preview_action_target(page, action)
+        return ActionExecutionResult(
+            details={
+                "action": action.action,
                 "dry_run_mode": True,
-                "dry_run_skip_reason": "Potentially destructive click (post/reply/submit) skipped.",
+                "dry_run_skip_reason": "Potentially destructive action skipped.",
                 "selector": action.selector,
                 "x": action.x,
                 "y": action.y,
-            }
+                "fallback_stage": "A",
+            },
+            vision_calls_used=0,
+        )
 
-        if action.selector:
-            await page.click(action.selector, timeout=action.timeout_ms)
-            return {"action": "click", "selector": action.selector}
-        if action.x is not None and action.y is not None:
-            await page.mouse.click(action.x, action.y)
-            return {"action": "click", "x": action.x, "y": action.y}
-        raise ValueError("click action requires selector or x/y coordinates")
-
-    if action.action == "type":
-        if dry_run_mode and _is_destructive_action(action):
-            await _preview_action_target(page, action)
-            return {
-                "action": "type",
-                "dry_run_mode": True,
-                "dry_run_skip_reason": "Potentially destructive text submission skipped.",
-                "selector": action.selector,
-                "typed_characters": len(action.text),
-            }
-
-        if not action.selector:
-            raise ValueError("type action requires selector")
-        if action.clear_before_type:
-            await page.fill(action.selector, "", timeout=action.timeout_ms)
-        await page.type(action.selector, action.text, delay=action.typing_delay_ms, timeout=action.timeout_ms)
-        return {
-            "action": "type",
-            "selector": action.selector,
-            "typed_characters": len(action.text),
-            "typing_delay_ms": action.typing_delay_ms,
-        }
-
-    if action.action == "wait":
-        await page.wait_for_timeout(action.wait_ms)
-        return {"action": "wait", "wait_ms": action.wait_ms}
-
-    if action.action == "screenshot":
-        return {"action": "screenshot", "message": "explicit screenshot requested"}
-
-    raise ValueError(f"Unsupported action: {action.action}")
+    executor = _get_zero_token_executor()
+    return await executor.execute_action(page=page, action=action)
 
 
 def _is_destructive_action(action: BrowserAction) -> bool:
@@ -589,6 +620,9 @@ async def browser_controller_node(state: AgentState) -> dict[str, Any]:
             thread_id=state.thread_id,
         )
     except Exception as exc:
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.error(f"ensure_page FAILED EXCEPTION: {exc}")
         feedback = WorkerFeedback(
             command_id="browser_runtime",
             status="failed",
@@ -649,13 +683,24 @@ async def browser_controller_node(state: AgentState) -> dict[str, Any]:
     action = pending_actions.pop(0)
     status: Literal["completed", "failed"] = "completed"
     details: dict[str, Any]
+    vision_calls_used = 0
 
     try:
-        details = await _execute_worker_action(
+        execution: ActionExecutionResult = await _execute_action_with_fallbacks(
             page,
             action,
             dry_run_mode=state.dry_run_mode,
         )
+        details = execution.details
+        vision_calls_used = execution.vision_calls_used
+    except ActionExecutionError as exc:
+        status = "failed"
+        vision_calls_used = exc.vision_calls_used
+        details = {
+            "action": action.action,
+            "error_type": type(exc).__name__,
+            "error_message": str(exc),
+        }
     except Exception as exc:
         status = "failed"
         details = {
@@ -692,5 +737,6 @@ async def browser_controller_node(state: AgentState) -> dict[str, Any]:
         "current_screenshot_encoding": snapshot.screenshot_encoding,
         "current_accessibility_tree": snapshot.accessibility_tree,
         "current_interactive_regions": snapshot.interactive_regions,
+        "vision_calls": state.vision_calls + vision_calls_used,
         "routing": updated_routing,
     }
