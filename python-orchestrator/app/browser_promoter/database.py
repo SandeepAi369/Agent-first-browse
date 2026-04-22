@@ -26,8 +26,14 @@ def initialize_persistence_database(database_path: Path | None = None) -> Path:
     db_path = database_path or get_agent_database_path()
     db_path.parent.mkdir(parents=True, exist_ok=True)
 
-    with sqlite3.connect(db_path) as connection:
-        connection.execute("PRAGMA journal_mode=WAL;")
+    with sqlite3.connect(db_path, timeout=10.0) as connection:
+        connection.execute("PRAGMA busy_timeout=5000;")
+        # WAL is best for production (concurrent reads). Falls back to DELETE
+        # on network filesystems (\\wsl$) where WAL locking is unsupported.
+        try:
+            connection.execute("PRAGMA journal_mode=WAL;")
+        except sqlite3.OperationalError:
+            connection.execute("PRAGMA journal_mode=DELETE;")
         connection.execute("PRAGMA synchronous=NORMAL;")
         connection.execute("PRAGMA foreign_keys=ON;")
 
@@ -94,6 +100,9 @@ def initialize_persistence_database(database_path: Path | None = None) -> Path:
             """
         )
 
+        # v3.0 Marketing engine tables
+        _create_marketing_tables(connection)
+
         connection.commit()
 
     return db_path
@@ -133,3 +142,216 @@ def count_locked_target_communities(database_path: Path | None = None) -> int:
         cursor = connection.execute("SELECT COUNT(*) FROM target_communities")
         row = cursor.fetchone()
         return int(row[0] if row else 0)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Marketing Engine Tables & Helpers (v3.0)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _create_marketing_tables(connection: sqlite3.Connection) -> None:
+    """Create v3.0 marketing engine tables if they don't exist."""
+
+    # Cached GitHub repo intelligence
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS github_repo_cache (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT NOT NULL,
+            repo_name TEXT NOT NULL,
+            full_name TEXT NOT NULL,
+            url TEXT NOT NULL,
+            description TEXT NOT NULL DEFAULT '',
+            language TEXT NOT NULL DEFAULT '',
+            stars INTEGER NOT NULL DEFAULT 0,
+            forks INTEGER NOT NULL DEFAULT 0,
+            topics_json TEXT NOT NULL DEFAULT '[]',
+            readme_summary TEXT NOT NULL DEFAULT '',
+            key_features_json TEXT NOT NULL DEFAULT '[]',
+            target_audience TEXT NOT NULL DEFAULT '',
+            promotion_hooks_json TEXT NOT NULL DEFAULT '[]',
+            homepage TEXT NOT NULL DEFAULT '',
+            cached_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(username, repo_name)
+        )
+        """
+    )
+
+    # Promotion history — tracks what was promoted where (for cooldown)
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS promotion_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            repo_name TEXT NOT NULL,
+            platform TEXT NOT NULL,
+            channel TEXT NOT NULL,
+            tactic TEXT NOT NULL,
+            content_angle TEXT NOT NULL DEFAULT '',
+            draft_message TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'planned',
+            promoted_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_promotion_history_repo_platform
+        ON promotion_history(repo_name, platform, promoted_at)
+        """
+    )
+
+    # Promotion results — engagement tracking
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS promotion_results (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            promotion_id INTEGER NOT NULL,
+            url TEXT NOT NULL DEFAULT '',
+            upvotes INTEGER NOT NULL DEFAULT 0,
+            comments INTEGER NOT NULL DEFAULT 0,
+            views INTEGER NOT NULL DEFAULT 0,
+            checked_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(promotion_id) REFERENCES promotion_history(id)
+        )
+        """
+    )
+
+
+def upsert_repo_cache(
+    *,
+    username: str,
+    repo_name: str,
+    full_name: str,
+    url: str,
+    description: str = "",
+    language: str = "",
+    stars: int = 0,
+    forks: int = 0,
+    topics_json: str = "[]",
+    readme_summary: str = "",
+    key_features_json: str = "[]",
+    target_audience: str = "",
+    promotion_hooks_json: str = "[]",
+    homepage: str = "",
+    database_path: Path | None = None,
+) -> int:
+    """Insert or update a cached repo profile."""
+    db_path = initialize_persistence_database(database_path)
+    with sqlite3.connect(db_path) as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO github_repo_cache(
+                username, repo_name, full_name, url, description, language,
+                stars, forks, topics_json, readme_summary, key_features_json,
+                target_audience, promotion_hooks_json, homepage, cached_at
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(username, repo_name)
+            DO UPDATE SET
+                full_name=excluded.full_name, url=excluded.url,
+                description=excluded.description, language=excluded.language,
+                stars=excluded.stars, forks=excluded.forks,
+                topics_json=excluded.topics_json, readme_summary=excluded.readme_summary,
+                key_features_json=excluded.key_features_json,
+                target_audience=excluded.target_audience,
+                promotion_hooks_json=excluded.promotion_hooks_json,
+                homepage=excluded.homepage, cached_at=CURRENT_TIMESTAMP
+            """,
+            (username, repo_name, full_name, url, description, language,
+             stars, forks, topics_json, readme_summary, key_features_json,
+             target_audience, promotion_hooks_json, homepage),
+        )
+        conn.commit()
+        return int(cursor.lastrowid or 0)
+
+
+def get_cached_repos(
+    username: str,
+    *,
+    max_age_hours: int = 24,
+    database_path: Path | None = None,
+) -> list[dict]:
+    """Return cached repo profiles that are still fresh."""
+    db_path = initialize_persistence_database(database_path)
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """
+            SELECT * FROM github_repo_cache
+            WHERE username = ?
+              AND cached_at > datetime('now', ? || ' hours')
+            ORDER BY stars DESC
+            """,
+            (username, f"-{max_age_hours}"),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+
+def record_promotion(
+    *,
+    repo_name: str,
+    platform: str,
+    channel: str,
+    tactic: str,
+    content_angle: str = "",
+    draft_message: str = "",
+    status: str = "planned",
+    database_path: Path | None = None,
+) -> int:
+    """Record a promotion action for cooldown tracking."""
+    db_path = initialize_persistence_database(database_path)
+    with sqlite3.connect(db_path) as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO promotion_history(
+                repo_name, platform, channel, tactic,
+                content_angle, draft_message, status
+            ) VALUES(?, ?, ?, ?, ?, ?, ?)
+            """,
+            (repo_name, platform, channel, tactic,
+             content_angle, draft_message, status),
+        )
+        conn.commit()
+        return int(cursor.lastrowid or 0)
+
+
+def check_promotion_cooldown(
+    *,
+    repo_name: str,
+    platform: str,
+    channel: str,
+    cooldown_days: int = 7,
+    database_path: Path | None = None,
+) -> bool:
+    """Return True if the repo was promoted in this channel within cooldown period."""
+    db_path = initialize_persistence_database(database_path)
+    with sqlite3.connect(db_path) as conn:
+        row = conn.execute(
+            """
+            SELECT COUNT(*) FROM promotion_history
+            WHERE repo_name = ? AND platform = ? AND channel = ?
+              AND promoted_at > datetime('now', ? || ' days')
+              AND status != 'cancelled'
+            """,
+            (repo_name, platform, channel, f"-{cooldown_days}"),
+        ).fetchone()
+        return bool(row and row[0] > 0)
+
+
+def count_platform_promotions_today(
+    *,
+    platform: str,
+    database_path: Path | None = None,
+) -> int:
+    """Count how many promotions were done on a platform today."""
+    db_path = initialize_persistence_database(database_path)
+    with sqlite3.connect(db_path) as conn:
+        row = conn.execute(
+            """
+            SELECT COUNT(*) FROM promotion_history
+            WHERE platform = ?
+              AND promoted_at > datetime('now', '-1 day')
+              AND status != 'cancelled'
+            """,
+            (platform,),
+        ).fetchone()
+        return int(row[0] if row else 0)
+
