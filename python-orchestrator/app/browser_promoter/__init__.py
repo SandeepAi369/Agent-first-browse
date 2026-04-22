@@ -6,7 +6,9 @@ from app.browser_promoter.dashboard import (
     resolve_platform_name,
 )
 from app.browser_promoter.database import initialize_persistence_database
+from app.browser_promoter.github_intelligence import GitHubIntelligence, RepoProfile
 from app.browser_promoter.graph import build_graph, build_graph_with_default_checkpointer
+from app.browser_promoter.marketing_engine import MarketingEngine, PromotionPlan
 from app.browser_promoter.nodes import (
     browser_controller_node,
     router_function,
@@ -20,7 +22,11 @@ __all__ = [
     "AgentState",
     "BrowserConfig",
     "BrowserMode",
+    "GitHubIntelligence",
     "HighLevelCommand",
+    "MarketingEngine",
+    "PromotionPlan",
+    "RepoProfile",
     "browser_controller_node",
     "build_graph",
     "build_graph_with_default_checkpointer",
@@ -35,3 +41,4 @@ __all__ = [
     "supervisor_node",
     "worker_node",
 ]
+

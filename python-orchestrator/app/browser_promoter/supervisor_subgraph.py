@@ -12,6 +12,12 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from app.call_pacing import AsyncGapLimiter
 from app.browser_promoter.database import lock_target_community
+from app.browser_promoter.github_intelligence import GitHubIntelligence, RepoProfile
+from app.browser_promoter.marketing_engine import (
+    MarketingEngine,
+    PromotionPlan,
+    build_portfolio_context,
+)
 from app.browser_promoter.state import AgentState, HighLevelCommand
 from app import config
 from app.observability import build_llm_config
@@ -89,6 +95,12 @@ class SupervisorInternalState(BaseModel):
     current_scene_summary: str = ""
     worker_last_confused: bool = False
     worker_last_confusion_reason: str = ""
+
+    # v3.0 Marketing Intelligence
+    github_username: str = ""
+    promotion_style: str = "organic"
+    portfolio_context: str = ""  # Injected by github_intelligence_node
+    promotion_plans_json: str = "[]"  # Serialized PromotionPlan summaries
 
     context_analysis: ContextAnalysisOutput | None = None
     strategy_plan: StrategyPlanOutput | None = None
@@ -347,8 +359,68 @@ async def context_analyzer_node(state: SupervisorInternalState) -> dict[str, Any
     return {"context_analysis": result}
 
 
+async def github_intelligence_node(state: SupervisorInternalState) -> dict[str, Any]:
+    """Sub-agent A2: Fetch GitHub repo intelligence and build portfolio context.
+
+    Queries the GitHub API (or cache) for the user's public repositories,
+    analyzes READMEs, and injects structured product knowledge into the
+    supervisor pipeline so downstream nodes have real data to work with.
+    """
+    username = state.github_username or config.GITHUB_USERNAME
+    if not username:
+        logger.info("No GitHub username configured — skipping intelligence fetch")
+        return {"portfolio_context": "", "promotion_plans_json": "[]"}
+
+    try:
+        intelligence = GitHubIntelligence(username=username)
+        profiles = await intelligence.get_repo_profiles()
+
+        if not profiles:
+            logger.warning("GitHub Intelligence returned 0 profiles for %s", username)
+            return {"portfolio_context": "No promotable repos found.", "promotion_plans_json": "[]"}
+
+        # Build portfolio context for LLM injection
+        portfolio_ctx = build_portfolio_context(profiles)
+
+        # Generate promotion plans
+        engine = MarketingEngine()
+        plans = await engine.generate_promotion_plans(profiles, max_plans=5)
+        plans_summary = [
+            {
+                "repo": p.repo.name,
+                "platform": p.platform,
+                "channel": p.channel,
+                "tactic": p.tactic,
+                "angle": p.content_angle,
+                "search_query": p.search_query,
+                "safety": p.safety_score,
+                "blocked": p.blocked_reason,
+                "draft": p.draft_message[:200],
+            }
+            for p in plans if not p.is_blocked()
+        ]
+
+        logger.info(
+            "GitHub Intelligence: %d repos, %d actionable plans for %s",
+            len(profiles), len(plans_summary), username,
+        )
+
+        return {
+            "portfolio_context": portfolio_ctx,
+            "promotion_plans_json": json.dumps(plans_summary, ensure_ascii=True),
+        }
+
+    except Exception as exc:
+        logger.error("GitHub Intelligence failed: %s", exc)
+        return {"portfolio_context": "", "promotion_plans_json": "[]"}
+
+
 async def strategy_planner_node(state: SupervisorInternalState) -> dict[str, Any]:
-    """Sub-agent B: Decide next action type and behavior mimicry plan."""
+    """Sub-agent B: Decide next action type and behavior mimicry plan.
+
+    Now enhanced with GitHub portfolio context and promotion plans from
+    the github_intelligence_node.
+    """
     context = state.context_analysis or ContextAnalysisOutput(
         platform_context="Unknown context",
         pain_points=[],
@@ -370,6 +442,24 @@ async def strategy_planner_node(state: SupervisorInternalState) -> dict[str, Any
         candidate_community_url=state.current_url,
     )
 
+    # Build enhanced payload with portfolio + promotion intelligence
+    payload: dict[str, Any] = {
+        "objective": state.objective,
+        "platform_context": context.platform_context,
+        "pain_points": context.pain_points,
+        "audience_intent": context.audience_intent,
+        "stealth_notes": context.stealth_notes,
+        "current_scene_summary": state.current_scene_summary,
+        "current_url": state.current_url,
+        "target_platforms": state.target_platforms,
+    }
+
+    # Inject portfolio context if available
+    if state.portfolio_context:
+        payload["github_portfolio"] = state.portfolio_context[:2000]
+    if state.promotion_plans_json and state.promotion_plans_json != "[]":
+        payload["promotion_plans"] = state.promotion_plans_json[:1500]
+
     result = await _invoke_structured(
         schema=StrategyPlanOutput,
         system_prompt=(
@@ -377,23 +467,17 @@ async def strategy_planner_node(state: SupervisorInternalState) -> dict[str, Any
             "Supported action types include reconnaissance and engage. "
             "When discovery is needed, choose reconnaissance and provide a concrete recon query plus "
             "candidate_community_url if visible. Prioritize stealth and organic behavior. "
+            "If github_portfolio and promotion_plans are provided, use them to inform your "
+            "strategy — pick the best repo and channel for the current context. "
             "You MUST return a valid JSON object matching the requested schema exactly."
         ),
-        payload={
-            "objective": state.objective,
-            "platform_context": context.platform_context,
-            "pain_points": context.pain_points,
-            "audience_intent": context.audience_intent,
-            "stealth_notes": context.stealth_notes,
-            "current_scene_summary": state.current_scene_summary,
-            "current_url": state.current_url,
-            "target_platforms": state.target_platforms,
-        },
+        payload=payload,
         fallback=fallback,
         run_name="supervisor.strategy_planner",
         trace_metadata={
             "current_url": state.current_url,
             "worker_last_confused": state.worker_last_confused,
+            "has_portfolio": bool(state.portfolio_context),
         },
     )
     return {"strategy_plan": result}
@@ -447,7 +531,12 @@ async def strategy_challenger_node(state: SupervisorInternalState) -> dict[str, 
 
 
 async def copywriter_node(state: SupervisorInternalState) -> dict[str, Any]:
-    """Sub-agent C: Draft short human-like copy when text is needed."""
+    """Sub-agent C: Draft short human-like copy when text is needed.
+
+    Enhanced in v3.0 with real product knowledge from GitHub Intelligence.
+    Uses portfolio context and promotion hooks to generate authentic,
+    experience-based messages instead of generic marketing copy.
+    """
     strategy = _resolve_effective_strategy(state)
 
     fallback_text: str | None = None
@@ -456,24 +545,48 @@ async def copywriter_node(state: SupervisorInternalState) -> dict[str, Any]:
 
     fallback = CopyDraftOutput(draft_text=fallback_text)
 
+    # Build enhanced payload with real product data
+    copy_payload: dict[str, Any] = {
+        "objective": state.objective,
+        "action_type": strategy.action_type,
+        "target_description": strategy.target_description,
+        "behavior_plan": strategy.behavior_plan,
+        "scene_summary": state.current_scene_summary,
+    }
+
+    # Inject portfolio context for authentic copy generation
+    if state.portfolio_context:
+        copy_payload["product_knowledge"] = state.portfolio_context[:1500]
+    if state.promotion_plans_json and state.promotion_plans_json != "[]":
+        copy_payload["promotion_context"] = state.promotion_plans_json[:800]
+
+    # Determine tone based on promotion style
+    style = state.promotion_style or "organic"
+    tone_guide = {
+        "organic": "Write like a fellow developer sharing a personal experience. Never sell.",
+        "direct": "Write a concise project showcase. Be genuine and invite feedback.",
+        "educational": "Write as someone sharing a technical insight. The project is a supporting reference, not the focus.",
+    }.get(style, "Write naturally like a developer.")
+
     result = await _invoke_structured(
         schema=CopyDraftOutput,
         system_prompt=(
-            "You are Copywriter. Draft one short, natural line in a human tone. "
-            "No hype, no slogans, no corporate buzzwords."
+            f"You are Copywriter for a developer marketing campaign. {tone_guide} "
+            "Draft one short, natural paragraph in a genuine human tone. "
+            "No hype, no slogans, no corporate buzzwords. "
+            "If product_knowledge is provided, reference specific features and your "
+            "actual experience building or using the tool. "
+            "CRITICAL: The text must sound like something a real developer would write "
+            "in a forum post — casual, helpful, with a personal touch."
         ),
-        payload={
-            "objective": state.objective,
-            "action_type": strategy.action_type,
-            "target_description": strategy.target_description,
-            "behavior_plan": strategy.behavior_plan,
-            "scene_summary": state.current_scene_summary,
-        },
+        payload=copy_payload,
         fallback=fallback,
         run_name="supervisor.copywriter",
         trace_metadata={
             "action_type": strategy.action_type,
             "current_url": state.current_url,
+            "promotion_style": style,
+            "has_product_knowledge": bool(state.portfolio_context),
         },
     )
     return {"copy_draft": result}
@@ -661,18 +774,26 @@ def _infer_niche(state: SupervisorInternalState) -> str:
 
 
 def build_supervisor_subgraph():
-    """Compile the hierarchical Supervisor meeting as a LangGraph subgraph."""
+    """Compile the hierarchical Supervisor meeting as a LangGraph subgraph.
+
+    v3.0 Pipeline:
+      START → context_analyzer → github_intelligence → strategy_planner
+            → strategy_challenger → [copywriter, risk_assessor] → final_merge → END
+    """
     graph = StateGraph(SupervisorInternalState)
 
     graph.add_node("context_analyzer", context_analyzer_node)
+    graph.add_node("github_intelligence", github_intelligence_node)
     graph.add_node("strategy_planner", strategy_planner_node)
     graph.add_node("strategy_challenger", strategy_challenger_node)
     graph.add_node("copywriter", copywriter_node)
     graph.add_node("risk_stealth_assessor", risk_stealth_assessor_node)
     graph.add_node("final_merge", final_merge_node)
 
+    # v3.0: GitHub Intelligence runs right after context analysis
     graph.add_edge(START, "context_analyzer")
-    graph.add_edge("context_analyzer", "strategy_planner")
+    graph.add_edge("context_analyzer", "github_intelligence")
+    graph.add_edge("github_intelligence", "strategy_planner")
     graph.add_edge("strategy_planner", "strategy_challenger")
 
     graph.add_edge("strategy_challenger", "copywriter")
@@ -719,6 +840,9 @@ async def run_supervisor_subgraph(main_state: AgentState) -> HighLevelCommand:
         current_scene_summary=main_state.current_scene_summary,
         worker_last_confused=main_state.worker_last_confused,
         worker_last_confusion_reason=main_state.worker_last_confusion_reason,
+        # v3.0 Marketing Intelligence
+        github_username=main_state.campaign.github_username,
+        promotion_style=main_state.campaign.promotion_style,
     )
 
     graph = _get_supervisor_subgraph()
