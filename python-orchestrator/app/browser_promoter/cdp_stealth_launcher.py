@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import inspect
+import os
+import platform
 from pathlib import Path
 from typing import Any
 
@@ -21,11 +23,39 @@ except Exception:  # pragma: no cover - optional dependency.
 
 logger = get_logger(__name__)
 
-STEALTH_USER_AGENT = (
+# Platform-specific user agents — matched to actual OS to avoid detection
+_WINDOWS_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/136.0.0.0 Safari/537.36"
 )
+_LINUX_USER_AGENT = (
+    "Mozilla/5.0 (X11; Linux x86_64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/136.0.0.0 Safari/537.36"
+)
+
+
+def _is_linux_env() -> bool:
+    """Return True if running on native Linux or inside WSL."""
+    return platform.system() == "Linux" or "WSL_DISTRO_NAME" in os.environ
+
+
+def get_stealth_user_agent() -> str:
+    """Return a user agent that matches the current OS.
+
+    Websites compare OS headers (Accept-Platform, Sec-CH-UA-Platform)
+    against the User-Agent string. A mismatch (e.g., Linux headers +
+    Windows UA) is a strong automation signal. This function ensures
+    they always match.
+    """
+    if _is_linux_env():
+        return _LINUX_USER_AGENT
+    return _WINDOWS_USER_AGENT
+
+
+# Default export for backward compatibility
+STEALTH_USER_AGENT = get_stealth_user_agent()
 
 STEALTH_LAUNCH_ARGS = [
     "--disable-blink-features=AutomationControlled",
@@ -49,7 +79,7 @@ STEALTH_INIT_SCRIPT = """
 
   defineSafe(navigator, 'webdriver', undefined);
   defineSafe(navigator, 'languages', ['en-US', 'en']);
-  defineSafe(navigator, 'platform', 'Win32');
+  defineSafe(navigator, 'platform', '""" + ("Linux x86_64" if _is_linux_env() else "Win32") + """');
   defineSafe(navigator, 'deviceMemory', 8);
   defineSafe(navigator, 'hardwareConcurrency', 12);
   defineSafe(navigator, 'maxTouchPoints', 0);
