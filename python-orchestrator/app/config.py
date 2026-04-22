@@ -87,6 +87,10 @@ SUPERVISOR_MODEL_API_KEYS: list[str] = _merge_unique_keys(
 
 # ─── Browser Runtime ─────────────────────────────────────────────────────────
 BROWSER_MODE: str = os.getenv("BROWSER_MODE", "ISOLATED_SERVER")
+# "auto"       = detect environment and pick best strategy (recommended)
+# "cdp"        = force LOCAL_NATIVE_CDP (Windows Edge/Chrome via CDP)
+# "playwright" = force ISOLATED_SERVER (Playwright's own Chromium)
+BROWSER_STRATEGY: str = os.getenv("BROWSER_STRATEGY", "auto").strip().lower()
 BROWSER_HEADLESS: bool = os.getenv("BROWSER_HEADLESS", "true").lower() in ("true", "1", "yes")
 LOCAL_CDP_ENDPOINT: str = os.getenv("LOCAL_CDP_ENDPOINT", "http://localhost:9222")
 REMOTE_WEBSOCKET_URL: str = os.getenv("REMOTE_WEBSOCKET_URL", "")
