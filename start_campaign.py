@@ -45,18 +45,28 @@ def _detect_environment() -> str:
         return "Windows Native"
     if "WSL_DISTRO_NAME" in os.environ:
         return f"WSL ({os.environ['WSL_DISTRO_NAME']})"
+    if platform.system() == "Linux":
+        return f"Linux ({platform.release().split('-')[0]})"
     return platform.system()
 
 
 def _resolve_browser_mode() -> BrowserMode:
-    if config.FORCE_VISIBLE_LOCAL_BROWSER:
-        return BrowserMode.LOCAL_NATIVE_CDP
+    """Resolve initial browser mode based on BROWSER_STRATEGY config.
 
-    try:
-        return BrowserMode(config.BROWSER_MODE)
-    except ValueError:
-        logger.warning("Unsupported BROWSER_MODE '%s'. Falling back to ISOLATED_SERVER.", config.BROWSER_MODE)
+    The actual smart auto-detection happens in browser_runtime.py's
+    _auto_resolve_browser_mode(). Here we just set the initial mode
+    that the runtime will further resolve when strategy='auto'.
+    """
+    strategy = config.BROWSER_STRATEGY
+
+    if strategy == "cdp":
+        return BrowserMode.LOCAL_NATIVE_CDP
+    if strategy == "playwright":
         return BrowserMode.ISOLATED_SERVER
+
+    # strategy == "auto": let the runtime decide based on environment
+    # Start with ISOLATED_SERVER — runtime will upgrade to CDP if appropriate
+    return BrowserMode.ISOLATED_SERVER
 
 
 async def main():
@@ -67,14 +77,14 @@ async def main():
     print("\n=======================================================")
     print("  AGENT FIRST IDE — CAMPAIGN STARTING")
     print("=======================================================")
-    print(f"  Runtime: {env_name}")
-    print(f"  Input:   {config.INPUT_DRIVER} (Playwright native API)")
-    print(f"  Browser: {_resolve_browser_mode().value}")
-    print(f"  Brain:   {config.SUPERVISOR_LLM_MODEL}")
-    print(f"  Eyes:    {config.WORKER_VLM_MODEL}")
-    print(f"  DryRun:  {config.DRY_RUN_MODE}")
-    print(f"  Auto:    {config.AUTONOMOUS_CONTINUATION}")
-    print(f"  Human:   {config.HUMAN_ACTION_DELAY_MIN_SECONDS:.1f}s - {config.HUMAN_ACTION_DELAY_MAX_SECONDS:.1f}s")
+    print(f"  Runtime:  {env_name}")
+    print(f"  Strategy: {config.BROWSER_STRATEGY} (auto-detect platform)")
+    print(f"  Input:    {config.INPUT_DRIVER} (Playwright native API)")
+    print(f"  Brain:    {config.SUPERVISOR_LLM_MODEL}")
+    print(f"  Eyes:     {config.WORKER_VLM_MODEL}")
+    print(f"  DryRun:   {config.DRY_RUN_MODE}")
+    print(f"  Auto:     {config.AUTONOMOUS_CONTINUATION}")
+    print(f"  Human:    {config.HUMAN_ACTION_DELAY_MIN_SECONDS:.1f}s - {config.HUMAN_ACTION_DELAY_MAX_SECONDS:.1f}s")
     print("=======================================================\n")
 
     campaign = CampaignContext(
