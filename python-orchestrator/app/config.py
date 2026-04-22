@@ -172,5 +172,25 @@ HUMAN_TYPING_DELAY_MAX_MS: int = int(os.getenv("HUMAN_TYPING_DELAY_MAX_MS", "115
 PHYSICAL_INPUT_CHROME_HEIGHT_PX: int = int(os.getenv("PHYSICAL_INPUT_CHROME_HEIGHT_PX", "0"))
 PHYSICAL_INPUT_DPI_MULTIPLIER: float = float(os.getenv("PHYSICAL_INPUT_DPI_MULTIPLIER", "1.0"))
 
+# ─── GitHub Intelligence ──────────────────────────────────────────────────────
+# Repo intelligence for autonomous marketing — reads public repos via API.
+GITHUB_USERNAME: str = os.getenv("GITHUB_USERNAME", "SandeepAi369")
+GITHUB_TOKEN: str = os.getenv("GITHUB_TOKEN", "")
+GITHUB_REPO_CACHE_TTL_HOURS: int = int(os.getenv("GITHUB_REPO_CACHE_TTL_HOURS", "24"))
+
+# ─── Marketing Engine ─────────────────────────────────────────────────────────
+# Controls autonomous promotion behavior and safety limits.
+# "organic"      = Answer questions naturally, mention project as one option
+# "direct"       = "Show & Tell" style posts with project as focus
+# "educational"  = Share technical insights, link tools naturally
+PROMOTION_STYLE: str = os.getenv("PROMOTION_STYLE", "organic").strip().lower()
+MAX_PROMOTIONS_PER_PLATFORM: int = int(os.getenv("MAX_PROMOTIONS_PER_PLATFORM", "2"))
+PROMOTION_COOLDOWN_DAYS: int = int(os.getenv("PROMOTION_COOLDOWN_DAYS", "7"))
+# Platforms the marketing engine is allowed to target
+PROMOTION_PLATFORMS: list[str] = _split_env_list(
+    os.getenv("PROMOTION_PLATFORMS", "reddit,github,hackernews")
+)
+
 # ─── Persistence ──────────────────────────────────────────────────────────────
 PERSISTENCE_DIR: Path = _PROJECT_ROOT / "persistence"
+
