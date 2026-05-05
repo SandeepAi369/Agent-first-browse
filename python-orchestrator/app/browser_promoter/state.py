@@ -14,7 +14,7 @@ class CampaignContext(BaseModel):
     campaign_id: str = Field(min_length=1)
     campaign_name: str = Field(min_length=1)
     objective: str = Field(min_length=1)
-    target_platforms: list[Literal["x", "reddit", "github"]] = Field(default_factory=list)
+    target_platforms: list[str] = Field(default_factory=list)
     session_id: str = Field(min_length=1)
 
     # v3.0 Marketing Intelligence
@@ -58,6 +58,7 @@ class BrowserAction(BaseModel):
         "scroll",
         "click",
         "type",
+        "type_and_enter",
         "wait",
         "screenshot",
         "manual_intervention_required",
@@ -77,21 +78,18 @@ class BrowserAction(BaseModel):
 
 
 class BrowserMode(str, Enum):
-    """Tri-mode runtime selection for browser connectivity."""
+    """Browser runtime mode. Only persistent context is supported."""
 
-    LOCAL_NATIVE_CDP = "LOCAL_NATIVE_CDP"
-    ISOLATED_SERVER = "ISOLATED_SERVER"
-    REMOTE_WEBSOCKET = "REMOTE_WEBSOCKET"
+    PERSISTENT_CONTEXT = "PERSISTENT_CONTEXT"
 
 
 class BrowserConfig(BaseModel):
-    """Runtime browser connectivity and behavior configuration."""
+    """Runtime browser configuration for native Playwright persistent context."""
 
-    mode: BrowserMode = BrowserMode.ISOLATED_SERVER
-    local_cdp_endpoint: str = "http://localhost:9222"
-    remote_websocket_url: str = ""
-    headless: bool = True
-    cdp_timeout_ms: int = Field(default=15000, ge=1000, le=120000)
+    mode: BrowserMode = BrowserMode.PERSISTENT_CONTEXT
+    headless: bool = False
+    viewport_width: int = Field(default=1440, ge=800, le=3840)
+    viewport_height: int = Field(default=900, ge=600, le=2160)
 
     model_config = ConfigDict(extra="forbid")
 
@@ -125,10 +123,11 @@ class WorkerFeedback(BaseModel):
 class RoutingFlags(BaseModel):
     """Routing controls for Supervisor -> Worker <-> Browser -> Router loop."""
 
-    next_hop: Literal["worker", "browser_controller", "supervisor", "router", "end"] = "worker"
+    next_hop: Literal["strategic_planner", "worker", "browser_controller", "supervisor", "router", "end"] = "strategic_planner"
     requires_browser_action: bool = False
     requires_supervisor_review: bool = False
     stop_requested: bool = False
+    vision_requested: bool = False
 
     model_config = ConfigDict(extra="forbid")
 
@@ -165,6 +164,8 @@ class AgentState(BaseModel):
     supervisor_commands: list[SupervisorCommand] = Field(default_factory=list)
     worker_action_queue: list[BrowserAction] = Field(default_factory=list)
     worker_feedback: list[WorkerFeedback] = Field(default_factory=list)
+    action_history: list[dict[str, Any]] = Field(default_factory=list)
+    consecutive_failures: int = Field(default=0, ge=0)
 
     screenshot_history: list[ScreenshotFrame] = Field(default_factory=list)
     screenshot_window_size: int = Field(default=6, ge=1, le=64)
@@ -191,6 +192,12 @@ class AgentState(BaseModel):
 
     routing: RoutingFlags = Field(default_factory=RoutingFlags)
     ephemeral: dict[str, Any] = Field(default_factory=dict)
+
+    temp_files: list[str] = Field(default_factory=list)
+    db_access_logs: list[dict[str, Any]] = Field(default_factory=list)
+    dynamic_schemas_created: list[str] = Field(default_factory=list)
+    
+    shared_reasoning_log: list[str] = Field(default_factory=list)
 
     model_config = ConfigDict(extra="forbid", validate_assignment=True)
 

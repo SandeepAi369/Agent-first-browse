@@ -115,6 +115,7 @@ def build_run_config(
         config_payload["configurable"] = {
             "thread_id": state.thread_id,
         }
+    config_payload.setdefault("configurable", {})["recursion_limit"] = 1000
 
     return config_payload
 
