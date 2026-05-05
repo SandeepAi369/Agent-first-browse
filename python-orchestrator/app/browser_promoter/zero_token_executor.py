@@ -14,7 +14,7 @@ from app import config
 from app.browser_promoter.playwright_human_input import PlaywrightHumanInput
 from app.browser_promoter.shadow_dom_piercer import TargetPoint, locate_target_point
 from app.browser_promoter.state import BrowserAction, InteractiveRegion
-from app.browser_promoter.worker_planner import WorkerDecision, WorkerVisionPlanner
+from app.browser_promoter.worker_planner import WorkerDecision
 from app.logger import get_logger
 from app.observability import build_llm_config
 
@@ -216,7 +216,7 @@ class ZeroTokenActionExecutor:
             details["fallback_stage"] = "A"
             return ActionExecutionResult(details=details)
 
-        if action.action not in {"click", "type"}:
+        if action.action not in {"click", "type", "type_and_enter"}:
             raise ValueError(f"Unsupported action for zero-token executor: {action.action}")
 
         # Step A: selector/coordinates targeting (0 tokens)
@@ -325,7 +325,7 @@ class ZeroTokenActionExecutor:
 
         if action.action == "type":
             await self._input.click(page, x=target.x, y=target.y)
-            if action.clear_before_type:
+            if getattr(action, "clear_before_type", False):
                 await self._input.clear_field(page)
             typed = await self._input.type_text(page, action.text)
             return {
@@ -338,7 +338,24 @@ class ZeroTokenActionExecutor:
                 "typing_corrections": typed["corrections"],
             }
 
-        raise ValueError(f"Targeted apply is only valid for click/type, got: {action.action}")
+        if action.action == "type_and_enter":
+            await self._input.click(page, x=target.x, y=target.y)
+            if getattr(action, "clear_before_type", False):
+                await self._input.clear_field(page)
+            typed = await self._input.type_text(page, action.text)
+            await self._input.press_key(page, "Enter")
+            return {
+                "action": "type_and_enter",
+                "x": target.x,
+                "y": target.y,
+                "target_method": target.method,
+                "selector": target.selector_used,
+                "typed_characters": typed["typed"],
+                "typing_corrections": typed["corrections"],
+                "key_pressed": "Enter",
+            }
+
+        raise ValueError(f"Targeted apply is only valid for click/type/type_and_enter, got: {action.action}")
 
     async def _execute_non_targeted_action(self, *, page: Page, action: BrowserAction) -> dict[str, Any]:
         if action.action == "manual_intervention_required":

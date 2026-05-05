@@ -33,7 +33,7 @@ configure_langsmith()
 from app.browser_promoter.database import initialize_persistence_database
 from app.browser_promoter.graph import build_graph_with_default_checkpointer
 from app.browser_promoter.browser_runtime import BrowserRuntime
-from app.browser_promoter.state import AgentState, BrowserConfig, BrowserMode, CampaignContext
+from app.browser_promoter.state import AgentState, BrowserConfig, CampaignContext
 from app.logger import get_logger
 
 logger = get_logger("campaign_launcher")
@@ -50,25 +50,6 @@ def _detect_environment() -> str:
     return platform.system()
 
 
-def _resolve_browser_mode() -> BrowserMode:
-    """Resolve initial browser mode based on BROWSER_STRATEGY config.
-
-    The actual smart auto-detection happens in browser_runtime.py's
-    _auto_resolve_browser_mode(). Here we just set the initial mode
-    that the runtime will further resolve when strategy='auto'.
-    """
-    strategy = config.BROWSER_STRATEGY
-
-    if strategy == "cdp":
-        return BrowserMode.LOCAL_NATIVE_CDP
-    if strategy == "playwright":
-        return BrowserMode.ISOLATED_SERVER
-
-    # strategy == "auto": let the runtime decide based on environment
-    # Start with ISOLATED_SERVER — runtime will upgrade to CDP if appropriate
-    return BrowserMode.ISOLATED_SERVER
-
-
 async def main():
     initialize_persistence_database()
 
@@ -78,8 +59,7 @@ async def main():
     print("  AGENT FIRST IDE — CAMPAIGN STARTING")
     print("=======================================================")
     print(f"  Runtime:  {env_name}")
-    print(f"  Strategy: {config.BROWSER_STRATEGY} (auto-detect platform)")
-    print(f"  Input:    {config.INPUT_DRIVER} (Playwright native API)")
+    print(f"  Browser:  Playwright Chromium (persistent context)")
     print(f"  Brain:    {config.SUPERVISOR_LLM_MODEL}")
     print(f"  Eyes:     {config.WORKER_VLM_MODEL}")
     print(f"  DryRun:   {config.DRY_RUN_MODE}")
@@ -88,26 +68,27 @@ async def main():
     print("=======================================================\n")
 
     campaign = CampaignContext(
-        campaign_id="real-task-test-playwright",
-        campaign_name="Test Playwright Native Input Driver",
+        campaign_id="test-wiki-001",
+        campaign_name="Wikipedia Search Test",
         objective=(
-            "Open https://github.com. Find the search bar in the header, type 'Playwright Input Test' "
-            "into it, and press Enter to search. Verify the search results page loads."
+            "TEST SIMPLE TASK:\n"
+            "1. Navigate to https://en.wikipedia.org\n"
+            "2. Find the main search bar and type a name like 'Alan Turing'.\n"
+            "3. Click the search button or press enter.\n"
+            "4. Verify that you have reached the article and read the title."
         ),
-        target_platforms=["github"],
-        session_id="recon-session-test",
+        target_platforms=["wikipedia"],
+        session_id="test-wiki-session",
+        github_username="None",
     )
 
     state = AgentState(
         campaign=campaign,
         thread_id=config.PERSISTENT_THREAD_ID or campaign.session_id,
-        browser_config=BrowserConfig(
-            mode=_resolve_browser_mode(),
-            headless=False if config.FORCE_VISIBLE_LOCAL_BROWSER else config.BROWSER_HEADLESS,
-        ),
-        dry_run_mode=config.DRY_RUN_MODE,
+        browser_config=BrowserConfig(headless=False),
+        dry_run_mode=False,
         autonomous_continuation=config.AUTONOMOUS_CONTINUATION,
-        max_cycles=config.MAX_CYCLES,
+        max_cycles=15,
         worker_confidence_threshold=config.WORKER_CONFIDENCE_THRESHOLD,
     )
 

@@ -13,7 +13,9 @@ from app.browser_promoter.nodes import (
     browser_controller_node,
     router_function,
     supervisor_node,
-    worker_node,
+    strategic_planner_node,
+    tactical_selector_node,
+    vision_tool_node,
 )
 from app.browser_promoter.state import AgentState, BrowserConfig, BrowserMode, HighLevelCommand
 from app.browser_promoter.supervisor_subgraph import build_supervisor_subgraph
@@ -39,6 +41,8 @@ __all__ = [
     "resolve_platform_name",
     "router_function",
     "supervisor_node",
-    "worker_node",
+    "strategic_planner_node",
+    "tactical_selector_node",
+    "vision_tool_node",
 ]
 

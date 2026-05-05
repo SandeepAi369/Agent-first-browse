@@ -16,7 +16,7 @@ from app.browser_promoter.dashboard import (
 from app.observability import build_llm_config
 from app.browser_promoter.state import AgentState, BrowserAction, InteractiveRegion, ScreenshotFrame, WorkerFeedback
 from app.browser_promoter.supervisor_subgraph import run_supervisor_subgraph
-from app.browser_promoter.worker_planner import WorkerVisionPlanner
+from app.browser_promoter.worker_planner import StrategicPlanner, TacticalSelector, VisionTool
 from app.browser_promoter.zero_token_executor import (
     ActionExecutionError,
     ActionExecutionResult,
@@ -27,7 +27,9 @@ from app.logger import get_logger
 logger = get_logger(__name__)
 
 
-_WORKER_PLANNER: WorkerVisionPlanner | None = None
+_STRATEGIC_PLANNER: StrategicPlanner | None = None
+_TACTICAL_SELECTOR: TacticalSelector | None = None
+_VISION_TOOL: VisionTool | None = None
 _ZERO_TOKEN_EXECUTOR: ZeroTokenActionExecutor | None = None
 
 
@@ -38,43 +40,87 @@ async def supervisor_node(state: AgentState) -> dict[str, Any]:
     return {"high_level_command": command}
 
 
-async def worker_node(state: AgentState) -> dict[str, Any]:
-    """
-    Convert a Supervisor intent into one strict BrowserAction via small VLM.
+def _get_strategic_planner() -> StrategicPlanner:
+    global _STRATEGIC_PLANNER
+    if _STRATEGIC_PLANNER is None:
+        _STRATEGIC_PLANNER = StrategicPlanner()
+    return _STRATEGIC_PLANNER
 
-    This node also performs aggressive garbage collection of heavy visual payloads
-    once the decision is made, preserving only lightweight scene summaries.
-    """
-    logger.info("Planning tactical action from screenshot + regions")
+def _get_tactical_selector() -> TacticalSelector:
+    global _TACTICAL_SELECTOR
+    if _TACTICAL_SELECTOR is None:
+        _TACTICAL_SELECTOR = TacticalSelector()
+    return _TACTICAL_SELECTOR
 
+def _get_vision_tool() -> VisionTool:
+    global _VISION_TOOL
+    if _VISION_TOOL is None:
+        _VISION_TOOL = VisionTool()
+    return _VISION_TOOL
+
+
+async def strategic_planner_node(state: AgentState) -> dict[str, Any]:
+    """Tier 1: NVIDIA GLM 5.1 analyzes context and drafts a strategy or requests vision."""
+    logger.info("Strategic Planner (NVIDIA GLM) drafting strategy")
+    planner = _get_strategic_planner()
     high_level_command = _resolve_high_level_command(state)
-    planner = _get_worker_planner()
+    
     llm_config = build_llm_config(
-        run_name="worker.tactical_decision",
-        tags=[
-            "worker",
-            "decision",
-            resolve_platform_name(state),
-        ],
-        metadata={
-            "thread_id": state.thread_id,
-            "cycle_count": state.cycle_count,
-            "worker_model": planner.model_name,
-            "current_url": state.current_url,
-        },
+        run_name="swarm.strategic_planner",
+        tags=["strategic_planner", "nvidia"],
+        metadata={"thread_id": state.thread_id},
     )
 
-    decision = await planner.decide_action(
+    decision = await planner.draft_strategy(
         high_level_command=high_level_command,
-        screenshot_base64=state.current_screenshot_base64,
-        screenshot_encoding=state.current_screenshot_encoding,
-        interactive_regions=state.current_interactive_regions,
         current_url=state.current_url,
+        interactive_regions=state.current_interactive_regions,
         accessibility_tree=state.current_accessibility_tree,
+        action_history=list(state.action_history),
+        shared_reasoning_log=list(state.shared_reasoning_log),
         llm_config=llm_config,
     )
 
-    summary = decision.scene_summary.strip() or f"Worker analyzed command: {high_level_command[:180]}"
+    log_entry = f"[NVIDIA GLM 5.1] Strategy Draft: {decision.strategy}"
+    updated_log = list(state.shared_reasoning_log)
+    updated_log.append(log_entry)
+
+    updated_routing = state.routing.model_copy(
+        update={
+            "vision_requested": decision.vision_requested,
+            "next_hop": "tactical_selector",
+        }
+    )
+
+    return {
+        "shared_reasoning_log": updated_log,
+        "routing": updated_routing,
+        "ephemeral": {"current_strategy": decision.strategy},
+    }
+
+async def tactical_selector_node(state: AgentState) -> dict[str, Any]:
+    """Tier 2: Groq GPT-OSS-120B converts the strategy into exact JSON BrowserAction."""
+    if state.routing.vision_requested:
+        # If vision is requested, skip tactics and route to vision tool
+        return {}
+
+    logger.info("Tactical Selector (Groq 120B) parsing action from strategy")
+    selector = _get_tactical_selector()
+    current_strategy = state.ephemeral.get("current_strategy", "Proceed with general search.")
+    
+    llm_config = build_llm_config(
+        run_name="swarm.tactical_selector",
+        tags=["tactical_selector", "groq"],
+        metadata={"thread_id": state.thread_id},
+    )
+
+    decision = await selector.select_tactics(
+        strategy=current_strategy,
+        interactive_regions=state.current_interactive_regions,
+        llm_config=llm_config,
+    )
+    
+    summary = decision.scene_summary.strip() or f"Tactical selection made."
     worker_feedback = list(state.worker_feedback)
     worker_action_queue = list(state.worker_action_queue)
 
@@ -82,18 +128,14 @@ async def worker_node(state: AgentState) -> dict[str, Any]:
         feedback = WorkerFeedback(
             command_id=_resolve_command_id(state),
             status="failed",
-            message="Worker VLM could not select a reliable browser action.",
-            details={
-                "high_level_command": high_level_command,
-                "confidence": decision.confidence,
-                "confusion_reason": decision.confusion_reason or "Insufficient visual confidence.",
-            },
+            message="Tactical Selector could not map strategy to DOM element.",
+            details={"confusion_reason": decision.confusion_reason},
         )
         worker_feedback = [*worker_feedback, feedback][-state.feedback_window_size :]
 
         updated_routing = state.routing.model_copy(
             update={
-                "next_hop": "router",
+                "next_hop": "stuck_evaluator",
                 "requires_browser_action": False,
                 "requires_supervisor_review": True,
             }
@@ -103,7 +145,7 @@ async def worker_node(state: AgentState) -> dict[str, Any]:
             "worker_feedback": worker_feedback,
             "worker_last_confidence": decision.confidence,
             "worker_last_confused": True,
-            "worker_last_confusion_reason": decision.confusion_reason or "Worker was uncertain.",
+            "worker_last_confusion_reason": decision.confusion_reason or "Tactical model was uncertain.",
             "current_scene_summary": summary,
             "routing": updated_routing,
             **_garbage_collect_visual_state(state, summary),
@@ -112,15 +154,10 @@ async def worker_node(state: AgentState) -> dict[str, Any]:
     feedback = WorkerFeedback(
         command_id=decision.action.action_id,
         status="completed",
-        message="Worker produced a validated browser action.",
-        details={
-            "high_level_command": high_level_command,
-            "action": decision.action.model_dump(mode="json"),
-            "confidence": decision.confidence,
-        },
+        message="Tactical action mapped successfully.",
+        details={"action": decision.action.model_dump(mode="json")},
     )
     worker_feedback = [*worker_feedback, feedback][-state.feedback_window_size :]
-
     worker_action_queue.append(decision.action)
 
     updated_routing = state.routing.model_copy(
@@ -142,12 +179,190 @@ async def worker_node(state: AgentState) -> dict[str, Any]:
         **_garbage_collect_visual_state(state, summary),
     }
 
+async def vision_tool_node(state: AgentState) -> dict[str, Any]:
+    """Tier 3: Google Gemma 4 performs visual analysis when requested by text models."""
+    logger.info("Vision Tool (Gemma 4) analyzing screenshot")
+    vision_tool = _get_vision_tool()
+    
+    llm_config = build_llm_config(
+        run_name="swarm.vision_tool",
+        tags=["vision_tool", "gemma"],
+        metadata={"thread_id": state.thread_id},
+    )
+
+    analysis = await vision_tool.analyze(
+        screenshot_base64=state.current_screenshot_base64,
+        screenshot_encoding=state.current_screenshot_encoding,
+        llm_config=llm_config,
+    )
+
+    log_entry = f"[Gemma 4 Vision] Screen Analysis: {analysis}"
+    updated_log = list(state.shared_reasoning_log)
+    updated_log.append(log_entry)
+
+    # Turn off vision_requested so the loop goes back to strategic planner naturally
+    updated_routing = state.routing.model_copy(
+        update={
+            "vision_requested": False,
+        }
+    )
+
+    return {
+        "shared_reasoning_log": updated_log,
+        "routing": updated_routing,
+    }
+
+def stuck_evaluator_node(state: AgentState) -> dict[str, Any]:
+    """Evaluates the proposed action against recent history to break infinite loops."""
+    logger.info("Evaluating for stuck/infinite loops")
+    
+    proposed_actions = state.worker_action_queue
+    if not proposed_actions:
+        return {}
+
+    proposed = proposed_actions[0]
+    action_dict = {"action": proposed.action, "selector": proposed.selector, "text": proposed.text, "x": proposed.x, "y": proposed.y, "url": proposed.url}
+    
+    history = list(state.action_history)
+    consecutive_failures = state.consecutive_failures
+    
+    is_loop = False
+    if len(history) >= 2:
+        last_action = history[-1]
+        prev_action = history[-2]
+        
+        # Check exact repetition
+        if action_dict == last_action and action_dict == prev_action:
+            is_loop = True
+            
+        # Check ping-pong (A -> B -> A)
+        elif action_dict == prev_action and len(history) >= 3 and history[-3] == last_action:
+            is_loop = True
+
+        # Check zero-progress (Scroll over and over without finding anything)
+        if proposed.action == "scroll" and last_action.get("action") == "scroll" and prev_action.get("action") == "scroll":
+             is_loop = True
+
+    if is_loop:
+        consecutive_failures += 1
+        logger.warning(f"Loop detected! consecutive_failures={consecutive_failures}")
+    else:
+        consecutive_failures = 0
+        
+    ephemeral = dict(state.ephemeral)
+    
+    if consecutive_failures >= 2:
+        logger.error("Agent is STUCK. Injecting KICK PROMPT and routing to Supervisor.")
+        ephemeral["kick_prompt"] = (
+            "HIGH SALIENCE SYSTEM OVERRIDE: You are caught in an infinite loop repeating the same actions "
+            "(e.g., scrolling endlessly or clicking the same element). ABANDON your current strategy completely. "
+            "If you are on Reddit and not finding results, PIVOT IMMEDIATELY to a different platform "
+            "(e.g., HackerNews, GitHub Discussions, Facebook Groups, Dev.to) using the web search tools. "
+            "Do NOT propose the same action again."
+        )
+        return {
+            "consecutive_failures": consecutive_failures,
+            "ephemeral": ephemeral,
+            "worker_action_queue": [],
+            "worker_last_confused": True,
+            "worker_last_confusion_reason": "Infinite loop detected by stuck evaluator.",
+            "action_history": [*history, action_dict][-6:]
+        }
+        
+    return {
+        "consecutive_failures": consecutive_failures,
+        "action_history": [*history, action_dict][-6:]
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Auth Check Node — Human-in-the-Loop Login Pause
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Known login URL patterns that should trigger HITL pause
+_LOGIN_URL_SIGNALS = (
+    "accounts.google.com",
+    "login.reddit.com",
+    "/login",
+    "/signin",
+    "/sign_in",
+    "/auth",
+    "facebook.com/login",
+    "github.com/login",
+    "github.com/session",
+    "news.ycombinator.com/login",
+    "dev.to/enter",
+)
+
+# DOM text signals indicating a login/auth form
+_LOGIN_DOM_SIGNALS = (
+    "password",
+    "sign in",
+    "log in",
+    "create account",
+    "captcha",
+    "verification code",
+    "two-factor",
+    "2fa",
+    "mfa",
+)
+
+
+def auth_check_node(state: AgentState) -> dict[str, Any]:
+    """Detect login walls and pause execution for human authentication.
+
+    Checks two signals:
+      1. URL pattern: If the current URL matches known auth endpoints.
+      2. DOM analysis: If interactive regions contain password/login fields.
+
+    When a login wall is detected, prints a prominent terminal message and
+    blocks on `input()` so the human can log in manually in the open
+    Playwright browser window. Once the human presses Enter, the agent
+    resumes with the authenticated session.
+    """
+    logger.info("Checking for authentication walls")
+
+    url = state.current_url.lower()
+    needs_login = any(sig in url for sig in _LOGIN_URL_SIGNALS)
+
+    # Secondary check: scan DOM interactive regions for auth-related fields
+    if not needs_login:
+        for region in state.current_interactive_regions:
+            combined = f"{region.text} {region.role} {region.tag}".lower()
+            if any(kw in combined for kw in _LOGIN_DOM_SIGNALS):
+                needs_login = True
+                break
+
+    if not needs_login:
+        return {}
+
+    # ── HITL Login Pause ──
+    logger.warning("Login wall detected at: %s", state.current_url)
+    print("\n" + "=" * 70)
+    print("  🚨 LOGIN REQUIRED")
+    print("=" * 70)
+    print(f"  URL: {state.current_url}")
+    print("")
+    print("  The agent detected a login or authentication wall.")
+    print("  Please switch to the Playwright Chromium browser window")
+    print("  and log in manually (Reddit, Google, GitHub, etc.).")
+    print("")
+    print("  Once you are logged in, come back here and press ENTER.")
+    print("=" * 70)
+    try:
+        input("\n  👉 Press ENTER when you have finished logging in: ")
+    except EOFError:
+        logger.info("No interactive stdin — continuing without blocking.")
+    print("  ✅ Resuming agent execution...\n")
+
+    return {}
+
 
 def router_node(state: AgentState) -> dict[str, Any]:
     """Minimal router node; decisions are made in router_function."""
     logger.info("Evaluating routing flags")
     next_cycle = state.cycle_count + 1
-    hard_max = min(state.max_cycles, 15)
+    hard_max = state.max_cycles
     still_allowed = state.should_continue and next_cycle < hard_max
     print_terminal_dashboard(state=state, cycle_value=next_cycle, hard_max=hard_max)
 
@@ -218,7 +433,7 @@ def router_node(state: AgentState) -> dict[str, Any]:
 
 def router_function(state: AgentState) -> Literal["browser_controller", "supervisor", "end"]:
     """Deterministic route selector for Step-5 traffic control."""
-    hard_max = min(state.max_cycles, 15)
+    hard_max = state.max_cycles
     if state.routing.stop_requested:
         return "end"
 
@@ -536,7 +751,7 @@ async def _execute_action_with_fallbacks(
 
 def _is_destructive_action(action: BrowserAction) -> bool:
     """Detect likely post/reply submission actions that should be dry-run protected."""
-    if action.action not in {"click", "type"}:
+    if action.action not in {"click", "type", "type_and_enter"}:
         return False
 
     haystack = " ".join([action.selector, action.text, action.url]).lower()
@@ -739,4 +954,78 @@ async def browser_controller_node(state: AgentState) -> dict[str, Any]:
         "current_interactive_regions": snapshot.interactive_regions,
         "vision_calls": state.vision_calls + vision_calls_used,
         "routing": updated_routing,
+    }
+
+
+async def task_logging_node(state: AgentState) -> dict[str, Any]:
+    """Summarize final state and push to completed_tasks table."""
+    logger.info("task_logging_node: Summarizing execution and logging to completed_tasks")
+    
+    import json
+    from app.browser_promoter.database import initialize_persistence_database
+    import sqlite3
+    
+    summary = f"Completed task '{state.high_level_command.behavior_plan if state.high_level_command else 'Unknown'}' after {state.cycle_count} cycles."
+    
+    final_state_data = {
+        "thread_id": state.thread_id,
+        "cycles": state.cycle_count,
+        "final_url": state.current_url,
+        "actions_taken": len(state.action_history),
+        "db_accesses": len(state.db_access_logs)
+    }
+    
+    db_path = initialize_persistence_database()
+    try:
+        with sqlite3.connect(db_path) as conn:
+            conn.execute(
+                "INSERT INTO completed_tasks(thread_id, summary, final_state_json) VALUES(?, ?, ?)",
+                (state.thread_id, summary, json.dumps(final_state_data))
+            )
+            conn.commit()
+    except Exception as e:
+        log.error(f"Failed to write to completed_tasks: {e}")
+
+    updated_routing = state.routing.model_copy(update={"next_hop": "housekeeping_node"})
+    return {"routing": updated_routing}
+
+
+async def housekeeping_node(state: AgentState) -> dict[str, Any]:
+    """Clean up temp files, drop dynamic tables, and purge ephemeral state."""
+    log.info("housekeeping_node: Beginning system cleanup")
+    import os
+    import sqlite3
+    from app.browser_promoter.database import initialize_persistence_database
+    
+    # 1. Temp file cleanup
+    files_removed = 0
+    for fpath in state.temp_files:
+        try:
+            if os.path.exists(fpath):
+                os.remove(fpath)
+                files_removed += 1
+        except Exception as e:
+            log.warning(f"Failed to remove temp file {fpath}: {e}")
+            
+    # 2. Drop dynamic schemas
+    tables_dropped = 0
+    if state.dynamic_schemas_created:
+        db_path = initialize_persistence_database()
+        with sqlite3.connect(db_path) as conn:
+            for table_name in state.dynamic_schemas_created:
+                try:
+                    conn.execute(f"DROP TABLE IF EXISTS {table_name}")
+                    tables_dropped += 1
+                except Exception as e:
+                    log.warning(f"Failed to drop table {table_name}: {e}")
+            conn.commit()
+            
+    log.info(f"housekeeping_node: Cleaned up {files_removed} files and {tables_dropped} dynamic tables.")
+    
+    updated_routing = state.routing.model_copy(update={"next_hop": "end"})
+    return {
+        "routing": updated_routing,
+        "temp_files": [],
+        "db_access_logs": [],
+        "dynamic_schemas_created": []
     }

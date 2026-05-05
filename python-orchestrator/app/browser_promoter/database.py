@@ -103,6 +103,32 @@ def initialize_persistence_database(database_path: Path | None = None) -> Path:
         # v3.0 Marketing engine tables
         _create_marketing_tables(connection)
 
+        # Autonomous architecture tables
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS system_access_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                node_name TEXT NOT NULL,
+                operation TEXT NOT NULL,
+                target_table TEXT NOT NULL,
+                query_context TEXT NOT NULL,
+                timestamp TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS completed_tasks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                thread_id TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                final_state_json TEXT NOT NULL,
+                completed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+
         connection.commit()
 
     return db_path
@@ -144,6 +170,48 @@ def count_locked_target_communities(database_path: Path | None = None) -> int:
         return int(row[0] if row else 0)
 
 
+def provision_dynamic_table(
+    table_name: str,
+    schema_json: dict[str, str],
+    database_path: Path | None = None,
+) -> None:
+    """
+    Dynamically provision a new SQLite table based on a schema mapping.
+    schema_json maps column_name -> sqlite_data_type (e.g., {'id': 'INTEGER PRIMARY KEY', 'name': 'TEXT'})
+    """
+    db_path = initialize_persistence_database(database_path)
+    
+    # Safe prefixing to prevent accidental core table overwrite
+    safe_table_name = table_name if table_name.startswith("dynamic_") else f"dynamic_{table_name}"
+    
+    columns = [f"{col} {dtype}" for col, dtype in schema_json.items()]
+    columns_str = ", ".join(columns)
+    
+    create_stmt = f"CREATE TABLE IF NOT EXISTS {safe_table_name} ({columns_str})"
+    
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(create_stmt)
+        conn.commit()
+
+
+def log_data_access(
+    node_name: str,
+    operation: str,
+    target_table: str,
+    query_context: str,
+    database_path: Path | None = None,
+) -> None:
+    """Log DB access events to system_access_logs."""
+    db_path = initialize_persistence_database(database_path)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO system_access_logs(node_name, operation, target_table, query_context)
+            VALUES(?, ?, ?, ?)
+            """,
+            (node_name, operation, target_table, query_context)
+        )
+        conn.commit()
 # ═══════════════════════════════════════════════════════════════════════════════
 #  Marketing Engine Tables & Helpers (v3.0)
 # ═══════════════════════════════════════════════════════════════════════════════

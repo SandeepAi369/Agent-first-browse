@@ -95,6 +95,7 @@ class SupervisorInternalState(BaseModel):
     current_scene_summary: str = ""
     worker_last_confused: bool = False
     worker_last_confusion_reason: str = ""
+    ephemeral: dict[str, Any] = Field(default_factory=dict)
 
     # v3.0 Marketing Intelligence
     github_username: str = ""
@@ -125,63 +126,60 @@ def _is_google_model_name(model_name: str) -> bool:
 
 
 def _get_supervisor_llm_clients() -> list[Any]:
-    """Create shared big-model clients with API-key failover."""
+    """Create shared big-model clients with multi-provider failover.
+
+    Architecture:
+      - Client 0: NVIDIA GLM 5.1 (primary) via integrate.api.nvidia.com
+      - Client 1+: Groq GPT-OSS-120B (backup) via api.groq.com
+    Each client carries its own base_url and model name so failover
+    seamlessly switches providers.
+    """
     global _SUPERVISOR_LLM_CLIENTS
     if _SUPERVISOR_LLM_CLIENTS is not None:
         return _SUPERVISOR_LLM_CLIENTS
 
-    model_name = config.SUPERVISOR_LLM_MODEL.strip()
-    wants_google_model = _is_google_model_name(model_name)
+    clients: list[Any] = []
+    primary_model = config.SUPERVISOR_LLM_MODEL.strip()
+    fallback_model = config.SUPERVISOR_FALLBACK_MODEL.strip() or "openai/gpt-oss-120b"
+    primary_base_url = config.SUPERVISOR_PRIMARY_BASE_URL.strip() or None
+    fallback_base_url = config.SUPERVISOR_FALLBACK_BASE_URL.strip() or config.OPENAI_BASE_URL.strip() or None
 
-    google_keys = config.GOOGLE_API_KEYS
-
-    if wants_google_model and google_keys:
-        try:
-            from langchain_google_genai import ChatGoogleGenerativeAI
-
-            if model_name.startswith("models/"):
-                model_name = model_name[len("models/"):]
-
-            _SUPERVISOR_LLM_CLIENTS = [
-                ChatGoogleGenerativeAI(
-                    model=model_name,
-                    google_api_key=google_key,
-                    temperature=0.2,
-                    timeout=40,
-                )
-                for google_key in google_keys
-            ]
-            return _SUPERVISOR_LLM_CLIENTS
-        except Exception as exc:
-            logger.warning("Supervisor Google model bootstrap failed: %s", exc)
-
-    api_keys = config.SUPERVISOR_MODEL_API_KEYS or config.OPENAI_API_KEYS
-    if not api_keys:
-        logger.warning("Supervisor model is not configured: missing API keys for Google and OpenAI paths.")
-        _SUPERVISOR_LLM_CLIENTS = []
-        return _SUPERVISOR_LLM_CLIENTS
-
-    resolved_model_name = model_name
-    if wants_google_model:
-        resolved_model_name = config.SUPERVISOR_FALLBACK_MODEL or "gpt-4.1-mini"
-        logger.warning(
-            "Supervisor model '%s' looks Google-specific but GOOGLE_API_KEY is unavailable. "
-            "Falling back to '%s'.",
-            model_name,
-            resolved_model_name,
+    # ── Primary: NVIDIA NIM (or first key) ──
+    primary_key = config.SUPERVISOR_MODEL_API_KEY.strip()
+    if primary_key:
+        clients.append(
+            ChatOpenAI(
+                model=primary_model,
+                api_key=primary_key,
+                base_url=primary_base_url,
+                temperature=0.2,
+                timeout=40,
+            )
         )
+        logger.info("Supervisor primary: %s via %s", primary_model, primary_base_url or "default")
 
-    base_url = config.OPENAI_BASE_URL.strip() or None
-    _SUPERVISOR_LLM_CLIENTS = [
-        ChatOpenAI(
-            model=resolved_model_name,
-            api_key=api_key,
-            base_url=base_url,
-            temperature=0.2,
-            timeout=40,
+    # ── Fallback: Groq keys (use fallback model + fallback base_url) ──
+    fallback_keys = config.SUPERVISOR_MODEL_API_KEY_FALLBACKS
+    for fk in fallback_keys:
+        fk = fk.strip()
+        if not fk or fk == primary_key:
+            continue
+        clients.append(
+            ChatOpenAI(
+                model=fallback_model,
+                api_key=fk,
+                base_url=fallback_base_url,
+                temperature=0.2,
+                timeout=40,
+            )
         )
-        for api_key in api_keys
-    ]
+    if fallback_keys:
+        logger.info("Supervisor fallback: %s via %s (%d keys)", fallback_model, fallback_base_url or "default", len(fallback_keys))
+
+    if not clients:
+        logger.warning("Supervisor model is not configured: no NVIDIA or Groq API keys found.")
+
+    _SUPERVISOR_LLM_CLIENTS = clients
     return _SUPERVISOR_LLM_CLIENTS
 
 
@@ -332,23 +330,28 @@ async def context_analyzer_node(state: SupervisorInternalState) -> dict[str, Any
         stealth_notes="Blend with native posting rhythm and avoid repetitive phrasing.",
     )
 
+    payload_data = {
+        "campaign_name": state.campaign_name,
+        "objective": state.objective,
+        "platform_hint": platform,
+        "current_url": state.current_url,
+        "scene_summary": state.current_scene_summary,
+        "worker_confusion": {
+            "flag": state.worker_last_confused,
+            "reason": state.worker_last_confusion_reason,
+        },
+    }
+    
+    if state.ephemeral.get("kick_prompt"):
+        payload_data["SYSTEM_OVERRIDE"] = state.ephemeral["kick_prompt"]
+
     result = await _invoke_structured(
         schema=ContextAnalysisOutput,
         system_prompt=(
             "You are Context Analyzer. Extract platform context and pain points for organic promotion. "
             "Be concise, tactical, and human. Avoid corporate buzzwords."
         ),
-        payload={
-            "campaign_name": state.campaign_name,
-            "objective": state.objective,
-            "platform_hint": platform,
-            "current_url": state.current_url,
-            "scene_summary": state.current_scene_summary,
-            "worker_confusion": {
-                "flag": state.worker_last_confused,
-                "reason": state.worker_last_confusion_reason,
-            },
-        },
+        payload=payload_data,
         fallback=fallback,
         run_name="supervisor.context_analyzer",
         trace_metadata={
@@ -454,6 +457,9 @@ async def strategy_planner_node(state: SupervisorInternalState) -> dict[str, Any
         "target_platforms": state.target_platforms,
     }
 
+    if state.ephemeral.get("kick_prompt"):
+        payload["SYSTEM_OVERRIDE"] = state.ephemeral["kick_prompt"]
+
     # Inject portfolio context if available
     if state.portfolio_context:
         payload["github_portfolio"] = state.portfolio_context[:2000]
@@ -469,6 +475,9 @@ async def strategy_planner_node(state: SupervisorInternalState) -> dict[str, Any
             "candidate_community_url if visible. Prioritize stealth and organic behavior. "
             "If github_portfolio and promotion_plans are provided, use them to inform your "
             "strategy — pick the best repo and channel for the current context. "
+            "CRITICAL: You are a multi-platform autonomous agent. If Reddit yields no results or you get stuck, "
+            "you MUST PIVOT to searching other platforms like Facebook Groups, HackerNews, GitHub Discussions, "
+            "or Dev.to using the web search tools. "
             "You MUST return a valid JSON object matching the requested schema exactly."
         ),
         payload=payload,
@@ -840,6 +849,7 @@ async def run_supervisor_subgraph(main_state: AgentState) -> HighLevelCommand:
         current_scene_summary=main_state.current_scene_summary,
         worker_last_confused=main_state.worker_last_confused,
         worker_last_confusion_reason=main_state.worker_last_confusion_reason,
+        ephemeral=dict(main_state.ephemeral),
         # v3.0 Marketing Intelligence
         github_username=main_state.campaign.github_username,
         promotion_style=main_state.campaign.promotion_style,

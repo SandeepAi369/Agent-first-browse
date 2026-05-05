@@ -9,11 +9,17 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 
 from app.browser_promoter.nodes import (
+    auth_check_node,
     browser_controller_node,
     router_function,
     router_node,
+    stuck_evaluator_node,
     supervisor_node,
-    worker_node,
+    strategic_planner_node,
+    tactical_selector_node,
+    vision_tool_node,
+    task_logging_node,
+    housekeeping_node,
 )
 from app.browser_promoter.state import AgentState
 
@@ -35,18 +41,40 @@ def build_graph(
     graph = StateGraph(AgentState)
 
     graph.add_node("supervisor", supervisor_node)
-    graph.add_node("worker", worker_node)
+    graph.add_node("strategic_planner", strategic_planner_node)
+    graph.add_node("tactical_selector", tactical_selector_node)
+    graph.add_node("vision_tool", vision_tool_node)
     graph.add_node("browser_controller", browser_controller_node)
+    graph.add_node("stuck_evaluator", stuck_evaluator_node)
+    graph.add_node("auth_check", auth_check_node)
     graph.add_node("router", router_node)
+    graph.add_node("task_logging_node", task_logging_node)
+    graph.add_node("housekeeping_node", housekeeping_node)
 
     graph.add_edge(START, "supervisor")
-    graph.add_edge("supervisor", "worker")
+    graph.add_edge("supervisor", "strategic_planner")
 
-    # Worker output is routed through router logic for circuit-break safety.
-    graph.add_edge("worker", "router")
+    # Collaborative Loop
+    graph.add_edge("strategic_planner", "tactical_selector")
+    
+    def collaborative_router(state: AgentState) -> str:
+        if state.routing.vision_requested:
+            return "vision_tool"
+        return "stuck_evaluator"
 
-    # Browser always loops back to Worker to observe result state.
-    graph.add_edge("browser_controller", "worker")
+    graph.add_conditional_edges("tactical_selector", collaborative_router, {
+        "vision_tool": "vision_tool",
+        "stuck_evaluator": "stuck_evaluator",
+    })
+    
+    graph.add_edge("vision_tool", "strategic_planner")
+
+    # Stuck Evaluator → Auth Check → Router
+    graph.add_edge("stuck_evaluator", "auth_check")
+    graph.add_edge("auth_check", "router")
+
+    # Browser always loops back to strategic_planner to observe result state.
+    graph.add_edge("browser_controller", "strategic_planner")
 
     graph.add_conditional_edges(
         "router",
@@ -54,9 +82,12 @@ def build_graph(
         {
             "browser_controller": "browser_controller",
             "supervisor": "supervisor",
-            "end": END,
+            "end": "task_logging_node",
         },
     )
+
+    graph.add_edge("task_logging_node", "housekeeping_node")
+    graph.add_edge("housekeeping_node", END)
 
     interrupt_before = ["browser_controller"] if enable_hitl_interrupt else None
     return graph.compile(
