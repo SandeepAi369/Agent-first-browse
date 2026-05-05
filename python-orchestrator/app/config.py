@@ -71,10 +71,17 @@ WORKER_VLM_API_KEYS: list[str] = _merge_unique_keys(
 )
 WORKER_VLM_MODEL: str = os.getenv("WORKER_VLM_MODEL", "gemma-4-27b-it")
 WORKER_VLM_FALLBACK_MODEL: str = os.getenv("WORKER_VLM_FALLBACK_MODEL", "gemma-3-27b-it")
+# How many image/vision calls each API key handles before rotating to the next
+WORKER_KEY_ROTATION_BATCH: int = int(os.getenv("WORKER_KEY_ROTATION_BATCH", "2"))
+
+# ─── NVIDIA NIM ───────────────────────────────────────────────────────────────
+NVIDIA_NIM_API_KEY: str = os.getenv("NVIDIA_NIM_API_KEY", "")
+NVIDIA_NIM_BASE_URL: str = os.getenv("NVIDIA_NIM_BASE_URL", "https://integrate.api.nvidia.com/v1")
+NVIDIA_NIM_MODEL: str = os.getenv("NVIDIA_NIM_MODEL", "nvidia/glm-5.1")
 
 # ─── Supervisor LLM ──────────────────────────────────────────────────────────
-SUPERVISOR_LLM_MODEL: str = os.getenv("SUPERVISOR_LLM_MODEL", "gemma-4-27b-it")
-SUPERVISOR_FALLBACK_MODEL: str = os.getenv("SUPERVISOR_FALLBACK_MODEL", "gpt-4.1-mini")
+SUPERVISOR_LLM_MODEL: str = os.getenv("SUPERVISOR_LLM_MODEL", "nvidia/glm-5.1")
+SUPERVISOR_FALLBACK_MODEL: str = os.getenv("SUPERVISOR_FALLBACK_MODEL", "openai/gpt-oss-120b")
 SUPERVISOR_MODEL_API_KEY: str = os.getenv("SUPERVISOR_MODEL_API_KEY", "")
 SUPERVISOR_MODEL_API_KEY_FALLBACKS: list[str] = _split_env_list(
     os.getenv("SUPERVISOR_MODEL_API_KEY_FALLBACKS", "")
@@ -84,30 +91,14 @@ SUPERVISOR_MODEL_API_KEYS: list[str] = _merge_unique_keys(
     SUPERVISOR_MODEL_API_KEY_FALLBACKS,
     OPENAI_API_KEYS,
 )
+# Primary endpoint (NVIDIA NIM) vs fallback endpoint (Groq)
+SUPERVISOR_PRIMARY_BASE_URL: str = os.getenv("SUPERVISOR_PRIMARY_BASE_URL", "https://integrate.api.nvidia.com/v1")
+SUPERVISOR_FALLBACK_BASE_URL: str = os.getenv("SUPERVISOR_FALLBACK_BASE_URL", "https://api.groq.com/openai/v1")
 
 # ─── Browser Runtime ─────────────────────────────────────────────────────────
-BROWSER_MODE: str = os.getenv("BROWSER_MODE", "ISOLATED_SERVER")
-# "auto"       = detect environment and pick best strategy (recommended)
-# "cdp"        = force LOCAL_NATIVE_CDP (Windows Edge/Chrome via CDP)
-# "playwright" = force ISOLATED_SERVER (Playwright's own Chromium)
-BROWSER_STRATEGY: str = os.getenv("BROWSER_STRATEGY", "auto").strip().lower()
-BROWSER_HEADLESS: bool = os.getenv("BROWSER_HEADLESS", "true").lower() in ("true", "1", "yes")
-LOCAL_CDP_ENDPOINT: str = os.getenv("LOCAL_CDP_ENDPOINT", "http://localhost:9222")
-REMOTE_WEBSOCKET_URL: str = os.getenv("REMOTE_WEBSOCKET_URL", "")
-LOCAL_BROWSER_AUTOSTART: bool = os.getenv("LOCAL_BROWSER_AUTOSTART", "true").lower() in (
-    "true",
-    "1",
-    "yes",
-)
-LOCAL_BROWSER_PREFERENCE: str = os.getenv("LOCAL_BROWSER_PREFERENCE", "edge").strip().lower()
-LOCAL_BROWSER_STARTUP_TIMEOUT_SECONDS: float = float(
-    os.getenv("LOCAL_BROWSER_STARTUP_TIMEOUT_SECONDS", "18")
-)
-LOCAL_BROWSER_FALLBACK_TO_ISOLATED: bool = os.getenv("LOCAL_BROWSER_FALLBACK_TO_ISOLATED", "true").lower() in (
-    "true",
-    "1",
-    "yes",
-)
+BROWSER_MODE: str = os.getenv("BROWSER_MODE", "PERSISTENT_CONTEXT")
+BROWSER_STRATEGY: str = os.getenv("BROWSER_STRATEGY", "playwright").strip().lower()
+BROWSER_HEADLESS: bool = os.getenv("BROWSER_HEADLESS", "false").lower() in ("true", "1", "yes")
 FORCE_VISIBLE_LOCAL_BROWSER: bool = os.getenv("FORCE_VISIBLE_LOCAL_BROWSER", "true").lower() in (
     "true",
     "1",
@@ -119,7 +110,7 @@ HUMAN_ACTION_DELAY_MIN_SECONDS: float = float(os.getenv("HUMAN_ACTION_DELAY_MIN_
 HUMAN_ACTION_DELAY_MAX_SECONDS: float = float(os.getenv("HUMAN_ACTION_DELAY_MAX_SECONDS", "3.2"))
 
 # ─── Agent Safety ─────────────────────────────────────────────────────────────
-DRY_RUN_MODE: bool = os.getenv("DRY_RUN_MODE", "true").lower() in ("true", "1", "yes")
+DRY_RUN_MODE: bool = os.getenv("DRY_RUN_MODE", "false").lower() in ("true", "1", "yes")
 AUTONOMOUS_CONTINUATION: bool = os.getenv("AUTONOMOUS_CONTINUATION", "true").lower() in (
     "true",
     "1",

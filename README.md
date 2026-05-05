@@ -1,14 +1,35 @@
 # Agent First IDE
 
-> Dual-model LangGraph browser automation orchestrator with Supervisor + Worker VLM architecture.
+> Autonomous AI-powered browser agent with crash-proof session persistence, multi-model orchestration, and real-world marketing automation.
 
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://python.org)
 [![LangGraph](https://img.shields.io/badge/langgraph-1.x-orange.svg)](https://langchain-ai.github.io/langgraph/)
 [![Playwright](https://img.shields.io/badge/playwright-1.55%2B-green.svg)](https://playwright.dev/python/)
+[![Private](https://img.shields.io/badge/repo-private-red.svg)](#)
 
 ---
 
 ## Architecture
+
+The system provides two execution modes:
+
+### 1. Advanced Single-Agent Mode (`advanced_agent.py`) — **Recommended**
+
+A streamlined, high-performance browser automation agent that bypasses the complex multi-agent graph in favor of a tight action loop:
+
+```
+Extract DOM → Query LLM → Execute Playwright Action → Repeat
+```
+
+**Key Features:**
+- **Single-model driving** — Uses Groq GPT-OSS-120B for lightning-fast JSON tactical decisions
+- **Crash-proof session persistence** — 4-layer protection (user_data_dir + storage_state injection + periodic auto-save + signal handlers)
+- **Google OAuth support** — Leverages persisted Gmail session for "Continue with Google" flows on platforms like Dev.to, Hashnode, etc.
+- **Zero stuck loops** — Action history injection prevents the model from repeating itself
+
+### 2. Multi-Agent Swarm Mode (`start_campaign.py`) — Legacy
+
+Full LangGraph orchestrator with Supervisor subgraph + Worker nodes:
 
 ```mermaid
 graph TD
@@ -22,95 +43,75 @@ graph TD
         RS --> FM
     end
 
-    SUP --> WORKER[Worker VLM]
-    WORKER --> ROUTER{Router}
-    ROUTER -->|"action ready"| BC[Browser Controller]
-    ROUTER -->|"confused / low confidence"| SUP
-    ROUTER -->|"max cycles / stop"| END_NODE([End])
-    BC --> WORKER
+    SUP --> STRAT[Strategic Planner - GLM 5.1]
+    STRAT --> TACT[Tactical Selector - Groq 120B]
+    TACT --> STUCK{Stuck Evaluator}
+    STUCK --> BC[Browser Controller]
+    BC --> STRAT
 ```
 
-### Key Components
-
-| Component | File | Role |
-|---|---|---|
-| **State** | `state.py` | Canonical Pydantic state with campaign context, screenshot history, routing flags |
-| **Supervisor** | `supervisor_subgraph.py` | 4-agent meeting: Context → Strategy → Copy + Risk → Merge |
-| **Worker** | `worker_planner.py` | Vision-Language Model that maps commands to physical browser actions |
-| **Browser** | `browser_runtime.py` | Persistent Playwright runtime with stealth, 3 connectivity modes |
-| **Router** | `nodes.py` | Circuit-breaker routing with HITL pause support |
-| **Database** | `database.py` | SQLite persistence for campaigns, vector memory, target communities |
-| **Graph** | `graph.py` | LangGraph compilation with optional checkpointer and HITL interrupt |
+**Model Hierarchy (Linear, No Load Balancing):**
+- **Strategic Planner**: NVIDIA GLM-5.1 → Gemma 4 (backup)
+- **Tactical Executor**: Groq GPT-OSS-120B → Gemma 4 (backup)
+- **Vision Tool**: Google Gemma 4 (on-demand)
 
 ---
 
-## Prerequisites
+## Session Persistence (Crash-Proof)
 
-- **Python** 3.11 or higher
-- **Playwright** Chromium browser (installed via `playwright install chromium`)
-- **Google API key** for Gemma models (recommended)
-- Optional OpenAI-compatible API key fallback
+The biggest challenge in browser automation is keeping authentication sessions alive across restarts. This project implements a **4-layer persistence strategy**:
+
+| Layer | Protection | Mechanism |
+|---|---|---|
+| **Layer 1** | Normal restarts | Chromium `user_data_dir` (native disk storage) |
+| **Layer 2** | WSL cookie corruption | `storage_state` JSON injection via `add_cookies()` |
+| **Layer 3** | Mid-task crashes | Periodic auto-save every 3 steps during execution |
+| **Layer 4** | Ctrl+C / SIGTERM / exceptions | `SessionGuard` singleton with signal handlers + atexit + triple-attempt finally block |
+
+**Atomic writes** prevent file corruption. A `.backup.json` is maintained as a fallback.
 
 ---
 
 ## Quick Start
 
-### 1. Clone & Navigate
+### 1. Clone & Setup
 
 ```bash
 git clone https://github.com/SandeepAi369/agent-first-ide.git
 cd agent-first-ide
-```
-
-### 2. Create Virtual Environment
-
-```bash
 python3 -m venv .venv
 source .venv/bin/activate
-```
-
-### 3. Install Dependencies
-
-```bash
 pip install -r python-orchestrator/requirements.txt
 playwright install chromium
 ```
 
-### 4. Configure Environment
+### 2. Configure Environment
 
 ```bash
 cp .env.example .env
-# Edit .env with your API keys
+# Edit .env with your API keys (GOOGLE_API_KEY, GROQ_API_KEY, NVIDIA_NIM_API_KEY, etc.)
 ```
 
-### 5. Run Dry Demo
+### 3. Login (One-Time)
 
 ```bash
-python scripts/run_dry_demo.py
+python3 advanced_agent.py login
 ```
 
----
+A browser window opens. Log into your Google/Gmail account manually, then press ENTER in the terminal. Your session is saved to `persistence/session_state.json` and will survive all future restarts.
 
-## Environment Variables
+### 4. Run Agent Tasks
 
-| Variable | Required | Default | Description |
-|---|---|---|---|
-| `GOOGLE_API_KEY` | ✅ (recommended) | — | Google key for Gemma/Gemini models |
-| `OPENAI_API_KEY` | ❌ | — | Fallback key for OpenAI-compatible providers |
-| `WORKER_VLM_API_KEY` | ❌ | Falls back to `OPENAI_API_KEY` | Separate key for Worker VLM |
-| `WORKER_VLM_MODEL` | ❌ | `gemma-4-27b-it` | Model name for Worker planning |
-| `WORKER_VLM_FALLBACK_MODEL` | ❌ | `gemma-3-27b-it` | Fallback model when Google route is unavailable |
-| `SUPERVISOR_MODEL_API_KEY` | ❌ | Falls back to `OPENAI_API_KEY` | Separate key for Supervisor model |
-| `SUPERVISOR_LLM_MODEL` | ❌ | `gemma-4-27b-it` | Model name for Supervisor discussion sub-agents |
-| `SUPERVISOR_FALLBACK_MODEL` | ❌ | `gpt-4.1-mini` | Fallback when Google supervisor model is unavailable |
-| `BROWSER_MODE` | ❌ | `ISOLATED_SERVER` | `LOCAL_NATIVE_CDP` / `ISOLATED_SERVER` / `REMOTE_WEBSOCKET` |
-| `BROWSER_HEADLESS` | ❌ | `true` | Run browser in headless mode |
-| `DRY_RUN_MODE` | ❌ | `true` | Skip destructive actions (post/reply/submit) |
-| `AUTONOMOUS_CONTINUATION` | ❌ | `true` | Auto-skip manual pause and continue with Supervisor re-plan |
-| `MAX_CYCLES` | ❌ | `15` | Maximum graph execution cycles |
-| `LANGCHAIN_TRACING_V2` | ❌ | `true` | Enable LangSmith tracing |
-| `LANGCHAIN_API_KEY` | ❌ | — | LangSmith API key |
-| `LANGCHAIN_PROJECT` | ❌ | `agent-first-ide` | LangSmith project name |
+```bash
+# Simple test (Wikipedia search)
+python3 advanced_agent.py run "Go to https://en.wikipedia.org, search for Alan Turing, and verify the article title."
+
+# Form fill test
+python3 advanced_agent.py run "Go to https://the-internet.herokuapp.com/login, type 'tomsmith' as username, type 'SuperSecretPassword!' as password, click Login, verify success."
+
+# Marketing task (Dev.to article)
+python3 advanced_agent.py run "Go to https://dev.to, log in with Google, create a new post about your project, and publish it."
+```
 
 ---
 
@@ -118,73 +119,62 @@ python scripts/run_dry_demo.py
 
 ```
 agent-first-ide/
+├── advanced_agent.py                  # Single-agent browser automation (recommended)
+├── start_campaign.py                  # Legacy multi-agent campaign launcher
+├── check_cookies.py                   # Cookie inspection utility
+├── test_form_fill.py                  # Swarm testing script
+├── .env                               # API keys (git-ignored)
 ├── .gitignore
-├── .env.example
 ├── README.md
-├── pyproject.toml
+├── persistence/                       # Runtime data (git-ignored)
+│   ├── session_state.json             # Saved cookies + localStorage
+│   ├── session_state.backup.json      # Backup state
+│   └── browser_sessions/             # Chromium profiles
 ├── python-orchestrator/
 │   ├── requirements.txt
 │   ├── app/
-│   │   ├── __init__.py
-│   │   ├── config.py              # Centralized environment configuration
-│   │   ├── logger.py              # Shared structured logging
+│   │   ├── config.py                  # Centralized environment configuration
+│   │   ├── logger.py                  # Structured logging
+│   │   ├── observability.py           # LangSmith tracing
 │   │   └── browser_promoter/
-│   │       ├── __init__.py
-│   │       ├── state.py           # Pydantic state models
-│   │       ├── graph.py           # LangGraph compilation
-│   │       ├── nodes.py           # Supervisor, Worker, Router, Browser nodes
-│   │       ├── dashboard.py       # Terminal status dashboard
-│   │       ├── supervisor_subgraph.py
-│   │       ├── database.py        # SQLite persistence
-│   │       ├── worker_planner.py  # Vision-Language Model planner
-│   │       └── browser_runtime.py # Playwright runtime manager
+│   │       ├── state.py               # Pydantic state models
+│   │       ├── graph.py               # LangGraph compilation
+│   │       ├── nodes.py               # All graph nodes + DOM extraction
+│   │       ├── browser_runtime.py     # Playwright persistent context runtime
+│   │       ├── cdp_stealth_launcher.py # Stealth hardening (UA, canvas, WebGL)
+│   │       ├── worker_planner.py      # Strategic + Tactical + Vision planners
+│   │       ├── supervisor_subgraph.py # 4-agent supervisor meeting
+│   │       ├── database.py            # SQLite persistence
+│   │       ├── dashboard.py           # Terminal status dashboard
+│   │       ├── github_intelligence.py # GitHub repo analysis for marketing
+│   │       └── marketing_engine.py    # Platform strategy engine
 │   └── tests/
-│       ├── conftest.py
-│       ├── test_state.py
-│       ├── test_database.py
-│       └── test_graph.py
 └── scripts/
-    └── run_dry_demo.py
 ```
 
 ---
 
-## Browser Modes
+## Environment Variables
 
-| Mode | Use Case |
-|---|---|
-| `ISOLATED_SERVER` | Launch a fresh Chromium with persistent profile (default, safest) |
-| `LOCAL_NATIVE_CDP` | Attach to an already-running Chrome via CDP on `localhost:9222` |
-| `REMOTE_WEBSOCKET` | Connect to a remote browser instance via WebSocket URL |
-
----
-
-## Safety Features
-
-- **Dry-run mode** — destructive actions (post, reply, submit) are highlighted but not executed
-- **HITL pause** — automatic pause when login walls, captchas, or MFA are detected
-- **Cycle limit** — hard cap at 15 cycles (configurable) to prevent runaway loops
-- **Confidence threshold** — Worker routes back to Supervisor when confidence drops below 0.4
+| Variable | Required | Description |
+|---|---|---|
+| `GOOGLE_API_KEY` | ✅ | Google key for Gemma 4 models (vision + backup) |
+| `NVIDIA_NIM_API_KEY` | ❌ | NVIDIA NIM key for GLM-5.1 strategic planner |
+| `GROQ_API_KEY` | ❌ | Groq key for GPT-OSS-120B tactical executor |
+| `OPENAI_API_KEY` | ❌ | Fallback key for OpenAI-compatible providers |
+| `BROWSER_HEADLESS` | ❌ | Run browser headless (default: `false`) |
+| `DRY_RUN_MODE` | ❌ | Skip destructive actions (default: `true`) |
+| `MAX_CYCLES` | ❌ | Maximum graph cycles (default: `15`) |
 
 ---
 
-## Development
+## Safety & Security
 
-```bash
-# Install dev dependencies
-pip install -r python-orchestrator/requirements.txt
-pip install pytest pytest-asyncio mypy ruff
-
-# Run tests
-pytest python-orchestrator/tests/ -v
-
-# Lint & format
-ruff check python-orchestrator/
-ruff format python-orchestrator/
-
-# Type check
-mypy python-orchestrator/app/ --ignore-missing-imports
-```
+- **Private repository** — All code and credentials stay private
+- **`.gitignore` protection** — `.env`, `persistence/`, browser profiles, and cookies are never committed
+- **Dry-run mode** — Destructive actions are skipped by default
+- **Stealth hardening** — WebDriver masking, canvas noise, WebGL spoofing, 12 browser fingerprint profiles
+- **Crash-proof saves** — Session state is always preserved, even on crashes
 
 ---
 
