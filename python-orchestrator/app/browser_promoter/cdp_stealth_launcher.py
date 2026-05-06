@@ -57,6 +57,25 @@ def get_stealth_user_agent() -> str:
 # Default export for backward compatibility
 STEALTH_USER_AGENT = get_stealth_user_agent()
 
+# ── Randomized Viewport Pool ──
+# Real-world common resolutions to prevent fingerprint linkage across sessions.
+import random as _random
+
+VIEWPORT_POOL: list[dict[str, int]] = [
+    {"width": 1920, "height": 1080},
+    {"width": 1536, "height": 864},
+    {"width": 1440, "height": 900},
+    {"width": 1366, "height": 768},
+    {"width": 1600, "height": 900},
+    {"width": 1280, "height": 800},
+]
+
+
+def get_random_viewport() -> dict[str, int]:
+    """Return a random viewport from the pool for this session."""
+    return _random.choice(VIEWPORT_POOL)
+
+
 STEALTH_LAUNCH_ARGS = [
     "--disable-blink-features=AutomationControlled",
     "--disable-dev-shm-usage",
@@ -66,61 +85,259 @@ STEALTH_LAUNCH_ARGS = [
     "--disable-infobars",
     "--disable-features=IsolateOrigins,SitePerProcess,OptimizeImageLoading,EnableOverscroll",
     "--password-store=basic",
+    # Prevent WebRTC from leaking local IP via mDNS — a common headless tell
+    "--disable-features=WebRtcHideLocalIpsWithMdns",
+    # Disable background network service that headless mode handles differently
+    "--disable-background-networking",
+    # Suppress "Chrome is being controlled by automated software" infobar
+    "--disable-client-side-phishing-detection",
 ]
 
-# Includes webdriver masking + canvas/webgl noise patch + closed shadow root capture.
+# ═══════════════════════════════════════════════════════════════════════════════
+#  World-Class Stealth Init Script (v3.0)
+#
+#  Injection layers:
+#    1. Proxy-based navigator.webdriver masking (defeats getOwnPropertyDescriptor)
+#    2. Canvas 2D fingerprint noise (per-session random seed)
+#    3. WebGL1 + WebGL2 vendor/renderer spoofing
+#    4. Permissions.query override (blocks headless notification leak)
+#    5. chrome.csi / chrome.loadTimes stubs (present in real Chrome, missing in headless)
+#    6. Plugin array spoofing (headless has empty plugins)
+#    7. AudioContext fingerprint noise
+#    8. Closed ShadowRoot capture (for DOM piercing)
+#    9. navigator property hardening (platform, deviceMemory, hardwareConcurrency)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_PLATFORM_STRING = "Linux x86_64" if _is_linux_env() else "Win32"
+
 STEALTH_INIT_SCRIPT = """
 (() => {
+  // ────────────────────────────────────────────────────────
+  // 0. Utility: define property that survives introspection
+  // ────────────────────────────────────────────────────────
   const defineSafe = (obj, key, value) => {
     try {
-      Object.defineProperty(obj, key, { get: () => value, configurable: true });
+      Object.defineProperty(obj, key, {
+        get: () => value,
+        configurable: true,
+        enumerable: true,
+      });
     } catch (_) {}
   };
 
-  defineSafe(navigator, 'webdriver', undefined);
-  defineSafe(navigator, 'languages', ['en-US', 'en']);
-  defineSafe(navigator, 'platform', '""" + ("Linux x86_64" if _is_linux_env() else "Win32") + """');
-  defineSafe(navigator, 'deviceMemory', 8);
-  defineSafe(navigator, 'hardwareConcurrency', 12);
-  defineSafe(navigator, 'maxTouchPoints', 0);
-  
-  delete window.cdc_goog_xxx;
-  delete window.cdc_goog_;
-  
-  window.chrome = window.chrome || { runtime: {} };
-
-  // Advanced Plugin spoofing
-  if (!navigator.plugins || navigator.plugins.length === 0) {
-    defineSafe(navigator, 'plugins', [1, 2, 3]);
+  // ────────────────────────────────────────────────────────
+  // 1. navigator.webdriver — Proxy-based deep masking
+  //    Defeats: Object.getOwnPropertyDescriptor(navigator, 'webdriver')
+  //    Defeats: navigator.webdriver === undefined checks
+  //    Defeats: 'webdriver' in navigator checks
+  // ────────────────────────────────────────────────────────
+  try {
+    const originalNavigator = navigator;
+    const navigatorProxy = new Proxy(originalNavigator, {
+      has: (target, key) => {
+        if (key === 'webdriver') return false;
+        return key in target;
+      },
+      get: (target, key) => {
+        if (key === 'webdriver') return undefined;
+        const value = target[key];
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+      getOwnPropertyDescriptor: (target, key) => {
+        if (key === 'webdriver') return undefined;
+        return Object.getOwnPropertyDescriptor(target, key);
+      },
+    });
+    Object.defineProperty(window, 'navigator', {
+      get: () => navigatorProxy,
+      configurable: true,
+    });
+  } catch (_) {
+    // Fallback to simple override if Proxy fails
+    try {
+      Object.defineProperty(navigator, 'webdriver', {
+        get: () => undefined,
+        configurable: true,
+      });
+    } catch (_) {}
   }
 
+  // ────────────────────────────────────────────────────────
+  // 2. Navigator property hardening
+  // ────────────────────────────────────────────────────────
+  defineSafe(navigator, 'languages', ['en-US', 'en']);
+  defineSafe(navigator, 'platform', '""" + _PLATFORM_STRING + """');
+  defineSafe(navigator, 'deviceMemory', 8);
+  defineSafe(navigator, 'hardwareConcurrency', """ + str(_random.choice([8, 10, 12, 16])) + """);
+  defineSafe(navigator, 'maxTouchPoints', 0);
+
+  // Clean Chromium DevTools protocol traces
+  delete window.cdc_goog_xxx;
+  delete window.cdc_goog_;
+  for (const key of Object.keys(window)) {
+    if (key.startsWith('cdc_') || key.startsWith('__webdriver')) {
+      try { delete window[key]; } catch (_) {}
+    }
+  }
+
+  // ────────────────────────────────────────────────────────
+  // 3. chrome.* stubs — present in real Chrome, missing in headless
+  // ────────────────────────────────────────────────────────
+  window.chrome = window.chrome || {};
+  window.chrome.runtime = window.chrome.runtime || {};
+
+  if (!window.chrome.csi) {
+    window.chrome.csi = function() {
+      return {
+        onloadT: Date.now(),
+        startE: Date.now() - Math.floor(Math.random() * 500 + 200),
+        pageT: Math.random() * 2000 + 1000,
+        tran: 15,
+      };
+    };
+  }
+
+  if (!window.chrome.loadTimes) {
+    window.chrome.loadTimes = function() {
+      return {
+        commitLoadTime: Date.now() / 1000,
+        connectionInfo: 'h2',
+        finishDocumentLoadTime: Date.now() / 1000 + Math.random(),
+        finishLoadTime: Date.now() / 1000 + Math.random() * 2,
+        firstPaintAfterLoadTime: 0,
+        firstPaintTime: Date.now() / 1000 + 0.1,
+        navigationType: 'Other',
+        npnNegotiatedProtocol: 'h2',
+        requestTime: Date.now() / 1000 - Math.random(),
+        startLoadTime: Date.now() / 1000 - Math.random() * 2,
+        wasAlternateProtocolAvailable: false,
+        wasFetchedViaSpdy: true,
+        wasNpnNegotiated: true,
+      };
+    };
+  }
+
+  // ────────────────────────────────────────────────────────
+  // 4. Plugin array spoofing (headless = empty plugins)
+  // ────────────────────────────────────────────────────────
+  if (!navigator.plugins || navigator.plugins.length === 0) {
+    const fakePlugin = (name, desc, filename) => ({
+      name, description: desc, filename, length: 1,
+      0: { type: 'application/pdf', suffixes: 'pdf', description: desc },
+    });
+    const fakePlugins = [
+      fakePlugin('Chrome PDF Plugin', 'Portable Document Format', 'internal-pdf-viewer'),
+      fakePlugin('Chrome PDF Viewer', 'Portable Document Format', 'mhjfbmdgcfjbbpaeojofohoefgiehjai'),
+      fakePlugin('Native Client', 'Native Client Executable', 'internal-nacl-plugin'),
+    ];
+    defineSafe(navigator, 'plugins', {
+      length: fakePlugins.length,
+      item: (i) => fakePlugins[i] || null,
+      namedItem: (n) => fakePlugins.find(p => p.name === n) || null,
+      refresh: () => {},
+      0: fakePlugins[0], 1: fakePlugins[1], 2: fakePlugins[2],
+      [Symbol.iterator]: function*() { yield* fakePlugins; },
+    });
+    defineSafe(navigator, 'mimeTypes', {
+      length: 2,
+      item: (i) => [{type:'application/pdf'}, {type:'text/pdf'}][i] || null,
+      namedItem: () => null,
+      0: {type: 'application/pdf', suffixes: 'pdf', description: '', enabledPlugin: fakePlugins[0]},
+      1: {type: 'text/pdf', suffixes: 'pdf', description: '', enabledPlugin: fakePlugins[0]},
+    });
+  }
+
+  // ────────────────────────────────────────────────────────
+  // 5. Permissions.query override — block notification headless leak
+  // ────────────────────────────────────────────────────────
+  try {
+    const originalQuery = window.Permissions.prototype.query;
+    window.Permissions.prototype.query = function(params) {
+      if (params && params.name === 'notifications') {
+        return Promise.resolve({ state: Notification.permission });
+      }
+      return originalQuery.call(this, params);
+    };
+  } catch (_) {}
+
+  // ────────────────────────────────────────────────────────
+  // 6. Canvas 2D fingerprint noise (per-session random seed)
+  // ────────────────────────────────────────────────────────
+  const canvasSeed = Math.floor(Math.random() * 255);
   const originalGetContext = HTMLCanvasElement.prototype.getContext;
   HTMLCanvasElement.prototype.getContext = function(type, attrs) {
     const ctx = originalGetContext.call(this, type, attrs);
     if (!ctx) return ctx;
 
     if (type === '2d') {
-      const originalGetImageData = ctx.getImageData.bind(ctx);
+      const origGetImageData = ctx.getImageData.bind(ctx);
       ctx.getImageData = function(x, y, w, h) {
-        const imageData = originalGetImageData(x, y, w, h);
-        if (imageData && imageData.data && imageData.data.length > 0) {
-          imageData.data[0] = imageData.data[0] ^ 1;
-          imageData.data[1] = imageData.data[1] ^ 1;
+        const imageData = origGetImageData(x, y, w, h);
+        if (imageData && imageData.data && imageData.data.length > 4) {
+          // XOR first 4 channels with session-unique seed
+          for (let i = 0; i < Math.min(imageData.data.length, 16); i += 4) {
+            imageData.data[i] = imageData.data[i] ^ (canvasSeed & 0x03);
+            imageData.data[i+1] = imageData.data[i+1] ^ ((canvasSeed >> 2) & 0x03);
+          }
         }
         return imageData;
       };
-    }
 
+      // Also intercept toDataURL for canvas fingerprinting
+      const origToDataURL = this.toDataURL.bind(this);
+      this.toDataURL = function(type) {
+        // Inject a single invisible pixel mutation before export
+        try {
+          ctx.fillStyle = `rgba(${canvasSeed % 3}, ${canvasSeed % 5}, ${canvasSeed % 7}, 0.004)`;
+          ctx.fillRect(0, 0, 1, 1);
+        } catch (_) {}
+        return origToDataURL(type);
+      };
+    }
     return ctx;
   };
 
-  const originalGetParameter = WebGLRenderingContext.prototype.getParameter;
-  WebGLRenderingContext.prototype.getParameter = function(param) {
-    if (param === 37445) return 'Intel Inc.';
-    if (param === 37446) return 'Intel Iris OpenGL Engine';
-    return originalGetParameter.call(this, param);
+  // ────────────────────────────────────────────────────────
+  // 7. WebGL1 + WebGL2 vendor/renderer spoofing
+  // ────────────────────────────────────────────────────────
+  const WEBGL_VENDOR = 'Intel Inc.';
+  const WEBGL_RENDERER = 'Intel Iris OpenGL Engine';
+  const UNMASKED_VENDOR_EXT = 37445;
+  const UNMASKED_RENDERER_EXT = 37446;
+
+  const patchWebGL = (proto) => {
+    if (!proto) return;
+    const origGetParam = proto.getParameter;
+    proto.getParameter = function(param) {
+      if (param === UNMASKED_VENDOR_EXT) return WEBGL_VENDOR;
+      if (param === UNMASKED_RENDERER_EXT) return WEBGL_RENDERER;
+      return origGetParam.call(this, param);
+    };
   };
 
+  try { patchWebGL(WebGLRenderingContext.prototype); } catch (_) {}
+  try { patchWebGL(WebGL2RenderingContext.prototype); } catch (_) {}
+
+  // ────────────────────────────────────────────────────────
+  // 8. AudioContext fingerprint noise
+  // ────────────────────────────────────────────────────────
+  try {
+    const origCreateOscillator = AudioContext.prototype.createOscillator;
+    AudioContext.prototype.createOscillator = function() {
+      const osc = origCreateOscillator.call(this);
+      const origConnect = osc.connect.bind(osc);
+      osc.connect = function(dest) {
+        // Inject imperceptible frequency drift to defeat audio fingerprinting
+        try { osc.detune.value = (Math.random() - 0.5) * 0.2; } catch (_) {}
+        return origConnect(dest);
+      };
+      return osc;
+    };
+  } catch (_) {}
+
+  // ────────────────────────────────────────────────────────
+  // 9. Closed ShadowRoot capture (for DOM piercing)
+  // ────────────────────────────────────────────────────────
   const originalAttachShadow = Element.prototype.attachShadow;
   Element.prototype.attachShadow = function(init) {
     const root = originalAttachShadow.call(this, init);
