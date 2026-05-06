@@ -28,6 +28,7 @@ from app.browser_promoter.cdp_stealth_launcher import (
     STEALTH_LAUNCH_ARGS,
     STEALTH_USER_AGENT,
     apply_page_stealth,
+    get_random_viewport,
 )
 from app.browser_promoter.state import BrowserConfig
 from app.logger import get_logger

@@ -1,21 +1,32 @@
-"""Advanced Single-Agent Browser Automation with CRASH-PROOF Session Persistence.
+"""Advanced Single-Agent Browser Automation with Native State Persistence (v8.0).
 
-Session Persistence Strategy (4 layers of protection):
-  Layer 1 — user_data_dir: Chromium's native disk-level cookie storage.
-  Layer 2 — storage_state injection: Explicit cookie/localStorage replay on launch.
-  Layer 3 — Periodic auto-save: Cookies dumped to disk every N steps during execution.
-  Layer 4 — Crash-proof finally: try/except/finally with signal handlers + atexit
-             guarantee state is saved even on KeyboardInterrupt, SIGTERM, or crashes.
+Session Persistence:
+  Pure native user_data_dir — Chromium manages all cookies, localStorage,
+  IndexedDB, and Cache natively on disk. No synthetic JSON injection.
+  Login once via --login mode, then all subsequent runs inherit the session.
+
+Enterprise Features (v5.0):
+  - Smart DOM Compression with priority tiers (P0 forms > P1 links > P2 nav)
+  - GhostCursor Bézier mouse paths + human typing with typo correction
+  - Adversarial Content Critic (pre-publish red-team review)
+  - Episodic Campaign Memory (SQLite dedup + cooldown enforcement)
+  - Multi-key API failover: Groq → DeepSeek → NVIDIA GLM → Gemma 4
+
+Self-Healing & Anti-Detection (v6.0+):
+  - Anti-Loop Watchdog: detects repeated URL/action patterns, injects override
+  - CAPTCHA/Cloudflare Detector: auto-clicks challenge checkboxes via GhostCursor
+  - LLM Circuit Breaker: hard ceiling on requests/failures per run
+  - Progressive Perception (v7.0): ReAct Heavy Mode with Vision + DOM
 """
 
 import argparse
 import asyncio
 import atexit
 import json
-import os
 import signal
 import sys
 import traceback
+from collections import Counter
 from pathlib import Path
 
 from pydantic import BaseModel, Field
@@ -29,22 +40,73 @@ from app.browser_promoter.cdp_stealth_launcher import (
     STEALTH_LAUNCH_ARGS,
     STEALTH_USER_AGENT,
     apply_page_stealth,
+    get_random_viewport,
+)
+from app.browser_promoter.browser_warmup import (
+    run_warmup,
+    extract_target_url_from_objective,
 )
 from app.browser_promoter.nodes import _extract_interactive_regions
 from app.browser_promoter.worker_planner import _build_worker_llms
 from app.logger import get_logger
 from playwright.async_api import async_playwright, BrowserContext, Page
 
+# Enterprise modules (v5.0)
+from ghost_input import ghost_click, ghost_type, ghost_scroll
+from campaign_memory import CampaignMemory
+from content_critic import ContentCritic
+
 logger = get_logger("advanced_agent")
+
+
+
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  LLM Circuit Breaker — Prevents runaway API drain
+# ═══════════════════════════════════════════════════════════════════════════════
+class CircuitBreaker:
+    """Track cumulative LLM usage per run and enforce hard ceilings.
+
+    Thresholds:
+      max_requests=50  — enough for 20 steps × ~2.5 LLM calls/step
+      max_failures=10  — if 10 calls fail across ALL models, something is broken
+    """
+
+    def __init__(self, max_requests: int = 50, max_failures: int = 10):
+        self.request_count = 0
+        self.failure_count = 0
+        self.max_requests = max_requests
+        self.max_failures = max_failures
+
+    def record_success(self):
+        self.request_count += 1
+
+    def record_failure(self):
+        self.failure_count += 1
+        self.request_count += 1
+
+    @property
+    def tripped(self) -> bool:
+        return (self.request_count >= self.max_requests
+                or self.failure_count >= self.max_failures)
+
+    @property
+    def reason(self) -> str:
+        if self.request_count >= self.max_requests:
+            return f"Request ceiling hit ({self.request_count}/{self.max_requests})"
+        if self.failure_count >= self.max_failures:
+            return f"Failure ceiling hit ({self.failure_count}/{self.max_failures})"
+        return ""
+
+    def status_line(self) -> str:
+        return f"[CB: {self.request_count}/{self.max_requests} reqs, {self.failure_count}/{self.max_failures} fails]"
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  Persistence Paths (all inside WSL)
 # ═══════════════════════════════════════════════════════════════════════════════
 PERSISTENCE_ROOT = Path(__file__).parent / "persistence"
-STATE_FILE = PERSISTENCE_ROOT / "session_state.json"
-STATE_BACKUP = PERSISTENCE_ROOT / "session_state.backup.json"
 PROFILE_DIR = PERSISTENCE_ROOT / "browser_sessions" / "agent_main"
-AUTO_SAVE_EVERY_N_STEPS = 3  # Save cookies every 3 steps during execution
 
 
 def _ensure_dirs():
@@ -53,27 +115,20 @@ def _ensure_dirs():
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  Crash-Proof Session Manager
+#  Browser Lifecycle Guard
 # ═══════════════════════════════════════════════════════════════════════════════
 class SessionGuard:
-    """Guarantees session state is saved no matter how the process exits.
+    """Lightweight lifecycle guard for the browser context.
 
-    Registers itself as:
-      - A signal handler for SIGINT (Ctrl+C) and SIGTERM (kill)
-      - An atexit handler (called on normal interpreter shutdown)
-      - Exposes save() for manual/periodic saves
-
-    The guard maintains a reference to the live BrowserContext and uses
-    atomic writes (write to .tmp then rename) to prevent file corruption.
+    With native user_data_dir persistence, Chromium handles all cookie/storage
+    persistence internally. This guard only ensures the browser context is
+    closed cleanly on exit (which flushes pending state to disk).
     """
 
     _instance: "SessionGuard | None" = None
 
     def __init__(self):
         self._context: BrowserContext | None = None
-        self._loop: asyncio.AbstractEventLoop | None = None
-        self._last_saved_state: dict | None = None
-        self._save_count = 0
         self._installed = False
 
     @classmethod
@@ -82,10 +137,9 @@ class SessionGuard:
             cls._instance = cls()
         return cls._instance
 
-    def attach(self, context: BrowserContext, loop: asyncio.AbstractEventLoop):
+    def attach(self, context: BrowserContext):
         """Attach a live browser context to guard."""
         self._context = context
-        self._loop = loop
         if not self._installed:
             self._install_handlers()
             self._installed = True
@@ -93,114 +147,27 @@ class SessionGuard:
 
     def _install_handlers(self):
         """Install signal + atexit handlers (once)."""
-        # Signal handlers
         for sig in (signal.SIGINT, signal.SIGTERM):
             try:
                 signal.signal(sig, self._signal_handler)
             except (OSError, ValueError):
-                pass  # Can't set signal handler in non-main thread
-        # atexit handler
+                pass
         atexit.register(self._atexit_handler)
         logger.info("SessionGuard: signal + atexit handlers installed")
 
     def _signal_handler(self, signum, frame):
-        """Called on Ctrl+C or kill — force-save synchronously then exit."""
+        """Called on Ctrl+C or kill — close context then exit."""
         sig_name = signal.Signals(signum).name
-        logger.warning("SessionGuard: caught %s — force-saving session...", sig_name)
-        self._force_sync_save()
-        logger.info("SessionGuard: session saved after %s. Exiting.", sig_name)
+        logger.warning("SessionGuard: caught %s — closing browser...", sig_name)
+        # Context.close() flushes all native state to user_data_dir
+        self.detach()
         sys.exit(0)
 
     def _atexit_handler(self):
-        """Called on normal interpreter shutdown — last-resort save."""
+        """Called on normal interpreter shutdown."""
         if self._context is not None:
-            logger.info("SessionGuard: atexit triggered — attempting final save...")
-            self._force_sync_save()
-
-    async def async_save(self):
-        """Save session state asynchronously (preferred path)."""
-        if self._context is None:
-            logger.warning("SessionGuard: no context attached, skipping save")
-            return
-
-        try:
-            state = await self._context.storage_state()
-            self._atomic_write(state)
-            self._last_saved_state = state
-            self._save_count += 1
-            cookie_count = len(state.get("cookies", []))
-            origin_count = len(state.get("origins", []))
-            logger.info(
-                "SessionGuard: saved (%d cookies, %d origins) [save #%d]",
-                cookie_count, origin_count, self._save_count,
-            )
-        except Exception as e:
-            logger.error("SessionGuard: async save failed: %s", e)
-            # Fall back to writing whatever we last had
-            if self._last_saved_state:
-                logger.info("SessionGuard: writing last known good state as fallback")
-                self._atomic_write(self._last_saved_state)
-
-    def _force_sync_save(self):
-        """Synchronous save — used by signal handlers and atexit.
-
-        When a signal fires, the event loop may be dead. We try multiple
-        strategies in order of reliability.
-        """
-        if self._context is None:
-            return
-
-        # Strategy 1: Try to run async save in the existing loop
-        try:
-            loop = self._loop or asyncio.get_event_loop()
-            if loop.is_running():
-                # Schedule it and hope we get to it
-                loop.create_task(self.async_save())
-                return
-            else:
-                loop.run_until_complete(self.async_save())
-                return
-        except Exception:
-            pass
-
-        # Strategy 2: Create a brand new event loop
-        try:
-            new_loop = asyncio.new_event_loop()
-            new_loop.run_until_complete(self.async_save())
-            new_loop.close()
-            return
-        except Exception:
-            pass
-
-        # Strategy 3: Write whatever we last captured (no async needed)
-        if self._last_saved_state:
-            logger.warning("SessionGuard: all async strategies failed — writing last known state")
-            try:
-                self._atomic_write(self._last_saved_state)
-            except Exception as e:
-                logger.error("SessionGuard: CRITICAL — even fallback write failed: %s", e)
-
-    def _atomic_write(self, state: dict):
-        """Write state to disk atomically (tmp + rename) to prevent corruption."""
-        _ensure_dirs()
-        tmp_path = STATE_FILE.with_suffix(".tmp")
-        try:
-            tmp_path.write_text(json.dumps(state, indent=2))
-            # Backup the old state file first
-            if STATE_FILE.exists():
-                try:
-                    STATE_BACKUP.write_text(STATE_FILE.read_text())
-                except Exception:
-                    pass
-            # Atomic rename
-            tmp_path.rename(STATE_FILE)
-        except Exception as e:
-            logger.error("SessionGuard: atomic write failed: %s", e)
-            # Direct write as absolute last resort
-            try:
-                STATE_FILE.write_text(json.dumps(state, indent=2))
-            except Exception:
-                pass
+            logger.info("SessionGuard: atexit — detaching context")
+            self.detach()
 
     def detach(self):
         """Detach the context reference (called after context.close())."""
@@ -208,19 +175,27 @@ class SessionGuard:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  Browser Launch with storage_state injection
+#  Browser Launch — Pure Native Persistence (v8.0)
 # ═══════════════════════════════════════════════════════════════════════════════
 async def launch_browser(*, headless: bool = False) -> tuple[BrowserContext, Page]:
-    """Launch Playwright with persistent profile + storage_state injection."""
+    """Launch Playwright with a persistent user_data_dir profile.
+
+    All cookies, localStorage, IndexedDB, and Cache are managed natively
+    by the Chromium engine on disk. No synthetic injection needed.
+    """
     _ensure_dirs()
     pw = await async_playwright().start()
 
-    logger.info("Launching Playwright Chromium (persistent profile: %s)", PROFILE_DIR)
+    logger.info("Launching Playwright Chromium (native profile: %s)", PROFILE_DIR)
+
+    # Randomize viewport per session to prevent fingerprint linkage
+    session_viewport = get_random_viewport()
+    logger.info("Session viewport: %dx%d", session_viewport["width"], session_viewport["height"])
 
     context = await pw.chromium.launch_persistent_context(
         user_data_dir=str(PROFILE_DIR),
         headless=headless,
-        viewport={"width": 1440, "height": 900},
+        viewport=session_viewport,
         locale="en-US",
         timezone_id="America/New_York",
         user_agent=STEALTH_USER_AGENT,
@@ -232,48 +207,9 @@ async def launch_browser(*, headless: bool = False) -> tuple[BrowserContext, Pag
     )
     await context.add_init_script(STEALTH_INIT_SCRIPT)
 
-    # ── Attach SessionGuard immediately ──
+    # ── Attach lifecycle guard ──
     guard = SessionGuard.get()
-    guard.attach(context, asyncio.get_running_loop())
-
-    # ── Inject saved cookies from state.json if it exists ──
-    state_source = STATE_FILE if STATE_FILE.exists() else (STATE_BACKUP if STATE_BACKUP.exists() else None)
-    if state_source:
-        logger.info("Injecting saved session state from %s", state_source)
-        try:
-            saved = json.loads(state_source.read_text())
-            cookies = saved.get("cookies", [])
-            if cookies:
-                for c in cookies:
-                    ss = c.get("sameSite", "Lax")
-                    if ss not in ("Strict", "Lax", "None"):
-                        c["sameSite"] = "Lax"
-                await context.add_cookies(cookies)
-                logger.info("Injected %d cookies from saved state.", len(cookies))
-
-            origins = saved.get("origins", [])
-            for origin_data in origins:
-                origin_url = origin_data.get("origin", "")
-                ls_items = origin_data.get("localStorage", [])
-                if origin_url and ls_items:
-                    temp_page = await context.new_page()
-                    try:
-                        await temp_page.goto(origin_url, wait_until="domcontentloaded", timeout=10000)
-                        for item in ls_items:
-                            await temp_page.evaluate(
-                                "(args) => localStorage.setItem(args.name, args.value)",
-                                {"name": item["name"], "value": item["value"]},
-                            )
-                    except Exception as e:
-                        logger.warning("Failed to inject localStorage for %s: %s", origin_url, e)
-                    finally:
-                        await temp_page.close()
-
-            # Seed the guard's last known state so signal handlers have data
-            guard._last_saved_state = saved
-            logger.info("Session state injection complete.")
-        except Exception as e:
-            logger.warning("Could not load state file: %s (starting fresh)", e)
+    guard.attach(context)
 
     # Get or create page
     if context.pages:
@@ -295,38 +231,32 @@ async def launch_browser(*, headless: bool = False) -> tuple[BrowserContext, Pag
 #  Manual Login Mode (--login)
 # ═══════════════════════════════════════════════════════════════════════════════
 async def manual_login_mode():
-    """Open a browser for human login, then save the session state."""
+    """Open a browser for human login. Chromium natively persists the session."""
     context, page = await launch_browser()
-    guard = SessionGuard.get()
 
     print("\n" + "=" * 70)
-    print("  🔐  MANUAL LOGIN MODE")
+    print("  🔐  MANUAL LOGIN MODE (Native Persistence)")
     print("=" * 70)
     print("  A Chromium browser window has opened.")
     print("  Please log into your Google/Gmail/Reddit account(s) now.")
     print("")
     print("  Once you are fully logged in and can see your inbox/feed,")
-    print("  come back here and press ENTER to save the session.")
-    print("  (Even if you Ctrl+C, the session will be auto-saved!)")
+    print("  come back here and press ENTER to close the browser.")
+    print("  Your session is saved AUTOMATICALLY in the browser profile.")
     print("=" * 70)
 
     try:
         input("\n  👉 Press ENTER when login is complete: ")
     except (EOFError, KeyboardInterrupt):
-        logger.info("Input interrupted — saving session anyway...")
+        logger.info("Input interrupted — closing browser...")
 
     try:
-        await guard.async_save()
+        await context.close()
     except Exception:
-        guard._force_sync_save()
-    finally:
-        try:
-            await context.close()
-        except Exception:
-            pass
-        guard.detach()
+        pass
+    SessionGuard.get().detach()
 
-    print("\n  ✅ Session saved! Future runs will use your login automatically.\n")
+    print("\n  ✅ Session persisted! Future runs will use your login automatically.\n")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -340,43 +270,208 @@ class AdvancedAction(BaseModel):
     text: str | None = Field(default=None, description="Text to type for 'type' action")
 
 
+class HeavyAction(BaseModel):
+    """ReAct schema for Heavy Mode (Vision + DOM)."""
+    current_state_analysis: str = Field(description="What exactly do you see on the screen right now? Are there any popups, overlays, or login prompts?")
+    obstacle_detection: str = Field(description="Is the path to the goal blocked? If so, state the micro-plan to resolve it (e.g., 'Must click Continue with Google first').")
+    reasoning: str = Field(description="Based on the analysis, why is this specific next action chosen?")
+    action_type: str = Field(description="One of: 'goto', 'click', 'type', 'scroll', 'press_enter', 'done'")
+    url: str | None = Field(default=None, description="URL for 'goto' action")
+    element_id: int | None = Field(default=None, description="Index of the interactive element")
+    text: str | None = Field(default=None, description="Text to type for 'type' action")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Smart DOM Compression (Priority-Tiered)
+# ═══════════════════════════════════════════════════════════════════════════════
+def _compress_dom_for_llm(raw_regions: list, max_tokens_budget: int = 2000) -> list[dict]:
+    """Compress DOM elements into a token-efficient representation with priority tiers.
+
+    Priority tiers:
+      P0 (critical): input, textarea, select, button, [role=button]
+      P1 (important): a (links with unique text)
+      P2 (low): generic divs, navs, repeated elements
+
+    Deduplicates elements with identical text and drops P2 elements
+    when the budget is tight.
+    """
+    P0_TAGS = {"input", "textarea", "select", "button"}
+    P0_ROLES = {"button", "textbox", "combobox", "searchbox", "checkbox", "radio"}
+
+    seen_texts: set[str] = set()
+    p0_items: list[dict] = []
+    p1_items: list[dict] = []
+    p2_items: list[dict] = []
+
+    for i, r in enumerate(raw_regions):
+        text_key = (r.tag + ":" + r.text[:60]).lower().strip()
+
+        # Dedup: skip elements with identical tag+text
+        if text_key in seen_texts and r.tag not in P0_TAGS:
+            continue
+        seen_texts.add(text_key)
+
+        item = {
+            "index": i,
+            "tag": r.tag,
+            "role": r.role,
+            "text": r.text[:100],
+            "x": r.x,
+            "y": r.y,
+        }
+
+        if r.tag in P0_TAGS or r.role in P0_ROLES:
+            p0_items.append(item)
+        elif r.tag == "a" and r.text.strip():
+            p1_items.append(item)
+        else:
+            p2_items.append(item)
+
+    # Build final list within budget (rough estimate: ~30 tokens per element)
+    budget_elements = max_tokens_budget // 30
+    result = p0_items[:budget_elements]
+    remaining = budget_elements - len(result)
+
+    if remaining > 0:
+        result.extend(p1_items[:remaining])
+        remaining -= min(len(p1_items), remaining)
+
+    if remaining > 0:
+        result.extend(p2_items[:remaining])
+
+    return result
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #  Main Agent Loop
 # ═══════════════════════════════════════════════════════════════════════════════
+async def _invoke_with_failover(
+    failover_chain: list,
+    messages: list,
+    schema,
+    circuit_breaker: CircuitBreaker | None = None,
+    base64_image: str | None = None,
+) -> tuple:
+    """Try each model in the failover chain until one succeeds.
+
+    Returns: (decision, model_name_used)
+    Raises: Exception if ALL models fail or circuit breaker is tripped.
+    """
+    if circuit_breaker and circuit_breaker.tripped:
+        raise RuntimeError(f"🔌 CIRCUIT BREAKER TRIPPED: {circuit_breaker.reason}")
+
+    last_error = None
+    for idx, llm in enumerate(failover_chain):
+        model_name = getattr(llm, 'model_name', getattr(llm, 'model', str(llm)))
+        
+        # ── Dynamic Vision Payload Support ──
+        supports_vision = any(x in model_name.lower() for x in [
+            "gpt-4o", "claude-3-5", "claude-3-opus", "gemini-1.5", "glm-4v", "vision", "pixtral", "gemma"
+        ])
+        
+        current_messages = messages
+        if supports_vision and base64_image and len(messages) > 0:
+            last_msg = messages[-1]
+            if isinstance(last_msg, HumanMessage):
+                multimodal_content = [
+                    {"type": "text", "text": str(last_msg.content)},
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}}
+                ]
+                current_messages = messages[:-1] + [HumanMessage(content=multimodal_content)]
+                
+        try:
+            structured = llm.with_structured_output(schema)
+            decision = await structured.ainvoke(current_messages)
+            if circuit_breaker:
+                circuit_breaker.record_success()
+            return decision, model_name
+        except Exception as e:
+            if circuit_breaker:
+                circuit_breaker.record_failure()
+            error_str = str(e)
+            is_rate_limit = "429" in error_str or "rate_limit" in error_str.lower()
+            is_server_error = "500" in error_str or "502" in error_str or "503" in error_str
+            is_timeout = "timeout" in error_str.lower() or "timed out" in error_str.lower()
+
+            if is_rate_limit:
+                logger.warning("⚠️  FAILOVER [%d/%d]: %s hit RATE LIMIT (429) — switching to next model...",
+                               idx + 1, len(failover_chain), model_name)
+            elif is_server_error:
+                logger.warning("⚠️  FAILOVER [%d/%d]: %s returned SERVER ERROR — switching to next model...",
+                               idx + 1, len(failover_chain), model_name)
+            elif is_timeout:
+                logger.warning("⚠️  FAILOVER [%d/%d]: %s TIMED OUT — switching to next model...",
+                               idx + 1, len(failover_chain), model_name)
+            else:
+                logger.warning("⚠️  FAILOVER [%d/%d]: %s failed (%s) — switching to next model...",
+                               idx + 1, len(failover_chain), model_name, error_str[:150])
+            last_error = e
+            continue
+
+    # All models exhausted
+    raise RuntimeError(f"ALL {len(failover_chain)} models failed. Last error: {last_error}")
+
+
 async def run_agent(objective: str):
-    """Core single-agent action loop with crash-proof session persistence."""
+    """Core single-agent action loop with native state persistence,
+    zero-downtime LLM failover, GhostCursor humanization, adversarial critic,
+    episodic campaign memory, and self-healing anti-detection (v8.0)."""
+
     context, page = await launch_browser()
     guard = SessionGuard.get()
 
-    _, secondary, tertiary = _build_worker_llms()
-    llm_clients = secondary + tertiary
-    if not llm_clients:
+    # ── Human Warm-Up Routine (WAF Bypass) ──
+    # Establishes credible browsing history before deep navigation.
+    target_hint = extract_target_url_from_objective(objective)
+    try:
+        await run_warmup(page, target_url=target_hint)
+    except Exception as warmup_err:
+        logger.warning("Warm-up routine failed (non-fatal): %s", warmup_err)
+
+    # ── Enterprise modules ──
+    memory = CampaignMemory()
+    critic = ContentCritic()
+    breaker = CircuitBreaker(max_requests=50, max_failures=10)
+
+    # ── Build the full failover chain ──
+    # Diagnostic-proven order: Groq (confirmed alive) → NVIDIA (fallback) → DeepSeek → Gemma
+    primary, secondary, deepseek, tertiary = _build_worker_llms()
+    # secondary=Groq (FAST, working), primary=NVIDIA (slow/timeout), tertiary=Gemma (vision)
+    failover_chain = secondary + primary + deepseek + tertiary
+    if not failover_chain:
         logger.error("No LLM clients available. Check API keys in .env.")
-        await guard.async_save()
         await context.close()
         guard.detach()
         return
 
-    llm = llm_clients[0]
-    structured_llm = llm.with_structured_output(AdvancedAction)
-    logger.info("Model: %s", getattr(llm, 'model_name', str(llm)))
+    chain_names = [getattr(m, 'model_name', getattr(m, 'model', '?')) for m in failover_chain]
+    logger.info("LLM Failover Chain (%d models): %s", len(failover_chain), " → ".join(chain_names))
     logger.info("Objective: %s", objective)
 
+    # ── Campaign memory context ──
+    campaign_log = memory.get_campaign_log(limit=5)
+    if campaign_log:
+        logger.info("Campaign history: %s", memory.get_summary())
+
     action_history: list[str] = []
+    url_history: list[str] = []  # Anti-Loop Watchdog tracker
+    captcha_retries = 0
+    heavy_mode_active = False
+    last_action_signature = ""
+    consecutive_identical_actions = 0
     max_steps = 20
     step = 0
 
     try:
         for step in range(max_steps):
-            logger.info("━━━ Step %d/%d ━━━", step + 1, max_steps)
+            logger.info("━━━ Step %d/%d %s ━━━", step + 1, max_steps, breaker.status_line())
 
-            # ── Periodic auto-save (every N steps) ──
-            if step > 0 and step % AUTO_SAVE_EVERY_N_STEPS == 0:
-                logger.info("Auto-saving session state (periodic checkpoint)...")
-                try:
-                    await guard.async_save()
-                except Exception as e:
-                    logger.warning("Periodic auto-save failed: %s", e)
+            # ── Circuit Breaker: abort if tripped ──
+            if breaker.tripped:
+                logger.critical("🔌 CIRCUIT BREAKER: %s — initiating graceful shutdown.", breaker.reason)
+                break
+
+
 
             try:
                 await page.wait_for_load_state("domcontentloaded", timeout=10000)
@@ -387,41 +482,167 @@ async def run_agent(objective: str):
             current_url = page.url
             logger.info("URL: %s", current_url)
 
+            # ── Progressive Perception: Check for Action Stagnation ──
+            if consecutive_identical_actions >= 2:
+                heavy_mode_active = True
+                logger.warning("🔄 Repeated action detected. Activating HEAVY MODE (Vision + DOM) for next step.")
+
+            # ── Anti-Loop Watchdog: detect navigation loops ──
+            url_history.append(current_url)
+            loop_override = ""
+            if len(url_history) >= 6:
+                recent_urls = url_history[-6:]
+                url_counts = Counter(recent_urls)
+                most_common_url, visit_count = url_counts.most_common(1)[0]
+                if visit_count >= 3:
+                    heavy_mode_active = True
+                    logger.warning(
+                        "🔄 LOOP DETECTED: '%s' visited %d times in last 6 steps! Activating HEAVY MODE.",
+                        most_common_url, visit_count,
+                    )
+                    loop_override = (
+                        "\n\n⚠️ SYSTEM OVERRIDE: You are TRAPPED in a navigation loop. "
+                        f"You have visited '{most_common_url}' {visit_count} times in the last 6 steps. "
+                        "STOP revisiting the same pages. "
+                        "If you are on a login page, you MUST click 'Continue with Google' "
+                        "or 'Sign in with Google' IMMEDIATELY. "
+                        "Do NOT navigate away from the login page. Authenticate FIRST. "
+                        "If there is no Google login button visible, SCROLL DOWN to find it."
+                    )
+
+            # ── CAPTCHA / Cloudflare Detector ──
+            try:
+                captcha_signals = await page.evaluate("""
+                () => {
+                    const s = [];
+                    if (document.querySelector('iframe[src*="challenges.cloudflare.com"]'))
+                        s.push('cloudflare_turnstile');
+                    if (document.querySelector('#cf-turnstile-container, .cf-turnstile'))
+                        s.push('cloudflare_turnstile');
+                    if (document.querySelector('iframe[src*="google.com/recaptcha"]'))
+                        s.push('recaptcha_v2');
+                    if (document.querySelector('.g-recaptcha'))
+                        s.push('recaptcha_v2');
+                    if (document.querySelector('iframe[src*="hcaptcha.com"]'))
+                        s.push('hcaptcha');
+                    const bt = (document.body?.innerText || '').toLowerCase();
+                    if (bt.includes('verify you are human') || bt.includes('checking your browser'))
+                        s.push('generic_challenge');
+                    return s;
+                }
+                """)
+                if captcha_signals:
+                    captcha_type = captcha_signals[0]
+                    captcha_retries += 1
+                    if captcha_retries > 2:
+                        logger.warning("🛡️ CAPTCHA ignored (hit retry limit of 2). Letting LLM proceed.")
+                    else:
+                        logger.warning("🛡️ CAPTCHA DETECTED: %s — attempting GhostCursor bypass (attempt %d)...", captcha_type, captcha_retries)
+                        if captcha_type in ("cloudflare_turnstile", "recaptcha_v2", "hcaptcha"):
+                            iframe_el = await page.query_selector(
+                                'iframe[src*="challenges.cloudflare.com"], '
+                                'iframe[src*="google.com/recaptcha"], '
+                                'iframe[src*="hcaptcha.com"]'
+                            )
+                            if iframe_el:
+                                box = await iframe_el.bounding_box()
+                                if box:
+                                    click_x = box["x"] + 30
+                                    click_y = box["y"] + 30
+                                    await ghost_click(page, click_x, click_y)
+                                    logger.info("🛡️ Clicked CAPTCHA checkbox at (%d, %d)", click_x, click_y)
+                                    await asyncio.sleep(4)
+                        elif captcha_type == "generic_challenge":
+                            logger.info("🛡️ Waiting 8s for Cloudflare browser check to complete...")
+                            await asyncio.sleep(8)
+                        continue  # Re-evaluate the page after handling the challenge
+                else:
+                    captcha_retries = 0  # Reset if no challenge found
+            except Exception as e:
+                logger.warning("CAPTCHA detection failed: %s", e)
+
             try:
                 raw_regions = await _extract_interactive_regions(page, max_regions=150)
             except Exception as e:
                 logger.warning("DOM extraction failed: %s — retrying next step", e)
                 continue
 
-            compact = [
-                {"index": i, "tag": r.tag, "role": r.role, "text": r.text[:120]}
-                for i, r in enumerate(raw_regions)
-            ]
+            # ── Smart DOM Compression (Priority-Tiered) ──
+            compact = _compress_dom_for_llm(raw_regions, max_tokens_budget=2000)
 
-            system_prompt = (
-                "You are an elite autonomous web agent operating inside a real browser.\n"
-                "You receive the current URL, a history of past actions, and a list of interactive DOM elements.\n"
-                "Choose the EXACT next action. If the objective is fully complete, output action_type='done'.\n"
-                "IMPORTANT: If you already typed text into a field, do NOT type it again. Move to the NEXT step.\n"
-                "Available actions: goto, click, type, scroll, press_enter, done.\n"
-            )
-
-            user_prompt = (
-                f"OBJECTIVE: {objective}\n"
-                f"CURRENT URL: {current_url}\n"
-                f"COMPLETED ACTIONS: {json.dumps(action_history)}\n"
-                f"INTERACTIVE ELEMENTS:\n{json.dumps(compact, indent=2)}\n\n"
-                "What is your NEXT action?"
-            )
+            # ── Progressive Perception (Heavy Mode) ──
+            base64_image = None
+            cleaned_dom = ""
+            if heavy_mode_active:
+                logger.info("👁️ Capturing heavy perception (Screenshot + DOM)...")
+                try:
+                    screenshot_bytes = await page.screenshot(type="jpeg", quality=50)
+                    import base64
+                    base64_image = base64.b64encode(screenshot_bytes).decode("utf-8")
+                    cleaned_dom = await page.evaluate('''() => {
+                        const clone = document.body.cloneNode(true);
+                        clone.querySelectorAll("script, style, svg, img, video").forEach(el => el.remove());
+                        return clone.innerText.substring(0, 3000);
+                    }''')
+                except Exception as e:
+                    logger.warning("Heavy perception capture failed: %s", e)
+                
+                schema_to_use = HeavyAction
+                system_prompt = (
+                    "You are an elite autonomous web agent operating inside a real browser.\n"
+                    "HEAVY MODE ACTIVATED: You are stuck. Look at the provided screenshot and DOM text to figure out what is blocking you (e.g. a popup, login overlay, or layout shift).\n"
+                    "You must output 'current_state_analysis' and 'obstacle_detection' before deciding the next action.\n"
+                    "IMPORTANT: If you already typed text into a field, do NOT type it again. Move to the NEXT step.\n"
+                    "Available actions: goto, click, type, scroll, press_enter, done.\n"
+                )
+                user_prompt = (
+                    f"OBJECTIVE: {objective}\n"
+                    f"CURRENT URL: {current_url}\n"
+                    f"COMPLETED ACTIONS: {json.dumps(action_history)}\n"
+                    f"INTERACTIVE ELEMENTS:\n{json.dumps(compact, indent=2)}\n\n"
+                    f"PAGE TEXT CONTEXT (DOM):\n{cleaned_dom}\n\n"
+                    "What is your NEXT action?"
+                    f"{loop_override}"
+                )
+            else:
+                schema_to_use = AdvancedAction
+                system_prompt = (
+                    "You are an elite autonomous web agent operating inside a real browser.\n"
+                    "You receive the current URL, a history of past actions, and a list of interactive DOM elements.\n"
+                    "Choose the EXACT next action. If the objective is fully complete, output action_type='done'.\n"
+                    "IMPORTANT: If you already typed text into a field, do NOT type it again. Move to the NEXT step.\n"
+                    "Available actions: goto, click, type, scroll, press_enter, done.\n"
+                )
+                user_prompt = (
+                    f"OBJECTIVE: {objective}\n"
+                    f"CURRENT URL: {current_url}\n"
+                    f"COMPLETED ACTIONS: {json.dumps(action_history)}\n"
+                    f"INTERACTIVE ELEMENTS:\n{json.dumps(compact, indent=2)}\n\n"
+                    "What is your NEXT action?"
+                    f"{loop_override}"
+                )
 
             messages = [SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)]
 
-            logger.info("Querying LLM...")
+            current_chain = failover_chain
+            if heavy_mode_active:
+                # Forcefully prioritize Gemma models for vision
+                gemma_models = [m for m in failover_chain if "gemma" in getattr(m, 'model_name', getattr(m, 'model', str(m))).lower()]
+                other_models = [m for m in failover_chain if m not in gemma_models]
+                if gemma_models:
+                    current_chain = gemma_models + other_models
+                    logger.info("👁️ Vision needed: forcefully routing to %s", getattr(gemma_models[0], 'model_name', 'Gemma'))
+
+            logger.info("Querying LLM (failover chain: %d models)...", len(current_chain))
             try:
-                decision: AdvancedAction = await structured_llm.ainvoke(messages)
-            except Exception as e:
-                logger.error("LLM call failed: %s", e)
-                break
+                decision, used_model = await _invoke_with_failover(
+                    current_chain, messages, schema_to_use, circuit_breaker=breaker, base64_image=base64_image
+                )
+                logger.info("Answered by: %s", used_model)
+            except RuntimeError as e:
+                logger.error("LLM FAILURE: %s — pausing 30s before retry...", e)
+                await asyncio.sleep(30)
+                continue
 
             logger.info("Reasoning: %s", decision.reasoning)
             logger.info("Action: %s", decision.action_type)
@@ -454,7 +675,7 @@ async def run_agent(objective: str):
                 cx, cy = t.x + t.width / 2, t.y + t.height / 2
                 logger.info("Clicking (%s '%s') at (%d, %d)", t.tag, t.text[:40], cx, cy)
                 try:
-                    await page.mouse.click(cx, cy)
+                    await ghost_click(page, cx, cy)
                 except Exception as e:
                     logger.warning("Click failed: %s", e)
 
@@ -464,15 +685,41 @@ async def run_agent(objective: str):
                     continue
                 t = raw_regions[decision.element_id]
                 cx, cy = t.x + t.width / 2, t.y + t.height / 2
-                logger.info("Typing '%s' into (%s '%s')", decision.text, t.tag, t.text[:40])
+
+                text_to_type = decision.text or ""
+
+                # ── Adversarial Critic: review body content before typing ──
+                if len(text_to_type) > 100:
+                    logger.info("Content Critic: reviewing %d-char body before typing...", len(text_to_type))
+                    try:
+                        verdict = await critic.review(
+                            content=text_to_type,
+                            platform=current_url,
+                            failover_chain=failover_chain,
+                            invoke_fn=_invoke_with_failover,
+                        )
+                        if not verdict.approved and verdict.rewritten_content:
+                            logger.info(
+                                "Critic rewrote content (tone=%.2f, issues=%d): %s",
+                                verdict.tone_score, len(verdict.issues),
+                                "; ".join(verdict.issues[:3]),
+                            )
+                            text_to_type = verdict.rewritten_content
+                        elif verdict.approved:
+                            logger.info("Critic approved content (tone=%.2f)", verdict.tone_score)
+                    except Exception as e:
+                        logger.warning("Critic review failed: %s — using original content", e)
+
+                logger.info("Typing '%s' into (%s '%s')", text_to_type[:80], t.tag, t.text[:40])
                 try:
-                    await page.mouse.click(cx, cy)
+                    await ghost_click(page, cx, cy)
                     await asyncio.sleep(0.3)
                     await page.keyboard.press("Control+A")
                     await page.keyboard.press("Backspace")
-                    await page.keyboard.type(decision.text, delay=30)
+                    await ghost_type(page, text_to_type)
                 except Exception as e:
                     logger.warning("Type failed: %s", e)
+
 
             elif decision.action_type == "press_enter":
                 logger.info("Pressing Enter")
@@ -484,12 +731,42 @@ async def run_agent(objective: str):
             elif decision.action_type == "scroll":
                 logger.info("Scrolling down")
                 try:
-                    await page.mouse.wheel(0, 600)
-                    await asyncio.sleep(1)
+                    await ghost_scroll(page, 600)
                 except Exception as e:
                     logger.warning("Scroll failed: %s", e)
 
+            # ── Progressive Perception: Track action state ──
+            current_action_signature = f"{decision.action_type}:{decision.element_id}:{decision.text}"
+            if current_action_signature == last_action_signature:
+                consecutive_identical_actions += 1
+            else:
+                consecutive_identical_actions = 0
+                if heavy_mode_active:
+                    logger.info("✅ Progress detected. Deactivating HEAVY MODE.")
+                    heavy_mode_active = False
+
+            last_action_signature = current_action_signature
+
         logger.info("Agent loop finished after %d steps.", step + 1)
+
+        # ── Record in campaign memory ──
+        try:
+            platform = "unknown"
+            final_url = page.url
+            for p in ["dev.to", "medium.com", "x.com", "twitter.com", "hashnode.com", "github.com"]:
+                if p in final_url:
+                    platform = p
+                    break
+            memory.record_post(
+                platform=platform,
+                title=objective[:120],
+                content=objective,
+                url=final_url,
+                agent_model=chain_names[0] if chain_names else "unknown",
+                steps_taken=step + 1,
+            )
+        except Exception as e:
+            logger.warning("Campaign memory record failed: %s", e)
 
     except KeyboardInterrupt:
         logger.warning("KeyboardInterrupt caught — saving session before exit...")
@@ -500,43 +777,15 @@ async def run_agent(objective: str):
 
     finally:
         # ════════════════════════════════════════════════════════════════════
-        #  CRASH-PROOF FINALLY BLOCK
-        #  This runs no matter what: normal exit, exception, Ctrl+C, break.
-        #  Three nested attempts to guarantee the state is written to disk.
+        #  CLEAN SHUTDOWN — context.close() flushes all native state to disk
         # ════════════════════════════════════════════════════════════════════
-        logger.info("Entering crash-proof shutdown sequence...")
-
-        # Attempt 1: Full async save (best quality — captures everything)
-        try:
-            await guard.async_save()
-            logger.info("Shutdown save: SUCCESS (async path)")
-        except Exception as e1:
-            logger.warning("Shutdown save attempt 1 failed: %s", e1)
-
-            # Attempt 2: Direct storage_state call (bypass guard)
-            try:
-                state = await context.storage_state()
-                guard._atomic_write(state)
-                logger.info("Shutdown save: SUCCESS (direct storage_state)")
-            except Exception as e2:
-                logger.warning("Shutdown save attempt 2 failed: %s", e2)
-
-                # Attempt 3: Write last known good state
-                if guard._last_saved_state:
-                    try:
-                        guard._atomic_write(guard._last_saved_state)
-                        logger.info("Shutdown save: SUCCESS (last known good state)")
-                    except Exception as e3:
-                        logger.error("Shutdown save attempt 3 FAILED: %s — SESSION MAY BE LOST", e3)
-
-        # Close the browser context
+        logger.info("Shutting down...")
         try:
             await context.close()
-        except Exception:
-            pass
-
+            logger.info("Browser closed. Native profile state persisted.")
+        except Exception as e:
+            logger.warning("Browser close failed: %s", e)
         guard.detach()
-        logger.info("Browser closed. Session state persisted.")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
