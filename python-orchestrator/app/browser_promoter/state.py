@@ -50,7 +50,11 @@ class HighLevelCommand(BaseModel):
 
 
 class BrowserAction(BaseModel):
-    """Executable browser action prepared by the Worker model."""
+    """Executable browser action prepared by the reasoning model.
+
+    The current pipeline is coordinate-only. Selector-based targeting is
+    retained only for backward compatibility and is not executed.
+    """
 
     action_id: str = Field(default_factory=lambda: f"act_{uuid4().hex[:12]}", min_length=1)
     action: Literal[
@@ -94,21 +98,6 @@ class BrowserConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
-class InteractiveRegion(BaseModel):
-    """Interactive UI element with spatial metadata for vision grounding."""
-
-    tag: str = ""
-    role: str = ""
-    text: str = ""
-    selector: str = ""
-    x: int
-    y: int
-    width: int
-    height: int
-
-    model_config = ConfigDict(extra="forbid")
-
-
 class WorkerFeedback(BaseModel):
     """Execution result from browser controller back to Worker/Supervisor."""
 
@@ -123,7 +112,14 @@ class WorkerFeedback(BaseModel):
 class RoutingFlags(BaseModel):
     """Routing controls for Supervisor -> Worker <-> Browser -> Router loop."""
 
-    next_hop: Literal["strategic_planner", "worker", "browser_controller", "supervisor", "router", "end"] = "strategic_planner"
+    next_hop: Literal[
+        "vision_agent",
+        "reasoning_agent",
+        "browser_controller",
+        "supervisor",
+        "router",
+        "end",
+    ] = "vision_agent"
     requires_browser_action: bool = False
     requires_supervisor_review: bool = False
     stop_requested: bool = False
@@ -141,9 +137,8 @@ class ScreenshotFrame(BaseModel):
     screenshot_encoding: str = "zlib+base64:jpeg"
     original_bytes: int = 0
     compressed_bytes: int = 0
-    accessibility_tree: dict[str, Any] = Field(default_factory=dict)
-    interactive_regions: list[InteractiveRegion] = Field(default_factory=list)
     scene_summary: str = ""
+    vision_map_json: str = ""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -174,9 +169,8 @@ class AgentState(BaseModel):
     current_url: str = ""
     current_screenshot_base64: str = ""
     current_screenshot_encoding: str = "none"
-    current_accessibility_tree: dict[str, Any] = Field(default_factory=dict)
-    current_interactive_regions: list[InteractiveRegion] = Field(default_factory=list)
     current_scene_summary: str = ""
+    current_vision_map_json: str = ""
 
     worker_last_confidence: float = Field(default=0.0, ge=0.0, le=1.0)
     worker_last_confused: bool = False

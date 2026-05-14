@@ -51,6 +51,20 @@ test-results/
 # ─── Windows venv ─────────────────────────────────────────
 .venv-windows/
 
-# ─── Test artifacts ───────────────────────────────────────
+# ─── Test artifacts & debug dumps ─────────────────────────
 live_test_screenshots/
 verification_screenshot.jpg
+debug_*.png
+*_dump.html
+*_log.txt
+*.html
+
+# ─── Scratch / temp test scripts ──────────────────────────
+scratch/
+
+# ─── Runtime debug screenshots ────────────────────────────
+*.png
+!README_assets/*.png
+
+# ─── Scripts (one-off launchers) ──────────────────────────
+scripts/

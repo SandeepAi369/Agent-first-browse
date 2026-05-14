@@ -69,13 +69,45 @@ def _ensure_db() -> sqlite3.Connection:
 
 
 class CampaignMemory:
-    """Lightweight episodic memory for the marketing agent."""
+    """Lightweight episodic memory for the marketing agent.
+
+    Auto-reconnects on database errors — no single failure kills the memory.
+    """
 
     def __init__(self, db_path: Path | None = None):
         if db_path:
             global DB_PATH
             DB_PATH = db_path
-        self._conn = _ensure_db()
+        self._conn: sqlite3.Connection | None = None
+        self._connect()
+
+    def _connect(self) -> None:
+        """Establish (or re-establish) the database connection."""
+        try:
+            if self._conn is not None:
+                try:
+                    self._conn.close()
+                except Exception:
+                    pass
+            self._conn = _ensure_db()
+        except Exception as e:
+            logger.error("Campaign memory DB connect failed: %s", e)
+            self._conn = None
+
+    def _get_conn(self) -> sqlite3.Connection:
+        """Get a live connection, auto-reconnecting if needed."""
+        if self._conn is None:
+            self._connect()
+        if self._conn is not None:
+            try:
+                self._conn.execute("SELECT 1")
+                return self._conn
+            except (sqlite3.OperationalError, sqlite3.ProgrammingError):
+                logger.warning("Campaign memory connection dead, reconnecting...")
+                self._connect()
+        if self._conn is None:
+            raise sqlite3.OperationalError("Cannot connect to campaign memory DB")
+        return self._conn
 
     def record_post(
         self,
@@ -91,7 +123,8 @@ class CampaignMemory:
         now = datetime.now(timezone.utc).isoformat()
 
         try:
-            self._conn.execute(
+            conn = self._get_conn()
+            conn.execute(
                 """INSERT INTO published_posts
                    (platform, url, title, content_hash, content_preview, published_at, agent_model, steps_taken)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
@@ -107,12 +140,12 @@ class CampaignMemory:
                 ),
             )
             # Update cooldown
-            self._conn.execute(
+            conn.execute(
                 """INSERT OR REPLACE INTO platform_cooldowns (platform, last_post_at, cooldown_hours)
                    VALUES (?, ?, 168)""",
                 (platform.lower().strip(), now),
             )
-            self._conn.commit()
+            conn.commit()
             logger.info(
                 "📝 Recorded post on %s: '%s' (hash=%s)",
                 platform, title[:60], content_hash,
@@ -127,7 +160,7 @@ class CampaignMemory:
 
     def has_posted_on(self, platform: str) -> bool:
         """Check if we have ever posted on this platform."""
-        cursor = self._conn.execute(
+        cursor = self._get_conn().execute(
             "SELECT COUNT(*) FROM published_posts WHERE platform = ?",
             (platform.lower().strip(),),
         )
@@ -139,7 +172,7 @@ class CampaignMemory:
         
         Returns: (is_cooling_down, reason_message)
         """
-        cursor = self._conn.execute(
+        cursor = self._get_conn().execute(
             "SELECT last_post_at FROM platform_cooldowns WHERE platform = ?",
             (platform.lower().strip(),),
         )
@@ -164,7 +197,7 @@ class CampaignMemory:
 
     def get_campaign_log(self, limit: int = 20) -> list[dict[str, Any]]:
         """Return the most recent published posts for context injection."""
-        cursor = self._conn.execute(
+        cursor = self._get_conn().execute(
             """SELECT platform, url, title, content_preview, published_at, agent_model, steps_taken
                FROM published_posts
                ORDER BY published_at DESC
@@ -177,12 +210,12 @@ class CampaignMemory:
     def get_post_count(self, platform: str | None = None) -> int:
         """Get total number of posts, optionally filtered by platform."""
         if platform:
-            cursor = self._conn.execute(
+            cursor = self._get_conn().execute(
                 "SELECT COUNT(*) FROM published_posts WHERE platform = ?",
                 (platform.lower().strip(),),
             )
         else:
-            cursor = self._conn.execute("SELECT COUNT(*) FROM published_posts")
+            cursor = self._get_conn().execute("SELECT COUNT(*) FROM published_posts")
         return cursor.fetchone()[0]
 
     def get_summary(self) -> str:
@@ -191,7 +224,7 @@ class CampaignMemory:
         if total == 0:
             return "No posts published yet."
 
-        cursor = self._conn.execute(
+        cursor = self._get_conn().execute(
             "SELECT DISTINCT platform FROM published_posts ORDER BY platform"
         )
         platforms = [row[0] for row in cursor.fetchall()]

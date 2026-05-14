@@ -484,3 +484,64 @@ def _extract_context(result: Any) -> BrowserContext | None:
         return context_attr
 
     return None
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Visual Cursor Script
+# ═══════════════════════════════════════════════════════════════════════════════
+
+VISUAL_CURSOR_INIT_SCRIPT = """
+(() => {
+    // Inject only once
+    if (window.__visualCursorInitialized) return;
+    window.__visualCursorInitialized = true;
+
+    const box = document.createElement('div');
+    box.id = 'playwright-visual-cursor';
+    box.style.width = '20px';
+    box.style.height = '20px';
+    box.style.position = 'absolute';
+    box.style.top = '0';
+    box.style.left = '0';
+    box.style.zIndex = '2147483647';
+    box.style.pointerEvents = 'none';
+    box.style.borderRadius = '50%';
+    box.style.backgroundColor = 'rgba(255, 0, 0, 0.5)';
+    box.style.border = '2px solid red';
+    box.style.transition = 'background-color 0.1s, transform 0.1s';
+    box.style.transform = 'translate(-50%, -50%)';
+    box.style.boxShadow = '0 0 5px rgba(0,0,0,0.3)';
+
+    // Wait for body to be ready
+    const initCursor = () => {
+        if (!document.body) {
+            setTimeout(initCursor, 50);
+            return;
+        }
+        document.body.appendChild(box);
+    };
+    
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', initCursor);
+    } else {
+        initCursor();
+    }
+
+    document.addEventListener('mousemove', event => {
+        box.style.left = event.pageX + 'px';
+        box.style.top = event.pageY + 'px';
+    }, true);
+
+    document.addEventListener('mousedown', event => {
+        box.style.backgroundColor = 'rgba(0, 255, 0, 0.7)';
+        box.style.transform = 'translate(-50%, -50%) scale(0.8)';
+        box.style.border = '2px solid #0f0';
+    }, true);
+
+    document.addEventListener('mouseup', event => {
+        box.style.backgroundColor = 'rgba(255, 0, 0, 0.5)';
+        box.style.transform = 'translate(-50%, -50%) scale(1)';
+        box.style.border = '2px solid red';
+    }, true);
+})();
+"""
+

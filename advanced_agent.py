@@ -1,30 +1,28 @@
-"""Advanced Single-Agent Browser Automation with Native State Persistence (v8.0).
+"""Advanced Single-Agent Browser Automation with Deep Intelligence (v9.0).
+
+v9.0 Deep Merge Architecture:
+  - ModelRegistry: ALL API keys, strict TEXT/VISION separation, singleton
+  - Mission Planner: pre-loop task decomposition into checkpoints
+  - Progressive State Machine: 7-phase tracker with failure memory
+  - Action Outcome Verifier: post-action page-change detection
+  - Self-Correction Engine: auto-recover from silently failing actions
+  - Recovery Advisor: separate LLM call when stuck
+  - Continuous Campaign Logger: records at every phase transition
+  - Enhanced Failover: 3s recovery, not 30s dead time
 
 Session Persistence:
   Pure native user_data_dir — Chromium manages all cookies, localStorage,
-  IndexedDB, and Cache natively on disk. No synthetic JSON injection.
-  Login once via --login mode, then all subsequent runs inherit the session.
-
-Enterprise Features (v5.0):
-  - Smart DOM Compression with priority tiers (P0 forms > P1 links > P2 nav)
-  - GhostCursor Bézier mouse paths + human typing with typo correction
-  - Adversarial Content Critic (pre-publish red-team review)
-  - Episodic Campaign Memory (SQLite dedup + cooldown enforcement)
-  - Multi-key API failover: Groq → DeepSeek → NVIDIA GLM → Gemma 4
-
-Self-Healing & Anti-Detection (v6.0+):
-  - Anti-Loop Watchdog: detects repeated URL/action patterns, injects override
-  - CAPTCHA/Cloudflare Detector: auto-clicks challenge checkboxes via GhostCursor
-  - LLM Circuit Breaker: hard ceiling on requests/failures per run
-  - Progressive Perception (v7.0): ReAct Heavy Mode with Vision + DOM
+  IndexedDB, and Cache natively on disk.
 """
 
 import argparse
 import asyncio
 import atexit
+import base64
 import json
 import signal
 import sys
+import time as _time
 import traceback
 from collections import Counter
 from pathlib import Path
@@ -41,20 +39,23 @@ from app.browser_promoter.cdp_stealth_launcher import (
     STEALTH_USER_AGENT,
     apply_page_stealth,
     get_random_viewport,
+    VISUAL_CURSOR_INIT_SCRIPT,
 )
 from app.browser_promoter.browser_warmup import (
     run_warmup,
     extract_target_url_from_objective,
 )
-from app.browser_promoter.nodes import _extract_interactive_regions
-from app.browser_promoter.worker_planner import _build_worker_llms
+from app.browser_promoter.worker_planner import ReasoningAgent, VisionAgent
 from app.logger import get_logger
 from playwright.async_api import async_playwright, BrowserContext, Page
 
-# Enterprise modules (v5.0)
+# Enterprise modules
 from ghost_input import ghost_click, ghost_type, ghost_scroll
 from campaign_memory import CampaignMemory
 from content_critic import ContentCritic
+from model_registry import ModelRegistry
+import dom_parser
+from content_store import ContentStore
 
 logger = get_logger("advanced_agent")
 
@@ -63,44 +64,201 @@ logger = get_logger("advanced_agent")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  LLM Circuit Breaker — Prevents runaway API drain
+#  v10.0 Progressive State Machine — Multi-field tracker with failure memory
 # ═══════════════════════════════════════════════════════════════════════════════
-class CircuitBreaker:
-    """Track cumulative LLM usage per run and enforce hard ceilings.
 
-    Thresholds:
-      max_requests=50  — enough for 20 steps × ~2.5 LLM calls/step
-      max_failures=10  — if 10 calls fail across ALL models, something is broken
-    """
+class AgentPhaseTracker:
+    """Track completed phases per field, failed actions, and correction context."""
 
-    def __init__(self, max_requests: int = 50, max_failures: int = 10):
-        self.request_count = 0
-        self.failure_count = 0
-        self.max_requests = max_requests
-        self.max_failures = max_failures
+    def __init__(self):
+        self.phases = {
+            "navigated_to_target": False,
+            "login_verified": False,
+            "compose_opened": False,
+            "title_filled": False,
+            "body_filled": False,
+            "all_fields_ready": False,
+            "submit_clicked": False,
+            "submit_verified": False,
+        }
+        self.typed_text = ""
+        self.current_checkpoint = ""
+        self.failed_actions: list[str] = []
+        self.correction_context = ""
+        self.recovery_advice = ""
+        # v10.0: track what's in each field
+        self.title_content = ""
+        self.body_content = ""
 
-    def record_success(self):
-        self.request_count += 1
+    def mark(self, phase: str):
+        if phase in self.phases:
+            self.phases[phase] = True
+            logger.info("✅ Phase '%s' completed", phase)
 
-    def record_failure(self):
-        self.failure_count += 1
-        self.request_count += 1
+    def is_done(self, phase: str) -> bool:
+        return self.phases.get(phase, False)
 
+    def progress_pct(self) -> int:
+        done = sum(1 for v in self.phases.values() if v)
+        return int(100 * done / max(len(self.phases), 1))
+
+    # Backwards compatibility aliases
     @property
-    def tripped(self) -> bool:
-        return (self.request_count >= self.max_requests
-                or self.failure_count >= self.max_failures)
+    def text_typed_done(self) -> bool:
+        return self.is_done("title_filled") or self.is_done("body_filled")
 
-    @property
-    def reason(self) -> str:
-        if self.request_count >= self.max_requests:
-            return f"Request ceiling hit ({self.request_count}/{self.max_requests})"
-        if self.failure_count >= self.max_failures:
-            return f"Failure ceiling hit ({self.failure_count}/{self.max_failures})"
-        return ""
+    def get_state_override(self, has_article: bool = False) -> str:
+        """Build contextual state info for the LLM based on field fill status."""
+        parts = []
 
-    def status_line(self) -> str:
-        return f"[CB: {self.request_count}/{self.max_requests} reqs, {self.failure_count}/{self.max_failures} fails]"
+        title_done = self.is_done("title_filled")
+        body_done = self.is_done("body_filled")
+        all_ready = self.is_done("all_fields_ready")
+
+        if all_ready:
+            parts.append(
+                "\n\n🚨 ALL FIELDS ARE FILLED. Click the Publish/Post/Submit button NOW. "
+                "Do NOT type anything else."
+            )
+        elif title_done and not body_done:
+            if has_article:
+                parts.append(
+                    f"\n\n📝 FIELD STATUS: Title filled ✓ ({len(self.title_content)} chars). "
+                    "Body/Content field is still EMPTY — click on the body/content textarea "
+                    "and the system will auto-inject the article content."
+                )
+            else:
+                parts.append(
+                    f"\n\n📝 FIELD STATUS: Title/First field filled ✓. "
+                    "Now type into the body/content field, or click Post/Submit if finished."
+                )
+        elif title_done and body_done:
+            parts.append(
+                f"\n\n📝 FIELD STATUS: Title ✓ ({len(self.title_content)} chars) | "
+                f"Body ✓ ({len(self.body_content)} chars). "
+                "All fields filled — click Publish/Post/Submit button."
+            )
+        elif not title_done and self.typed_text:
+            parts.append(
+                f"\n\n📝 FIELD STATUS: You typed: '{self.typed_text[:60]}...' — "
+                "now fill the remaining fields or click Submit."
+            )
+
+
+        if self.correction_context:
+            parts.append(self.correction_context)
+        if self.recovery_advice:
+            parts.append(f"\n\n🛠️ RECOVERY ADVICE: {self.recovery_advice}")
+        return "".join(parts)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  v9.0 Mission Planner — Decomposes objective into checkpoints
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def _decompose_objective(
+    objective: str, failover_chain: list, breaker, health_tracker,
+) -> list[str]:
+    """Break objective into 3-5 sequential checkpoints using the TEXT chain."""
+    prompt = (
+        "Break this browser automation objective into 3-5 short sequential checkpoints. "
+        "Each checkpoint is ONE specific browser action (navigate, click, type, verify). "
+        "Return ONLY a JSON array of strings. No markdown, no explanation.\n\n"
+        f"Objective: {objective}"
+    )
+    try:
+        response, _ = await _invoke_with_failover(
+            failover_chain, [HumanMessage(content=prompt)],
+            None, breaker, health_tracker=health_tracker,
+        )
+        text = response.content if hasattr(response, "content") else str(response)
+        text = text.strip()
+        if "```" in text:
+            text = text.split("```")[1].split("```")[0].strip()
+            if text.startswith("json"):
+                text = text[4:].strip()
+        checkpoints = json.loads(text)
+        if isinstance(checkpoints, list) and all(isinstance(c, str) for c in checkpoints):
+            return checkpoints[:7]
+    except Exception as e:
+        logger.warning("Mission planner failed: %s — using objective as single checkpoint", e)
+    return [objective]
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  v9.0 Action Outcome Verifier
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def _verify_action_outcome(page: Page, prev_url: str, prev_screenshot_hash: int) -> dict:
+    """Check if the last action actually changed the page state."""
+    await asyncio.sleep(0.4)
+    new_url = page.url
+    if new_url != prev_url:
+        return {"changed": True, "type": "url_change", "detail": f"{prev_url} → {new_url}"}
+    try:
+        new_bytes = await page.screenshot(type="jpeg", quality=20)
+        new_hash = hash(new_bytes[:2000])
+        if new_hash != prev_screenshot_hash:
+            return {"changed": True, "type": "visual_change", "detail": "Page content changed"}
+    except Exception:
+        pass
+    try:
+        has_modal = await page.evaluate(
+            "() => !!document.querySelector('[role=\"dialog\"], [role=\"alertdialog\"], .modal')"
+        )
+        if has_modal:
+            return {"changed": True, "type": "modal_appeared", "detail": "Dialog appeared"}
+    except Exception:
+        pass
+    return {"changed": False, "type": "no_change", "detail": "Page appears unchanged"}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  v9.0 Recovery Advisor — Asks a separate LLM call to unblock
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def _ask_recovery_advisor(
+    objective: str, current_url: str, action_history: list,
+    failover_chain: list, breaker, health_tracker,
+) -> str:
+    """When stuck, ask a text LLM for expert recovery advice."""
+    prompt = (
+        "You are a browser automation RECOVERY CONSULTANT. The agent is STUCK. "
+        "Analyze the situation and give ONE specific actionable instruction.\n\n"
+        f"OBJECTIVE: {objective}\nURL: {current_url}\n"
+        f"RECENT ACTIONS:\n{json.dumps(action_history[-6:], indent=1)}\n\n"
+        "Respond in 1-2 sentences ONLY."
+    )
+    try:
+        response, model = await _invoke_with_failover(
+            failover_chain, [HumanMessage(content=prompt)],
+            None, breaker, health_tracker=health_tracker,
+        )
+        advice = response.content if hasattr(response, "content") else str(response)
+        logger.info("🛠️ Recovery Advisor (%s): %s", model, advice[:200])
+        return advice.strip()
+    except Exception as e:
+        logger.warning("Recovery advisor failed: %s", e)
+        return "Try scrolling down or dismissing any visible popups."
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  v9.0 Continuous Campaign Logger
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _record_phase_transition(memory, platform: str, objective: str, url: str, step: int, phase: str):
+    """Record progress to campaign memory at each phase transition."""
+    try:
+        memory.record_post(
+            platform=platform,
+            title=f"[Phase:{phase}] {objective[:80]}",
+            content=objective,
+            url=url,
+            agent_model="v9.0-deep-merge",
+            steps_taken=step + 1,
+        )
+    except Exception as e:
+        logger.warning("Campaign log failed: %s", e)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  Persistence Paths (all inside WSL)
@@ -202,10 +360,12 @@ async def launch_browser(*, headless: bool = False) -> tuple[BrowserContext, Pag
         java_script_enabled=True,
         device_scale_factor=1,
         extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
-        args=STEALTH_LAUNCH_ARGS,
+        args=STEALTH_LAUNCH_ARGS + dom_parser.TLS_STEALTH_ARGS,
         ignore_default_args=["--enable-automation"],
     )
     await context.add_init_script(STEALTH_INIT_SCRIPT)
+    await context.add_init_script(VISUAL_CURSOR_INIT_SCRIPT)
+    await dom_parser.install_shadow_piercer(context)
 
     # ── Attach lifecycle guard ──
     guard = SessionGuard.get()
@@ -260,115 +420,104 @@ async def manual_login_mode():
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  Agent Action Schema
+#  Autonomous Action Schema — Observe-Think-Act (OTA) Loop
 # ═══════════════════════════════════════════════════════════════════════════════
-class AdvancedAction(BaseModel):
-    reasoning: str = Field(description="Brief explanation of why this action is taken.")
-    action_type: str = Field(description="One of: 'goto', 'click', 'type', 'scroll', 'press_enter', 'done'")
-    url: str | None = Field(default=None, description="URL for 'goto' action")
-    element_id: int | None = Field(default=None, description="Index of the interactive element")
-    text: str | None = Field(default=None, description="Text to type for 'type' action")
+class AutonomousAction(BaseModel):
+    """ReAct-style autonomous action with mandatory chain-of-thought.
 
-
-class HeavyAction(BaseModel):
-    """ReAct schema for Heavy Mode (Vision + DOM)."""
-    current_state_analysis: str = Field(description="What exactly do you see on the screen right now? Are there any popups, overlays, or login prompts?")
-    obstacle_detection: str = Field(description="Is the path to the goal blocked? If so, state the micro-plan to resolve it (e.g., 'Must click Continue with Google first').")
-    reasoning: str = Field(description="Based on the analysis, why is this specific next action chosen?")
-    action_type: str = Field(description="One of: 'goto', 'click', 'type', 'scroll', 'press_enter', 'done'")
-    url: str | None = Field(default=None, description="URL for 'goto' action")
-    element_id: int | None = Field(default=None, description="Index of the interactive element")
-    text: str | None = Field(default=None, description="Text to type for 'type' action")
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  Smart DOM Compression (Priority-Tiered)
-# ═══════════════════════════════════════════════════════════════════════════════
-def _compress_dom_for_llm(raw_regions: list, max_tokens_budget: int = 2000) -> list[dict]:
-    """Compress DOM elements into a token-efficient representation with priority tiers.
-
-    Priority tiers:
-      P0 (critical): input, textarea, select, button, [role=button]
-      P1 (important): a (links with unique text)
-      P2 (low): generic divs, navs, repeated elements
-
-    Deduplicates elements with identical text and drops P2 elements
-    when the budget is tight.
+    The LLM MUST populate the 4 thinking fields before choosing an action.
+    This prevents blind step-following and forces genuine situational awareness.
     """
-    P0_TAGS = {"input", "textarea", "select", "button"}
-    P0_ROLES = {"button", "textbox", "combobox", "searchbox", "checkbox", "radio"}
 
-    seen_texts: set[str] = set()
-    p0_items: list[dict] = []
-    p1_items: list[dict] = []
-    p2_items: list[dict] = []
+    # ── OBSERVE: What does the screen show? ──
+    screen_state: str = Field(
+        description=(
+            "Describe what you SEE on the current screen in 1-3 sentences. "
+            "Include: page type (login page, feed, compose box, error page), "
+            "key visible elements (buttons, inputs, text), any popups/overlays/modals, "
+            "and whether the user appears logged in or logged out."
+        )
+    )
 
-    for i, r in enumerate(raw_regions):
-        text_key = (r.tag + ":" + r.text[:60]).lower().strip()
+    # ── THINK: Reason through the situation ──
+    previous_action_result: str = Field(
+        description=(
+            "Evaluate the outcome of your LAST action. Did the page change? "
+            "Did a new element appear? Did an error show up? "
+            "If this is the very first step, say 'First action — no prior state.'"
+        )
+    )
+    goal_progress: str = Field(
+        description=(
+            "Assess progress toward the ULTIMATE goal. What percentage is done? "
+            "What specific sub-tasks remain? "
+            "Example: '40% done — logged in successfully, now need to find compose box and type the tweet.'"
+        )
+    )
+    reasoning: str = Field(
+        description=(
+            "Based on screen_state and goal_progress, explain WHY this specific "
+            "next action is the correct choice. Consider alternatives you rejected. "
+            "Example: 'I see the compose box is visible at element e5. I should click it to focus, "
+            "then type the tweet content. I considered scrolling first but the box is already visible.'"
+        )
+    )
 
-        # Dedup: skip elements with identical tag+text
-        if text_key in seen_texts and r.tag not in P0_TAGS:
-            continue
-        seen_texts.add(text_key)
-
-        item = {
-            "index": i,
-            "tag": r.tag,
-            "role": r.role,
-            "text": r.text[:100],
-            "x": r.x,
-            "y": r.y,
-        }
-
-        if r.tag in P0_TAGS or r.role in P0_ROLES:
-            p0_items.append(item)
-        elif r.tag == "a" and r.text.strip():
-            p1_items.append(item)
-        else:
-            p2_items.append(item)
-
-    # Build final list within budget (rough estimate: ~30 tokens per element)
-    budget_elements = max_tokens_budget // 30
-    result = p0_items[:budget_elements]
-    remaining = budget_elements - len(result)
-
-    if remaining > 0:
-        result.extend(p1_items[:remaining])
-        remaining -= min(len(p1_items), remaining)
-
-    if remaining > 0:
-        result.extend(p2_items[:remaining])
-
-    return result
+    # ── ACT: The chosen action ──
+    action_type: str = Field(
+        description="One of: 'goto', 'click', 'type', 'scroll', 'press_enter', 'wait', 'done'"
+    )
+    url: str | None = Field(default=None, description="URL for 'goto' action")
+    x: float | None = Field(default=None, description="X coordinate for click/type actions (from vision map)")
+    y: float | None = Field(default=None, description="Y coordinate for click/type actions (from vision map)")
+    text: str | None = Field(default=None, description="Text to type for 'type' action")
+    wait_ms: int | None = Field(default=None, description="Milliseconds to wait for 'wait' action (default: 1000)")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  Main Agent Loop
+#  Main Agent Loop — Enhanced Failover (v9.0)
 # ═══════════════════════════════════════════════════════════════════════════════
 async def _invoke_with_failover(
     failover_chain: list,
     messages: list,
     schema,
-    circuit_breaker: CircuitBreaker | None = None,
+    circuit_breaker=None,
     base64_image: str | None = None,
+    health_tracker=None,
 ) -> tuple:
     """Try each model in the failover chain until one succeeds.
 
-    Returns: (decision, model_name_used)
-    Raises: Exception if ALL models fail or circuit breaker is tripped.
+    v9.0 improvements:
+      - Configurable timeout (30s default, not hardcoded 20s)
+      - 3s quarantine wait, not 30s dead time
+      - Proper exponential backoff via ProviderHealthTracker
     """
     if circuit_breaker and circuit_breaker.tripped:
         raise RuntimeError(f"🔌 CIRCUIT BREAKER TRIPPED: {circuit_breaker.reason}")
 
     last_error = None
+    model_names = [
+        getattr(m, 'model_name', getattr(m, 'model', str(m)))
+        for m in failover_chain
+    ]
+
+    # If all providers quarantined, wait briefly for recovery
+    if health_tracker and health_tracker.all_quarantined(model_names):
+        wait_time = min(health_tracker.shortest_quarantine_wait() + 0.5, 8.0)
+        logger.warning("⏳ All providers quarantined. Waiting %.1fs...", wait_time)
+        await asyncio.sleep(wait_time)
+
     for idx, llm in enumerate(failover_chain):
-        model_name = getattr(llm, 'model_name', getattr(llm, 'model', str(llm)))
-        
-        # ── Dynamic Vision Payload Support ──
+        model_name = model_names[idx]
+
+        if health_tracker and not health_tracker.is_available(model_name):
+            if idx < len(failover_chain) - 1:
+                continue
+
+        # Dynamic Vision Payload Support
         supports_vision = any(x in model_name.lower() for x in [
-            "gpt-4o", "claude-3-5", "claude-3-opus", "gemini-1.5", "glm-4v", "vision", "pixtral", "gemma"
+            "gpt-4o", "claude-3-5", "gemini", "glm-4v", "vision", "pixtral", "gemma"
         ])
-        
         current_messages = messages
         if supports_vision and base64_image and len(messages) > 0:
             last_msg = messages[-1]
@@ -378,89 +527,119 @@ async def _invoke_with_failover(
                     {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}}
                 ]
                 current_messages = messages[:-1] + [HumanMessage(content=multimodal_content)]
-                
+
         try:
-            structured = llm.with_structured_output(schema)
-            decision = await structured.ainvoke(current_messages)
+            if schema is not None:
+                structured = llm.with_structured_output(schema)
+            else:
+                structured = llm
+            decision = await asyncio.wait_for(
+                structured.ainvoke(current_messages),
+                timeout=30.0,
+            )
             if circuit_breaker:
                 circuit_breaker.record_success()
+            if health_tracker:
+                health_tracker.record_success(model_name)
             return decision, model_name
+        except asyncio.TimeoutError:
+            if circuit_breaker:
+                circuit_breaker.record_failure()
+            if health_tracker:
+                health_tracker.record_failure(model_name)
+            logger.warning("⚠️  FAILOVER [%d/%d]: %s TIMED OUT (>30s)", idx + 1, len(failover_chain), model_name)
+            last_error = TimeoutError(f"{model_name} timed out")
         except Exception as e:
             if circuit_breaker:
                 circuit_breaker.record_failure()
             error_str = str(e)
             is_rate_limit = "429" in error_str or "rate_limit" in error_str.lower()
-            is_server_error = "500" in error_str or "502" in error_str or "503" in error_str
-            is_timeout = "timeout" in error_str.lower() or "timed out" in error_str.lower()
-
+            if health_tracker:
+                health_tracker.record_failure(model_name, is_rate_limit=is_rate_limit)
+            logger.warning("⚠️  FAILOVER [%d/%d]: %s — %s", idx + 1, len(failover_chain), model_name, error_str[:150])
             if is_rate_limit:
-                logger.warning("⚠️  FAILOVER [%d/%d]: %s hit RATE LIMIT (429) — switching to next model...",
-                               idx + 1, len(failover_chain), model_name)
-            elif is_server_error:
-                logger.warning("⚠️  FAILOVER [%d/%d]: %s returned SERVER ERROR — switching to next model...",
-                               idx + 1, len(failover_chain), model_name)
-            elif is_timeout:
-                logger.warning("⚠️  FAILOVER [%d/%d]: %s TIMED OUT — switching to next model...",
-                               idx + 1, len(failover_chain), model_name)
-            else:
-                logger.warning("⚠️  FAILOVER [%d/%d]: %s failed (%s) — switching to next model...",
-                               idx + 1, len(failover_chain), model_name, error_str[:150])
+                await asyncio.sleep(1.5)
             last_error = e
-            continue
 
-    # All models exhausted
-    raise RuntimeError(f"ALL {len(failover_chain)} models failed. Last error: {last_error}")
+    raise RuntimeError(f"ALL {len(failover_chain)} models failed. Last: {last_error}")
 
 
 async def run_agent(objective: str):
-    """Core single-agent action loop with native state persistence,
-    zero-downtime LLM failover, GhostCursor humanization, adversarial critic,
-    episodic campaign memory, and self-healing anti-detection (v8.0)."""
+    """Core autonomous agent loop — v9.0 Deep Intelligence Architecture.
 
+    Features: ModelRegistry, Mission Planner, Progressive State Machine,
+    Action Verifier, Self-Correction Engine, Recovery Advisor,
+    Continuous Campaign Logger, Enhanced Failover.
+    """
     context, page = await launch_browser()
     guard = SessionGuard.get()
 
-    # ── Human Warm-Up Routine (WAF Bypass) ──
-    # Establishes credible browsing history before deep navigation.
+    # ── Human Warm-Up Routine ──
     target_hint = extract_target_url_from_objective(objective)
     try:
         await run_warmup(page, target_url=target_hint)
     except Exception as warmup_err:
         logger.warning("Warm-up routine failed (non-fatal): %s", warmup_err)
 
-    # ── Enterprise modules ──
+    # ── v9.0: ModelRegistry as single source of truth ──
+    registry = ModelRegistry.get_instance()
     memory = CampaignMemory()
     critic = ContentCritic()
-    breaker = CircuitBreaker(max_requests=50, max_failures=10)
+    breaker = registry.breaker  # Shared circuit breaker
+    health_tracker = registry.health  # Shared health tracker
 
-    # ── Build the full failover chain ──
-    # Diagnostic-proven order: Groq (confirmed alive) → NVIDIA (fallback) → DeepSeek → Gemma
-    primary, secondary, deepseek, tertiary = _build_worker_llms()
-    # secondary=Groq (FAST, working), primary=NVIDIA (slow/timeout), tertiary=Gemma (vision)
-    failover_chain = secondary + primary + deepseek + tertiary
+    # Agents pull from ModelRegistry automatically
+    vision_agent = VisionAgent()
+    reasoning_agent = ReasoningAgent()
+
+    failover_chain = reasoning_agent.get_failover_chain()
+    chain_names = reasoning_agent.get_chain_names()
+
     if not failover_chain:
         logger.error("No LLM clients available. Check API keys in .env.")
         await context.close()
         guard.detach()
         return
 
-    chain_names = [getattr(m, 'model_name', getattr(m, 'model', '?')) for m in failover_chain]
     logger.info("LLM Failover Chain (%d models): %s", len(failover_chain), " → ".join(chain_names))
-    logger.info("Objective: %s", objective)
+    logger.info("Objective: %s", objective[:200])
+
+    # ── v10.0: Content Store — separate long articles from objective ──
+    store = ContentStore(base_dir=Path(__file__).parent / "persistence")
+    llm_objective, has_article = store.load_from_objective(objective)
+    if has_article:
+        logger.info(
+            "📄 Article loaded: title='%s' | body=%d chars | platform=%s",
+            store.get_title()[:60], len(store.get_body()), store.article.target_platform,
+        )
+        logger.info("📄 Shortened objective for LLM (%d chars)", len(llm_objective))
+    else:
+        llm_objective = objective
 
     # ── Campaign memory context ──
     campaign_log = memory.get_campaign_log(limit=5)
     if campaign_log:
         logger.info("Campaign history: %s", memory.get_summary())
 
+    # ── v9.0: Mission Planner — decompose into checkpoints ──
+    mission_checkpoints = await _decompose_objective(llm_objective, failover_chain, breaker, health_tracker)
+    logger.info("📋 Mission Plan (%d checkpoints):", len(mission_checkpoints))
+    for i, cp in enumerate(mission_checkpoints):
+        logger.info("  [%d] %s", i + 1, cp)
+
     action_history: list[str] = []
-    url_history: list[str] = []  # Anti-Loop Watchdog tracker
-    captcha_retries = 0
-    heavy_mode_active = False
+    url_history: list[str] = []
     last_action_signature = ""
     consecutive_identical_actions = 0
-    max_steps = 20
+    correction_failures = 0  # v9.0: Self-correction streak counter
+    max_steps = 25  # v9.0: Increased from 20 to accommodate verification steps
     step = 0
+
+    # ── v9.0: Progressive State Machine ──
+    phase_tracker = AgentPhaseTracker()
+    # Backwards compat aliases
+    completed_phases = phase_tracker.phases
+    typed_text_content = ""
 
     try:
         for step in range(max_steps):
@@ -482,180 +661,234 @@ async def run_agent(objective: str):
             current_url = page.url
             logger.info("URL: %s", current_url)
 
-            # ── Progressive Perception: Check for Action Stagnation ──
-            if consecutive_identical_actions >= 2:
-                heavy_mode_active = True
-                logger.warning("🔄 Repeated action detected. Activating HEAVY MODE (Vision + DOM) for next step.")
-
             # ── Anti-Loop Watchdog: detect navigation loops ──
             url_history.append(current_url)
-            loop_override = ""
+            loop_context = ""
             if len(url_history) >= 6:
                 recent_urls = url_history[-6:]
                 url_counts = Counter(recent_urls)
                 most_common_url, visit_count = url_counts.most_common(1)[0]
                 if visit_count >= 3:
-                    heavy_mode_active = True
                     logger.warning(
-                        "🔄 LOOP DETECTED: '%s' visited %d times in last 6 steps! Activating HEAVY MODE.",
+                        "🔄 LOOP DETECTED: '%s' visited %d times in last 6 steps!",
                         most_common_url, visit_count,
                     )
-                    loop_override = (
-                        "\n\n⚠️ SYSTEM OVERRIDE: You are TRAPPED in a navigation loop. "
-                        f"You have visited '{most_common_url}' {visit_count} times in the last 6 steps. "
-                        "STOP revisiting the same pages. "
-                        "If you are on a login page, you MUST click 'Continue with Google' "
-                        "or 'Sign in with Google' IMMEDIATELY. "
-                        "Do NOT navigate away from the login page. Authenticate FIRST. "
-                        "If there is no Google login button visible, SCROLL DOWN to find it."
+                    loop_context = (
+                        f"\n\n⚠️ CRITICAL LOOP WARNING: You have visited '{most_common_url}' "
+                        f"{visit_count} times in the last 6 steps. You are stuck. "
+                        "STOP and THINK deeply: Why are you repeating the same navigation? "
+                        "Your previous approach is NOT working. You MUST try a DIFFERENT strategy: "
+                        "scroll to reveal hidden elements, wait for dynamic content to load, "
+                        "click a different element, or re-evaluate whether the goal is already achieved. "
+                        "Do NOT repeat the same action you just tried."
                     )
 
-            # ── CAPTCHA / Cloudflare Detector ──
-            try:
-                captcha_signals = await page.evaluate("""
-                () => {
-                    const s = [];
-                    if (document.querySelector('iframe[src*="challenges.cloudflare.com"]'))
-                        s.push('cloudflare_turnstile');
-                    if (document.querySelector('#cf-turnstile-container, .cf-turnstile'))
-                        s.push('cloudflare_turnstile');
-                    if (document.querySelector('iframe[src*="google.com/recaptcha"]'))
-                        s.push('recaptcha_v2');
-                    if (document.querySelector('.g-recaptcha'))
-                        s.push('recaptcha_v2');
-                    if (document.querySelector('iframe[src*="hcaptcha.com"]'))
-                        s.push('hcaptcha');
-                    const bt = (document.body?.innerText || '').toLowerCase();
-                    if (bt.includes('verify you are human') || bt.includes('checking your browser'))
-                        s.push('generic_challenge');
-                    return s;
-                }
-                """)
-                if captcha_signals:
-                    captcha_type = captcha_signals[0]
-                    captcha_retries += 1
-                    if captcha_retries > 2:
-                        logger.warning("🛡️ CAPTCHA ignored (hit retry limit of 2). Letting LLM proceed.")
-                    else:
-                        logger.warning("🛡️ CAPTCHA DETECTED: %s — attempting GhostCursor bypass (attempt %d)...", captcha_type, captcha_retries)
-                        if captcha_type in ("cloudflare_turnstile", "recaptcha_v2", "hcaptcha"):
-                            iframe_el = await page.query_selector(
-                                'iframe[src*="challenges.cloudflare.com"], '
-                                'iframe[src*="google.com/recaptcha"], '
-                                'iframe[src*="hcaptcha.com"]'
-                            )
-                            if iframe_el:
-                                box = await iframe_el.bounding_box()
-                                if box:
-                                    click_x = box["x"] + 30
-                                    click_y = box["y"] + 30
-                                    await ghost_click(page, click_x, click_y)
-                                    logger.info("🛡️ Clicked CAPTCHA checkbox at (%d, %d)", click_x, click_y)
-                                    await asyncio.sleep(4)
-                        elif captcha_type == "generic_challenge":
-                            logger.info("🛡️ Waiting 8s for Cloudflare browser check to complete...")
-                            await asyncio.sleep(8)
-                        continue  # Re-evaluate the page after handling the challenge
-                else:
-                    captcha_retries = 0  # Reset if no challenge found
-            except Exception as e:
-                logger.warning("CAPTCHA detection failed: %s", e)
+            # ── Determine Context-Aware Target Hint for Sniper Mode ──
+            target_hint = None
+            if store.has_article:
+                if not phase_tracker.is_done("title_filled"):
+                    target_hint = "title"
+                elif not phase_tracker.is_done("body_filled"):
+                    target_hint = "body"
+                elif not phase_tracker.is_done("submit_clicked"):
+                    target_hint = "submit"
 
-            try:
-                raw_regions = await _extract_interactive_regions(page, max_regions=150)
-            except Exception as e:
-                logger.warning("DOM extraction failed: %s — retrying next step", e)
-                continue
+            # ═══ TIER 1: God-Mode DOM Parser V11 (instant, ~50ms) ═══
+            dom_data = await dom_parser.extract(page, target_hint=target_hint, timeout=5.0)
+            elements_list = dom_data.get("elements", [])
+            dom_markdown = dom_data.get("markdown", "")
+            vision_map_json = json.dumps({"elements": elements_list, "image_size": dom_data.get("image_size", {})}, ensure_ascii=True)
 
-            # ── Smart DOM Compression (Priority-Tiered) ──
-            compact = _compress_dom_for_llm(raw_regions, max_tokens_budget=2000)
-
-            # ── Progressive Perception (Heavy Mode) ──
-            base64_image = None
-            cleaned_dom = ""
-            if heavy_mode_active:
-                logger.info("👁️ Capturing heavy perception (Screenshot + DOM)...")
+            # ═══ TIER 2: Vision API — ABSOLUTE LAST RESORT ═══
+            # Only fires if the DOM parser found literally zero elements
+            # (e.g., the page is a full-canvas app or a PDF viewer)
+            if not elements_list:
+                logger.warning("God-Mode DOM found 0 elements — falling back to Vision API")
                 try:
-                    screenshot_bytes = await page.screenshot(type="jpeg", quality=50)
-                    import base64
+                    screenshot_bytes = await page.screenshot(type="jpeg", quality=55)
                     base64_image = base64.b64encode(screenshot_bytes).decode("utf-8")
-                    cleaned_dom = await page.evaluate('''() => {
-                        const clone = document.body.cloneNode(true);
-                        clone.querySelectorAll("script, style, svg, img, video").forEach(el => el.remove());
-                        return clone.innerText.substring(0, 3000);
-                    }''')
                 except Exception as e:
-                    logger.warning("Heavy perception capture failed: %s", e)
-                
-                schema_to_use = HeavyAction
-                system_prompt = (
-                    "You are an elite autonomous web agent operating inside a real browser.\n"
-                    "HEAVY MODE ACTIVATED: You are stuck. Look at the provided screenshot and DOM text to figure out what is blocking you (e.g. a popup, login overlay, or layout shift).\n"
-                    "You must output 'current_state_analysis' and 'obstacle_detection' before deciding the next action.\n"
-                    "IMPORTANT: If you already typed text into a field, do NOT type it again. Move to the NEXT step.\n"
-                    "Available actions: goto, click, type, scroll, press_enter, done.\n"
+                    logger.warning("Screenshot capture failed: %s", e)
+                    continue
+
+                vision_map_json = await vision_agent.detect_elements(
+                    screenshot_base64=base64_image,
+                    screenshot_encoding="base64:jpeg",
                 )
-                user_prompt = (
-                    f"OBJECTIVE: {objective}\n"
-                    f"CURRENT URL: {current_url}\n"
-                    f"COMPLETED ACTIONS: {json.dumps(action_history)}\n"
-                    f"INTERACTIVE ELEMENTS:\n{json.dumps(compact, indent=2)}\n\n"
-                    f"PAGE TEXT CONTEXT (DOM):\n{cleaned_dom}\n\n"
-                    "What is your NEXT action?"
-                    f"{loop_override}"
+                vision_data = json.loads(vision_map_json) if vision_map_json.strip() else {}
+                elements_list = vision_data.get("elements", [])
+                if elements_list:
+                    logger.info("Vision fallback: extracted %d elements", len(elements_list))
+                else:
+                    logger.warning("Vision fallback also empty — page may be non-interactive")
+
+            # ── Login State Detector: check if user is already authenticated ──
+            login_hint = ""
+            try:
+                login_state = await asyncio.wait_for(page.evaluate("""
+                () => {
+                    const url = window.location.href;
+                    const body = document.body ? document.body.innerText.slice(0, 500) : '';
+                    const hasProfile = !!document.querySelector('[data-testid="AppTabBar_Profile_Link"], [aria-label="Profile"], img[alt*="profile" i]');
+                    const hasCompose = !!document.querySelector('[data-testid="tweetTextarea_0"], [data-testid="tweetButtonInline"], [aria-label="Post"]');
+                    const hasFeed = !!document.querySelector('[data-testid="primaryColumn"], [data-testid="tweet"]');
+                    const hasLoginForm = !!document.querySelector('input[name="text"], input[name="password"], [data-testid="LoginForm_Login_Button"]');
+                    return {
+                        url: url,
+                        hasProfile: hasProfile,
+                        hasCompose: hasCompose,
+                        hasFeed: hasFeed,
+                        hasLoginForm: hasLoginForm
+                    };
+                }
+                """), timeout=5.0)
+
+                if login_state.get("hasProfile") or login_state.get("hasFeed") or login_state.get("hasCompose"):
+                    login_hint = (
+                        "\n\n🔑 LOGIN STATUS: You are ALREADY LOGGED IN. "
+                        "Profile icon and/or feed content detected. "
+                        "DO NOT attempt to log in again. Skip any login steps and proceed directly to your goal."
+                    )
+                    if login_state.get("hasCompose"):
+                        login_hint += " A tweet compose area is available on this page."
+                    logger.info("🔑 Login detected: profile=%s feed=%s compose=%s",
+                                login_state.get("hasProfile"), login_state.get("hasFeed"), login_state.get("hasCompose"))
+                elif login_state.get("hasLoginForm"):
+                    login_hint = "\n\n🔑 LOGIN STATUS: You are NOT logged in. A login form is visible."
+                    logger.info("🔑 Login form detected — user is logged out")
+            except Exception as login_err:
+                logger.warning("Login state detection failed: %s", login_err)
+
+            # ════════════════════════════════════════════════════════════════
+            #  OTA SYSTEM PROMPT — Autonomous Observe-Think-Act Persona
+            # ════════════════════════════════════════════════════════════════
+            system_prompt = (
+                "You are an elite autonomous web agent with FULL CREATIVE FREEDOM. "
+                "You operate inside a real Chromium browser and control it through actions.\n\n"
+
+                "═══ CORE IDENTITY ═══\n"
+                "You are an INDEPENDENT THINKER, not a step-follower. "
+                "The user gives you a GOAL (their intent). Any numbered steps they provide are "
+                "SUGGESTIONS, not commands. YOU decide the actual actions based on what you SEE.\n\n"
+
+                "═══ OBSERVE-THINK-ACT LOOP ═══\n"
+                "Every turn you MUST:\n"
+                "1. OBSERVE: Describe what you actually see on screen (screen_state field).\n"
+                "   - Is this a login page? A feed? A compose dialog? An error?\n"
+                "   - Are there popups, overlays, cookie banners, or CAPTCHAs blocking you?\n"
+                "   - Is the user logged in or logged out? Look for profile icons, usernames, feeds.\n"
+                "2. THINK: Reason through the situation (previous_action_result + goal_progress + reasoning).\n"
+                "   - Did your last action work? How do you know?\n"
+                "   - What fraction of the goal is done? What remains?\n"
+                "   - Consider at least 2 possible next actions and explain why you chose one.\n"
+                "3. ACT: Execute exactly ONE action based on your reasoning.\n\n"
+
+                "═══ AUTONOMOUS INTELLIGENCE RULES ═══\n"
+                "• NEVER blindly follow user steps if the screen shows a different state. "
+                "If the user says 'login' but you see a feed with a profile icon, you are ALREADY logged in — skip login.\n"
+                "• If an action FAILED (you can see from action history), do NOT repeat it. Try an alternative approach.\n"
+                "• If you see a popup, overlay, modal, or cookie banner, HANDLE IT FIRST before continuing your main task.\n"
+                "• ARTICLES: For long articles, the content is pre-loaded. Type ONLY the title into the title field. "
+                "For the body/content field, just click on it with a type action — the system will auto-inject the full article.\n"
+                "• MULTI-FIELD FORMS: On platforms like dev.to, there are SEPARATE title and body fields. "
+                "Fill the TITLE first, then click the BODY field. Do NOT re-type the title.\n"
+                "• If the FIELD STATUS says 'All fields filled', your ONLY remaining action is to click Publish/Submit.\n"
+                "• SCROLL if you cannot find the target element in the vision map — it may be below the fold.\n"
+                "• Use 'wait' (1000-2000ms) after clicks that trigger page loads or dynamic content.\n"
+                "• When the goal is FULLY achieved, output action_type='done' immediately. Do not take unnecessary extra steps.\n"
+                "• PLATFORM LIMITS: Twitter/X = 280 chars max. Reddit titles = 300. Keep text within limits.\n"
+                "• EXACT TEXT: When the user provides specific text to post, type it EXACTLY as given. Do NOT rewrite, shorten, or modify it.\n"
+                "• After typing text, your NEXT action should be to CLICK the submit/post button. Do not re-type.\n\n"
+
+                "═══ PAGE STRUCTURE (Semantic Markdown) ═══\n"
+                "You receive a compressed Markdown map of all interactive elements, grouped by their semantic container (form, nav, header, etc). "
+                "Each element has: [eN] id, kind, label, and (x,y) coordinates. "
+                "Use the coordinates to click/type. Use the container grouping to understand which elements belong together.\n\n"
+
+                "═══ AVAILABLE ACTIONS ═══\n"
+                "goto — Navigate to a URL (set url field)\n"
+                "click — Click at coordinates (set x, y fields)\n"
+                "type — Click at coordinates, clear field, then type text (set x, y, text fields)\n"
+                "scroll — Scroll down to reveal more content\n"
+                "press_enter — Press Enter key (e.g., to submit a form)\n"
+                "wait — Wait for content to load (set wait_ms, default 1000)\n"
+                "done — Goal achieved, stop execution\n"
+            )
+
+            # ════════════════════════════════════════════════════════════════
+            #  USER PROMPT — Intent + Context + Vision Map
+            # ════════════════════════════════════════════════════════════════
+            # ── v9.0: Consolidated State Override ──
+            state_override = phase_tracker.get_state_override(store.has_article)
+
+            # ── Hard Action Dedup: break repetition loops ──
+            dedup_override = ""
+            if consecutive_identical_actions >= 2:
+                dedup_override = (
+                    f"\n\n🛑 REPETITION BLOCK: EXACT SAME action {consecutive_identical_actions + 1} times. "
+                    "You MUST choose a COMPLETELY DIFFERENT action NOW."
                 )
-            else:
-                schema_to_use = AdvancedAction
-                system_prompt = (
-                    "You are an elite autonomous web agent operating inside a real browser.\n"
-                    "You receive the current URL, a history of past actions, and a list of interactive DOM elements.\n"
-                    "Choose the EXACT next action. If the objective is fully complete, output action_type='done'.\n"
-                    "IMPORTANT: If you already typed text into a field, do NOT type it again. Move to the NEXT step.\n"
-                    "Available actions: goto, click, type, scroll, press_enter, done.\n"
-                )
-                user_prompt = (
-                    f"OBJECTIVE: {objective}\n"
-                    f"CURRENT URL: {current_url}\n"
-                    f"COMPLETED ACTIONS: {json.dumps(action_history)}\n"
-                    f"INTERACTIVE ELEMENTS:\n{json.dumps(compact, indent=2)}\n\n"
-                    "What is your NEXT action?"
-                    f"{loop_override}"
-                )
+
+            user_prompt = (
+                f"═══ YOUR MISSION ═══\n"
+                f"{llm_objective}\n\n"
+                f"NOTE: The above describes the user's INTENT. Any numbered steps are guidance, not strict commands. "
+                f"YOU decide the actual actions based on what you see on screen.\n\n"
+                f"═══ CURRENT CONTEXT ═══\n"
+                f"URL: {current_url}\n"
+                f"Step: {step+1}/{max_steps} ({max_steps - step - 1} remaining)"
+                f"{login_hint}"
+                f"{state_override}"
+                f"{dedup_override}\n\n"
+                f"═══ ACTION HISTORY (recent) ═══\n"
+                f"{json.dumps(action_history[-5:], indent=1) if action_history else '[]'}\n\n"
+                f"═══ PAGE STRUCTURE ═══\n"
+                f"{dom_markdown}\n\n"
+                f"Now OBSERVE the page structure above, THINK about your situation, and choose your NEXT action."
+                f"{loop_context}"
+            )
 
             messages = [SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)]
 
-            current_chain = failover_chain
-            if heavy_mode_active:
-                # Forcefully prioritize Gemma models for vision
-                gemma_models = [m for m in failover_chain if "gemma" in getattr(m, 'model_name', getattr(m, 'model', str(m))).lower()]
-                other_models = [m for m in failover_chain if m not in gemma_models]
-                if gemma_models:
-                    current_chain = gemma_models + other_models
-                    logger.info("👁️ Vision needed: forcefully routing to %s", getattr(gemma_models[0], 'model_name', 'Gemma'))
-
-            logger.info("Querying LLM (failover chain: %d models)...", len(current_chain))
+            logger.info("Querying reasoning LLM (failover chain: %d models)...", len(failover_chain))
             try:
                 decision, used_model = await _invoke_with_failover(
-                    current_chain, messages, schema_to_use, circuit_breaker=breaker, base64_image=base64_image
+                    failover_chain,
+                    messages,
+                    AutonomousAction,
+                    circuit_breaker=breaker,
+                    health_tracker=health_tracker,
                 )
                 logger.info("Answered by: %s", used_model)
             except RuntimeError as e:
-                logger.error("LLM FAILURE: %s — pausing 30s before retry...", e)
-                await asyncio.sleep(30)
+                wait_secs = min(health_tracker.shortest_quarantine_wait() + 1.0, 15.0) if health_tracker else 5.0
+                logger.error("LLM FAILURE: %s — waiting %.1fs for recovery...", e, wait_secs)
+                await asyncio.sleep(wait_secs)
+                step -= 1  # Don't burn a step when ALL models are down
                 continue
 
-            logger.info("Reasoning: %s", decision.reasoning)
-            logger.info("Action: %s", decision.action_type)
+            # ── Log the full OTA chain-of-thought ──
+            logger.info("👁️ OBSERVE: %s", decision.screen_state[:200])
+            logger.info("🔄 PREVIOUS: %s", decision.previous_action_result[:150])
+            logger.info("📊 PROGRESS: %s", decision.goal_progress[:150])
+            logger.info("🧠 REASONING: %s", decision.reasoning[:200])
+            logger.info("⚡ ACTION: %s", decision.action_type)
 
+            # ── Build enriched action history entry ──
             summary = f"Step {step+1}: {decision.action_type}"
-            if decision.element_id is not None and decision.element_id < len(raw_regions):
-                target_text = raw_regions[decision.element_id].text[:60]
-                summary += f" on '{target_text}'"
+            if decision.x is not None and decision.y is not None:
+                summary += f" at ({int(decision.x)},{int(decision.y)})"
             if decision.text:
-                summary += f" text='{decision.text}'"
-            action_history.append(summary)
+                text_preview = decision.text[:100] + ("..." if len(decision.text) > 100 else "")
+                summary += f" text='{text_preview}' ({len(decision.text)} chars)"
+            if decision.url:
+                summary += f" url='{decision.url[:60]}'"
+
+            # ── Execute with outcome tracking ──
+            action_outcome = "→ OK"
 
             # ── Execute ──
+            intercepted_by_smart_engine = False
             if decision.action_type == "done":
                 logger.info("✅ Goal Achieved!")
                 break
@@ -666,59 +899,283 @@ async def run_agent(objective: str):
                     await page.goto(decision.url, wait_until="domcontentloaded", timeout=15000)
                 except Exception as e:
                     logger.warning("Navigation failed: %s", e)
+                    action_outcome = f"→ FAILED: {e}"
 
-            elif decision.action_type == "click":
-                if decision.element_id is None or decision.element_id >= len(raw_regions):
-                    logger.warning("Invalid element_id %s", decision.element_id)
+            elif decision.action_type in ("type", "click"):
+                if decision.x is None or decision.y is None:
+                    logger.warning("Missing coordinates for action")
                     continue
-                t = raw_regions[decision.element_id]
-                cx, cy = t.x + t.width / 2, t.y + t.height / 2
-                logger.info("Clicking (%s '%s') at (%d, %d)", t.tag, t.text[:40], cx, cy)
-                try:
-                    await ghost_click(page, cx, cy)
-                except Exception as e:
-                    logger.warning("Click failed: %s", e)
 
-            elif decision.action_type == "type":
-                if decision.element_id is None or decision.element_id >= len(raw_regions):
-                    logger.warning("Invalid element_id %s", decision.element_id)
-                    continue
-                t = raw_regions[decision.element_id]
-                cx, cy = t.x + t.width / 2, t.y + t.height / 2
+                # ══════════════════════════════════════════════════════════
+                #  v10.0: Smart Content Injection Engine
+                # ══════════════════════════════════════════════════════════
+                is_article_mode = store.has_article
+                intercepted_by_smart_engine = False
 
-                text_to_type = decision.text or ""
+                if is_article_mode and not phase_tracker.is_done("all_fields_ready"):
+                    # ── Detect which field we're targeting ──
+                    form_data = await dom_parser.detect_form_fields(page)
+                    title_field = dom_parser.find_field(form_data, "title")
+                    body_field = dom_parser.find_field(form_data, "body")
 
-                # ── Adversarial Critic: review body content before typing ──
-                if len(text_to_type) > 100:
-                    logger.info("Content Critic: reviewing %d-char body before typing...", len(text_to_type))
+                    target_is_title = False
+                    target_is_body = False
+
+                    if title_field and not phase_tracker.is_done("title_filled"):
+                        tdist = abs(decision.y - title_field["y"]) + abs(decision.x - title_field["x"])
+                        if tdist < 200:
+                            target_is_title = True
+                    if body_field and not phase_tracker.is_done("body_filled"):
+                        bdist = abs(decision.y - body_field["y"]) + abs(decision.x - body_field["x"])
+                        if bdist < 200:
+                            target_is_body = True
+
+                    # (Removed heuristic fallback that wrongly triggered on Publish button)
+
+
+                    if target_is_title:
+                        intercepted_by_smart_engine = True
+                        # ── TITLE: Use ghost_type ──
+                        title_text = store.get_title()
+                        logger.info("📝 TITLE INJECTION: '%s' (%d chars) at (%d, %d)",
+                                    title_text[:60], len(title_text), decision.x, decision.y)
+                        try:
+                            await ghost_click(page, decision.x, decision.y)
+                            await asyncio.sleep(0.3)
+                            await page.keyboard.press("Control+A")
+                            await asyncio.sleep(0.1)
+                            await page.keyboard.press("Delete")
+                            await asyncio.sleep(0.2)
+                            await page.keyboard.insert_text(title_text)
+                            await asyncio.sleep(0.3)
+
+                            audit = await dom_parser.audit_form_fields(page)
+                            title_audit = audit.get("title", {})
+                            if title_audit.get("found") and title_audit.get("length", 0) > 0:
+                                logger.info("✅ TITLE VERIFIED: %d chars — '%s'",
+                                            title_audit["length"], title_audit.get("value", "")[:60])
+                                phase_tracker.mark("title_filled")
+                                phase_tracker.title_content = title_text
+                                phase_tracker.typed_text = title_text
+                                completed_phases["title_filled"] = True
+                                action_outcome = f"→ TITLE OK ({title_audit['length']} chars)"
+                            else:
+                                logger.warning("⚠️ TITLE UNVERIFIED — field not found after typing")
+                                phase_tracker.mark("title_filled")
+                                phase_tracker.title_content = title_text
+                                completed_phases["title_filled"] = True
+                                action_outcome = "→ TITLE typed (unverified)"
+
+                            _record_phase_transition(memory, "unknown", objective, page.url, step, "title_filled")
+                        except Exception as e:
+                            logger.warning("Title typing failed: %s", e)
+                            action_outcome = f"→ FAILED: {e}"
+
+                    elif target_is_body:
+                        intercepted_by_smart_engine = True
+                        # ── BODY: Direct injection ──
+                        body_text = store.get_body()
+                        logger.info("📄 BODY INJECTION: %d chars via insert_text at (%d, %d)",
+                                    len(body_text), decision.x, decision.y)
+                        try:
+                            await ghost_click(page, decision.x, decision.y)
+                            await asyncio.sleep(0.5)
+                            await page.keyboard.press("Control+A")
+                            await asyncio.sleep(0.1)
+                            await page.keyboard.press("Delete")
+                            await asyncio.sleep(0.2)
+                            # Direct injection — Instant and rate-limit safe via JS evaluation + input events
+                            try:
+                                await page.evaluate('''
+                                    (text) => {
+                                        const el = document.activeElement;
+                                        if (!el) return;
+                                        if (typeof el.value !== "undefined") {
+                                            const nativeSetter = Object.getOwnPropertyDescriptor(
+                                                window.HTMLTextAreaElement.prototype, "value"
+                                            )?.set || Object.getOwnPropertyDescriptor(
+                                                window.HTMLInputElement.prototype, "value"
+                                            )?.set;
+                                            if (nativeSetter) {
+                                                nativeSetter.call(el, text);
+                                            } else {
+                                                el.value = text;
+                                            }
+                                            el.dispatchEvent(new Event('input', { bubbles: true }));
+                                            el.dispatchEvent(new Event('change', { bubbles: true }));
+                                        } else if (el.isContentEditable) {
+                                            el.textContent = text;
+                                            el.dispatchEvent(new Event('input', { bubbles: true }));
+                                        }
+                                    }
+                                ''', body_text)
+                                await asyncio.sleep(0.5)
+                            except Exception as js_err:
+                                logger.warning("JS direct injection failed (%s), falling back to insert_text", js_err)
+                                await page.keyboard.insert_text(body_text)
+                            
+                            await asyncio.sleep(1.0)
+
+                            audit = await dom_parser.audit_form_fields(page)
+                            body_audit = audit.get("body", {})
+                            if body_audit.get("found") and body_audit.get("length", 0) > 100:
+                                logger.info("✅ BODY VERIFIED: %d chars injected", body_audit["length"])
+                                phase_tracker.mark("body_filled")
+                                phase_tracker.body_content = body_text
+                                completed_phases["body_filled"] = True
+                                action_outcome = f"→ BODY OK ({body_audit['length']} chars)"
+                            else:
+                                logger.warning("⚠️ BODY INJECTION PARTIAL: audit=%d chars", body_audit.get("length", 0))
+                                phase_tracker.mark("body_filled")
+                                phase_tracker.body_content = body_text
+                                completed_phases["body_filled"] = True
+                                action_outcome = f"→ BODY injected (audit: {body_audit.get('length', 0)} chars)"
+
+                            _record_phase_transition(memory, "unknown", objective, page.url, step, "body_filled")
+                        except Exception as e:
+                            logger.warning("Body injection failed: %s", e)
+                            action_outcome = f"→ FAILED: {e}"
+
+                    if phase_tracker.is_done("title_filled") and phase_tracker.is_done("body_filled"):
+                        if not phase_tracker.is_done("all_fields_ready"):
+                            phase_tracker.mark("all_fields_ready")
+                            completed_phases["all_fields_ready"] = True
+                            logger.info("🎯 ALL ARTICLE FIELDS READY — awaiting submit click")
+
+                if intercepted_by_smart_engine:
+                    pass # We handled it above
+                elif decision.action_type == "click":
+                    logger.info("Clicking at (%d, %d)", decision.x, decision.y)
                     try:
-                        verdict = await critic.review(
-                            content=text_to_type,
-                            platform=current_url,
-                            failover_chain=failover_chain,
-                            invoke_fn=_invoke_with_failover,
-                        )
-                        if not verdict.approved and verdict.rewritten_content:
-                            logger.info(
-                                "Critic rewrote content (tone=%.2f, issues=%d): %s",
-                                verdict.tone_score, len(verdict.issues),
-                                "; ".join(verdict.issues[:3]),
-                            )
-                            text_to_type = verdict.rewritten_content
-                        elif verdict.approved:
-                            logger.info("Critic approved content (tone=%.2f)", verdict.tone_score)
+                        await ghost_click(page, decision.x, decision.y)
                     except Exception as e:
-                        logger.warning("Critic review failed: %s — using original content", e)
+                        logger.warning("Click failed: %s", e)
+                        action_outcome = f"→ FAILED: {e}"
+                elif decision.action_type == "type":
+                    # ══════════════════════════════════════════════════════════
+                    #  Standard typing (tweets, short posts, etc.)
+                    # ══════════════════════════════════════════════════════════
+                    text_to_type = decision.text or ""
+                    platform_char_limits = {
+                        "x.com": 280, "twitter.com": 280,
+                        "reddit.com": 40000, "dev.to": 100000,
+                        "medium.com": 100000, "hashnode.com": 100000,
+                    }
+                    max_chars = 280
+                    for domain, limit in platform_char_limits.items():
+                        if domain in current_url:
+                            max_chars = limit
+                            break
 
-                logger.info("Typing '%s' into (%s '%s')", text_to_type[:80], t.tag, t.text[:40])
-                try:
-                    await ghost_click(page, cx, cy)
-                    await asyncio.sleep(0.3)
-                    await page.keyboard.press("Control+A")
-                    await page.keyboard.press("Backspace")
-                    await ghost_type(page, text_to_type)
-                except Exception as e:
-                    logger.warning("Type failed: %s", e)
+                    if len(text_to_type) > max_chars:
+                        logger.warning(
+                            "⚠️ Text too long (%d chars) for platform limit (%d). Truncating.",
+                            len(text_to_type), max_chars,
+                        )
+                        text_to_type = text_to_type[:max_chars]
+
+                    # ── Content Critic: ONLY for agent-generated content ──
+                    objective_lower = objective.lower()
+                    words_in_objective = sum(1 for w in text_to_type.split() if w.lower() in objective_lower)
+                    text_from_user = words_in_objective >= len(text_to_type.split()) * 0.5
+
+                    if len(text_to_type) > 100 and not text_from_user:
+                        logger.info("Content Critic: reviewing %d-char AGENT-GENERATED body...", len(text_to_type))
+                        try:
+                            verdict = await critic.review(
+                                content=text_to_type,
+                                platform=current_url,
+                                failover_chain=failover_chain,
+                                invoke_fn=_invoke_with_failover,
+                            )
+                            if not verdict.approved and verdict.rewritten_content:
+                                rewritten = verdict.rewritten_content
+                                if len(rewritten) <= max_chars:
+                                    logger.info(
+                                        "Critic rewrote content (tone=%.2f, issues=%d): %s",
+                                        verdict.tone_score, len(verdict.issues),
+                                        "; ".join(verdict.issues[:3]),
+                                    )
+                                    text_to_type = rewritten
+                                else:
+                                    logger.warning(
+                                        "Critic rewrite (%d chars) exceeds %d limit — using original",
+                                        len(rewritten), max_chars,
+                                    )
+                            elif verdict.approved:
+                                logger.info("Critic approved content (tone=%.2f)", verdict.tone_score)
+                        except Exception as e:
+                            logger.warning("Critic review failed: %s — using original content", e)
+                    elif text_from_user:
+                        logger.info("📝 User-provided text detected — skipping critic review")
+
+                    logger.info("Typing '%s' (%d chars) at (%d, %d)", text_to_type[:80], len(text_to_type), decision.x, decision.y)
+                    try:
+                        # Click to focus the field
+                        await ghost_click(page, decision.x, decision.y)
+                        await asyncio.sleep(0.3)
+
+                        # Clear existing content
+                        await page.mouse.click(decision.x, decision.y, click_count=3)
+                        await asyncio.sleep(0.15)
+                        await page.keyboard.press("Backspace")
+                        await asyncio.sleep(0.15)
+                        await page.keyboard.press("Control+A")
+                        await asyncio.sleep(0.1)
+                        await page.keyboard.press("Delete")
+                        await asyncio.sleep(0.2)
+
+                        # INSTANT FILL — replace slow ghost_type with insert_text
+                        await page.keyboard.insert_text(text_to_type)
+                        await asyncio.sleep(0.3)
+
+                        # ── Post-Type Verification ──
+                        try:
+                            audit = await dom_parser.audit_form_fields(page)
+                            # Check title first, then body, then generic
+                            t = audit.get("title", {})
+                            b = audit.get("body", {})
+                            verified_len = max(t.get("length", 0), b.get("length", 0))
+                            if verified_len > 0:
+                                logger.info("✅ TYPE VERIFIED: %d chars in field", verified_len)
+                                phase_tracker.mark("title_filled")
+                                phase_tracker.typed_text = text_to_type
+                                completed_phases["title_filled"] = True
+                                typed_text_content = text_to_type
+                                action_outcome = f"→ OK (verified: {verified_len} chars)"
+                                _record_phase_transition(memory, "unknown", objective, page.url, step, "title_filled")
+                            else:
+                                # Fallback: try the old selector method
+                                verify_result = await asyncio.wait_for(page.evaluate("""
+                                () => {
+                                    const el = document.querySelector('[data-testid="tweetTextarea_0"], [contenteditable="true"], textarea:focus, input:focus');
+                                    if (el) {
+                                        const text = el.textContent || el.value || '';
+                                        return { found: true, length: text.length, preview: text.slice(0, 100) };
+                                    }
+                                    return { found: false, length: 0, preview: '' };
+                                }
+                                """), timeout=3.0)
+                                if verify_result.get("found") and verify_result.get("length", 0) > 0:
+                                    logger.info("✅ TYPE VERIFIED (fallback): %d chars — '%s'",
+                                                verify_result["length"], verify_result["preview"][:60])
+                                    phase_tracker.mark("title_filled")
+                                    phase_tracker.typed_text = text_to_type
+                                    completed_phases["title_filled"] = True
+                                    typed_text_content = text_to_type
+                                    action_outcome = f"→ OK (verified: {verify_result['length']} chars)"
+                                else:
+                                    logger.warning("⚠️ TYPE UNVERIFIED: field not found or empty after typing")
+                                    action_outcome = "→ PARTIAL (field not verified)"
+                        except Exception as verify_err:
+                            logger.warning("Type verification failed: %s", verify_err)
+                            phase_tracker.mark("title_filled")
+                            phase_tracker.typed_text = text_to_type
+                            completed_phases["title_filled"] = True
+                            typed_text_content = text_to_type
+                    except Exception as e:
+                        logger.warning("Type failed: %s", e)
+                        action_outcome = f"→ FAILED: {e}"
 
 
             elif decision.action_type == "press_enter":
@@ -727,6 +1184,16 @@ async def run_agent(objective: str):
                     await page.keyboard.press("Enter")
                 except Exception as e:
                     logger.warning("Press Enter failed: %s", e)
+                    action_outcome = f"→ FAILED: {e}"
+
+            elif decision.action_type == "wait":
+                wait_ms = decision.wait_ms or 800
+                logger.info("Waiting %dms", wait_ms)
+                try:
+                    await page.wait_for_timeout(wait_ms)
+                except Exception as e:
+                    logger.warning("Wait failed: %s", e)
+                    action_outcome = f"→ FAILED: {e}"
 
             elif decision.action_type == "scroll":
                 logger.info("Scrolling down")
@@ -734,16 +1201,158 @@ async def run_agent(objective: str):
                     await ghost_scroll(page, 600)
                 except Exception as e:
                     logger.warning("Scroll failed: %s", e)
+                    action_outcome = f"→ FAILED: {e}"
 
-            # ── Progressive Perception: Track action state ──
-            current_action_signature = f"{decision.action_type}:{decision.element_id}:{decision.text}"
+            # Record action with outcome + screen context
+            history_entry = f"{summary} {action_outcome}"
+            if decision.screen_state:
+                history_entry += f" | Screen: {decision.screen_state[:80]}"
+            action_history.append(history_entry)
+
+            # ── v9.0: Action Outcome Verification + Self-Correction ──
+            if decision.action_type in ("click", "type", "goto"):
+                pre_hash = hash(current_url + vision_map_json[:500])
+                outcome = await _verify_action_outcome(page, current_url, pre_hash)
+                if outcome["changed"]:
+                    correction_failures = 0
+                    phase_tracker.correction_context = ""
+                    logger.info("✓ Verified: %s", outcome["detail"][:100])
+                else:
+                    correction_failures += 1
+                    phase_tracker.failed_actions.append(
+                        f"Step {step+1}: {decision.action_type} → NO EFFECT"
+                    )
+                    if correction_failures >= 2:
+                        phase_tracker.correction_context = (
+                            f"\n\n⚠️ SELF-CORRECTION: Last {correction_failures} actions had NO visible effect. "
+                            f"Failed: {'; '.join(phase_tracker.failed_actions[-3:])}. "
+                            "Try a COMPLETELY DIFFERENT approach: scroll, dismiss overlays, or wait."
+                        )
+                        logger.warning("🔧 Self-correction activated (streak=%d)", correction_failures)
+
+            # ── v9.0: Phase Transitions + Continuous Campaign Logging ──
+            platform = "unknown"
+            for p in ["dev.to", "medium.com", "x.com", "twitter.com", "hashnode.com", "github.com"]:
+                if p in page.url:
+                    platform = p
+                    break
+
+            if decision.action_type == "goto" and not phase_tracker.is_done("navigated_to_target"):
+                phase_tracker.mark("navigated_to_target")
+                _record_phase_transition(memory, platform, objective, page.url, step, "navigated")
+
+            is_submit_click = False
+            if decision.action_type == "click":
+                if store.has_article:
+                    is_submit_click = phase_tracker.is_done("body_filled") and not intercepted_by_smart_engine
+                else:
+                    is_submit_click = phase_tracker.text_typed_done
+
+            if is_submit_click:
+                phase_tracker.mark("submit_clicked")
+                completed_phases["submit_clicked"] = True
+                logger.info("📤 Post button click detected")
+                _record_phase_transition(memory, platform, objective, page.url, step, "submit_clicked")
+
+                # ── Mission Completion: verify and exit gracefully ──
+                await asyncio.sleep(3.0)  # Let the platform process the post
+                try:
+                    post_url = page.url
+
+                    # CRITICAL FIX: Handle /content_disclosure popup on X
+                    # This popup is NOT success — it's a blocker that needs dismissal
+                    if "content_disclosure" in post_url:
+                        logger.warning("⚠️ Content disclosure popup detected — attempting to dismiss")
+                        try:
+                            # Look for dismiss/continue/post buttons in the popup
+                            dismiss_btn = await page.query_selector(
+                                'button:has-text("Post"), button:has-text("Continue"), '
+                                'button:has-text("Got it"), button:has-text("Dismiss"), '
+                                '[data-testid="confirmationSheetConfirm"]'
+                            )
+                            if dismiss_btn:
+                                await dismiss_btn.click()
+                                logger.info("✅ Disclosure popup dismissed")
+                                await asyncio.sleep(3.0)
+                                post_url = page.url  # Re-check URL after dismissal
+                            else:
+                                logger.warning("No dismiss button found in disclosure popup")
+                        except Exception as disc_err:
+                            logger.warning("Disclosure dismissal failed: %s", disc_err)
+
+                    # Check if compose box cleared (post went through) or URL changed
+                    compose_empty = await asyncio.wait_for(page.evaluate("""
+                    () => {
+                        const href = window.location.href;
+                        // On X, the URL stays /compose/post but the box disappears
+                        if (href.includes('twitter.com') || href.includes('x.com')) {
+                            const box = document.querySelector('[data-testid="tweetTextarea_0"]');
+                            return !box || (box.textContent || '').trim().length < 5;
+                        }
+                        // On Reddit, successful post ALWAYS navigates away from /submit
+                        if (href.includes('reddit.com/submit') || href.includes('reddit.com/user/me/submit')) {
+                            return false;
+                        }
+                        // Generic fallback: check if we navigated away from a submit-like URL
+                        if (href.includes('/submit') || href.includes('/compose')) {
+                            return false;
+                        }
+                        return true;
+                    }
+                    """), timeout=3.0)
+
+                    # Only consider it a real success if we're NOT still on a blocker URL
+                    still_blocked = "content_disclosure" in page.url or "compose" in page.url
+                    real_success = compose_empty and not still_blocked
+
+                except Exception:
+                    real_success = False  # Don't assume success on errors
+                    still_blocked = False
+
+                if real_success:
+                    phase_tracker.mark("submit_verified")
+                    _record_phase_transition(memory, platform, objective, page.url, step, "submit_verified")
+                    completed_phases["mission_success"] = True
+
+                    # v10.0: Clean up content store after successful post
+                    if store.has_article:
+                        store.mark_posted()
+
+                    # ── SUCCESS BANNER ──
+                    total_phases = len(phase_tracker.phases)
+                    done_phases = sum(1 for v in phase_tracker.phases.values() if v)
+                    logger.info("")
+                    logger.info("━" * 60)
+                    logger.info("🎯  MISSION ACCOMPLISHED")
+                    logger.info("━" * 60)
+                    logger.info("  Platform:  %s", platform)
+                    logger.info("  URL:       %s", post_url)
+                    logger.info("  Steps:     %d", step + 1)
+                    logger.info("  Phases:    %d/%d (%d%%)", done_phases, total_phases, phase_tracker.progress_pct())
+                    logger.info("  Objective: %s", objective[:80])
+                    logger.info("━" * 60)
+                    logger.info("")
+                    break  # Exit the OTA loop — mission complete
+
+            # ── Progressive Perception: Track action dedup ──
+            current_action_signature = f"{decision.action_type}:{decision.text[:30] if decision.text else 'none'}"
             if current_action_signature == last_action_signature:
                 consecutive_identical_actions += 1
+                if consecutive_identical_actions >= 3:
+                    logger.warning(
+                        "🛑 STUCK DETECTED: '%s' repeated %d times — calling Recovery Advisor",
+                        decision.action_type, consecutive_identical_actions + 1,
+                    )
+                    # v9.0: Ask Recovery Advisor instead of just logging a warning
+                    advice = await _ask_recovery_advisor(
+                        objective, page.url, action_history,
+                        failover_chain, breaker, health_tracker,
+                    )
+                    phase_tracker.recovery_advice = advice
+                    consecutive_identical_actions = 0  # Reset after getting advice
             else:
                 consecutive_identical_actions = 0
-                if heavy_mode_active:
-                    logger.info("✅ Progress detected. Deactivating HEAVY MODE.")
-                    heavy_mode_active = False
+                phase_tracker.recovery_advice = ""  # Clear old advice on new action
 
             last_action_signature = current_action_signature
 
@@ -772,6 +1381,17 @@ async def run_agent(objective: str):
         logger.warning("KeyboardInterrupt caught — saving session before exit...")
 
     except Exception as e:
+        # ── Structured Crash Context ──
+        try:
+            crash_context = {
+                "step": step + 1,
+                "url": page.url if page and not page.is_closed() else "unknown",
+                "last_action": action_history[-1] if action_history else "none",
+                "breaker_status": breaker.status_line(),
+            }
+            logger.error("💥 CRASH CONTEXT: %s", json.dumps(crash_context))
+        except Exception:
+            pass
         logger.error("Unexpected crash: %s", e)
         logger.error(traceback.format_exc())
 
@@ -779,13 +1399,22 @@ async def run_agent(objective: str):
         # ════════════════════════════════════════════════════════════════════
         #  CLEAN SHUTDOWN — context.close() flushes all native state to disk
         # ════════════════════════════════════════════════════════════════════
-        logger.info("Shutting down...")
+        mission_success = completed_phases.get("mission_success", False)
+        if mission_success:
+            logger.info("✅ Agent shutting down after successful mission.")
+        else:
+            logger.info("⚠️  Agent shutting down (mission incomplete — ran out of steps or was interrupted).")
         try:
             await context.close()
             logger.info("Browser closed. Native profile state persisted.")
         except Exception as e:
             logger.warning("Browser close failed: %s", e)
         guard.detach()
+
+        if mission_success:
+            print("\n" + "═" * 60)
+            print("  ✅  MISSION COMPLETE — Post published successfully!")
+            print("═" * 60 + "\n")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

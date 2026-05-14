@@ -1,3 +1,12 @@
+"""Worker Planner — Vision + Reasoning agents for Agent First IDE v9.0.
+
+Both agents now pull their LLM clients from ModelRegistry (single source of truth).
+No more duplicated key-loading logic or missed API keys.
+
+Vision Agent  → uses ModelRegistry.get_vision_chain()  (Gemini×2 → NVIDIA×2)
+Reasoning Agent → uses ModelRegistry.get_text_chain()  (Groq×3 → NVIDIA×2)
+"""
+
 from __future__ import annotations
 
 import base64
@@ -10,349 +19,46 @@ from typing import Any
 from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel, ConfigDict, Field
 
-from app.call_pacing import AsyncGapLimiter
-from app import config
-from app.browser_promoter.state import BrowserAction, InteractiveRegion
-
+from app.browser_promoter.state import BrowserAction
 
 log = logging.getLogger("app.browser_promoter.worker_planner")
-_WORKER_LLM_GAP = AsyncGapLimiter(config.WORKER_LLM_MIN_GAP_SECONDS)
 
 
-class WorkerDecision(BaseModel):
-    """
-    Structured decision object returned by the small Worker VLM.
-
-    `action` must conform to BrowserAction when present.
-    """
+class ReasoningDecision(BaseModel):
+    """Structured output for the reasoning agent."""
 
     action: BrowserAction | None = None
     confidence: float = Field(default=0.0, ge=0.0, le=1.0)
     confused: bool = False
     confusion_reason: str = ""
     scene_summary: str = ""
+    reasoning: str = ""
 
     model_config = ConfigDict(extra="forbid")
 
 
-def _is_google_model_name(model_name: str) -> bool:
-    lowered = model_name.strip().lower()
-    return "gemini" in lowered or "gemma" in lowered
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Utility Functions (unchanged)
+# ═══════════════════════════════════════════════════════════════════════════════
 
+def _decode_screenshot_data_url(encoded: str, encoding: str) -> str:
+    """Normalize state screenshot encoding into a standard image data URL."""
+    try:
+        if encoding == "zlib+base64:jpeg":
+            compressed = base64.b64decode(encoded.encode("ascii"), validate=False)
+            raw_jpeg = zlib.decompress(compressed)
+            plain_base64 = base64.b64encode(raw_jpeg).decode("ascii")
+            return f"data:image/jpeg;base64,{plain_base64}"
 
-def _split_keys(env_var: str) -> list[str]:
-    """Extract multiple API keys from a comma/semicolon-delimited env var."""
-    raw = os.getenv(env_var, "")
-    if not raw.strip():
-        return []
-    return [k.strip() for k in raw.replace(";", ",").split(",") if k.strip()]
+        if encoding == "base64:jpeg":
+            return f"data:image/jpeg;base64,{encoded}"
 
+        if encoding == "base64:png":
+            return f"data:image/png;base64,{encoded}"
+    except Exception:
+        return ""
 
-def _build_worker_llms() -> tuple[list[Any], list[Any], list[Any], list[Any]]:
-    """Build worker LLM clients with multi-key support for every provider.
-
-    Returns: (primary_clients, secondary_clients, deepseek_clients, tertiary_clients)
-
-    Each provider supports multiple API keys via comma-separated env vars:
-      NVIDIA_NIM_API_KEY       → one or more NVIDIA keys
-      NVIDIA_NIM_API_KEYS      → additional NVIDIA keys (comma-separated)
-      OPENAI_API_KEY           → Groq/OpenAI keys (existing multi-key support)
-      DEEPSEEK_API_KEY         → one or more DeepSeek keys
-      DEEPSEEK_API_KEYS        → additional DeepSeek keys (comma-separated)
-      CEREBRAS_API_KEY         → one or more Cerebras keys
-      CEREBRAS_API_KEYS        → additional Cerebras keys (comma-separated)
-      GOOGLE_API_KEY           → Google keys (existing multi-key support)
-
-    When multiple keys exist for a provider, each key creates a separate
-    LLM client in the failover chain. This maximizes throughput because
-    rate limits are per-key, so N keys = N× the daily token quota.
-    """
-    primary_clients = []
-    secondary_clients = []
-    deepseek_clients = []
-    tertiary_clients = []
-
-    # ── FAKE AGENT HEADER FACTORY ──
-    # Spoof a modern browser to bypass Cloudflare Error 1010 on API endpoints
-    SPOOFED_HEADERS = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    }
-
-    # ── Primary: NVIDIA NIM (supports multi-key) ──
-    nvidia_keys = _split_keys("NVIDIA_NIM_API_KEYS")
-    single_nvidia = os.getenv("NVIDIA_NIM_API_KEY", "")
-    if single_nvidia and single_nvidia not in nvidia_keys:
-        nvidia_keys.insert(0, single_nvidia)
-
-    if nvidia_keys:
-        from langchain_openai import ChatOpenAI
-        base_url = os.getenv("NVIDIA_NIM_BASE_URL", "https://integrate.api.nvidia.com/v1")
-        model_name = os.getenv("NVIDIA_NIM_MODEL", "z-ai/glm-5.1")
-        for key in nvidia_keys:
-            primary_clients.append(
-                ChatOpenAI(
-                    model=model_name,
-                    api_key=key,
-                    base_url=base_url,
-                    temperature=0.0,
-                    timeout=12,
-                    default_headers=SPOOFED_HEADERS
-                )
-            )
-        log.info("NVIDIA NIM: %d key(s) loaded", len(nvidia_keys))
-
-    # ── Secondary: GROQ (Strict Mapping) ──
-    groq_keys = _split_keys("GROQ_API_KEYS")
-    single_groq = os.getenv("GROQ_API_KEY", "")
-    if single_groq and single_groq not in groq_keys:
-        groq_keys.insert(0, single_groq)
-
-    if groq_keys:
-        from langchain_openai import ChatOpenAI
-        base_url = "https://api.groq.com/openai/v1"
-        model_name = "openai/gpt-oss-120b"
-        for api_key in groq_keys:
-            secondary_clients.append(
-                ChatOpenAI(
-                    model=model_name,
-                    api_key=api_key,
-                    base_url=base_url,
-                    temperature=0.0,
-                    timeout=25,
-                    default_headers=SPOOFED_HEADERS
-                )
-            )
-        log.info("Groq: %d key(s) loaded", len(groq_keys))
-
-    # ── Tertiary: Cerebras (Strict Mapping) ──
-    cerebras_keys = _split_keys("CEREBRAS_API_KEYS")
-    single_cerebras = os.getenv("CEREBRAS_API_KEY", "")
-    if single_cerebras and single_cerebras not in cerebras_keys:
-        cerebras_keys.insert(0, single_cerebras)
-
-    if cerebras_keys:
-        # DISABLED: Diagnostic confirmed gpt-oss-120b returns 404 on Cerebras API.
-        # Re-enable when Cerebras fixes their model registry.
-        log.warning("Cerebras: SKIPPED (gpt-oss-120b returns 404 — model not available)")
-        # from langchain_openai import ChatOpenAI
-        # for key in cerebras_keys:
-        #     tertiary_clients.append(
-        #         ChatOpenAI(
-        #             model="gpt-oss-120b",
-        #             api_key=key,
-        #             base_url="https://api.cerebras.ai/v1",
-        #             temperature=0.0,
-        #             timeout=25,
-        #             default_headers=SPOOFED_HEADERS
-        #         )
-        #     )
-
-    # ── DeepSeek V4 Pro (supports multi-key) ──
-    deepseek_keys = _split_keys("DEEPSEEK_API_KEYS")
-    single_deepseek = os.getenv("DEEPSEEK_API_KEY", "")
-    if single_deepseek and single_deepseek not in deepseek_keys:
-        deepseek_keys.insert(0, single_deepseek)
-
-    if deepseek_keys:
-        from langchain_openai import ChatOpenAI
-        for key in deepseek_keys:
-            deepseek_clients.append(
-                ChatOpenAI(
-                    model="deepseek-v4-pro",
-                    api_key=key,
-                    base_url="https://api.deepseek.com/v1",
-                    temperature=0.0,
-                    timeout=30,
-                    default_headers=SPOOFED_HEADERS
-                )
-            )
-        log.info("DeepSeek: %d key(s) loaded", len(deepseek_keys))
-
-    # ── Tertiary: Google Gemma (already supports multi-key via config) ──
-    google_keys = config.GOOGLE_API_KEYS
-    if google_keys:
-        try:
-            from langchain_google_genai import ChatGoogleGenerativeAI
-            model_name = "gemma-4-31b-it"
-            for google_key in google_keys:
-                tertiary_clients.append(
-                    ChatGoogleGenerativeAI(
-                        model=model_name,
-                        google_api_key=google_key,
-                        temperature=0.0,
-                        timeout=30,
-                    )
-                )
-            log.info("Google Gemma: %d key(s) loaded", len(google_keys))
-        except Exception as exc:
-            log.error("Google client bootstrap failed: %s", exc)
-
-    total = len(primary_clients) + len(secondary_clients) + len(deepseek_clients) + len(tertiary_clients)
-    log.info("Total LLM clients built: %d (NVIDIA=%d, Groq/Cerebras=%d, DeepSeek=%d, Gemma=%d)",
-             total, len(primary_clients), len(secondary_clients),
-             len(deepseek_clients), len(tertiary_clients))
-
-    return primary_clients, secondary_clients, deepseek_clients, tertiary_clients
-
-
-
-class StrategyDecision(BaseModel):
-    strategy: str = Field(default="", description="The high-level strategy for the next step.")
-    vision_requested: bool = Field(default=False, description="Set to true if visual analysis is required to find an element.")
-
-class StrategicPlanner:
-    def __init__(self) -> None:
-        self._primary_clients, _, _, self._tertiary_clients = _build_worker_llms()
-        self.model_name = getattr(config, 'NVIDIA_NIM_MODEL', 'glm-5.1')
-
-    async def draft_strategy(
-        self,
-        high_level_command: str,
-        current_url: str,
-        interactive_regions: list[InteractiveRegion],
-        accessibility_tree: dict[str, Any],
-        action_history: list[dict[str, Any]] | None = None,
-        shared_reasoning_log: list[str] = None,
-        llm_config: dict[str, Any] = None,
-    ) -> StrategyDecision:
-        if not self._primary_clients and not self._secondary_clients:
-            return StrategyDecision(strategy="No models configured", vision_requested=False)
-            
-        compact_regions = [{"tag": r.tag, "text": r.text[:100], "selector": r.selector} for r in interactive_regions[:50]]
-        
-        system = (
-            "You are the Strategic Planner. Your job is to decide WHAT to do next based on the command and DOM state.\\n"
-            "Analyze the command, look at the DOM regions, and output a structured strategy.\\n"
-            "If the DOM regions do not contain the target element, or if you encounter a complex UI (like a captcha), set vision_requested to true."
-        )
-        user = f"Command: {high_level_command}\\nURL: {current_url}\\nDOM: {json.dumps(compact_regions)}\\nReasoning Log: {shared_reasoning_log}"
-        
-        messages = [SystemMessage(content=system), HumanMessage(content=user)]
-        
-        decision = None
-        # Try NVIDIA First
-        if self._primary_clients:
-            try:
-                llm = self._primary_clients[0]
-                if hasattr(llm, "with_structured_output"):
-                    structured_llm = llm.with_structured_output(StrategyDecision)
-                    decision = await structured_llm.ainvoke(messages, config=llm_config)
-            except Exception as e:
-                log.warning(f"Strategy NVIDIA error: {e}. Falling back to Backup Model (Gemma).")
-                
-        # Fallback to Gemma (Backup)
-        if decision is None and self._tertiary_clients:
-            try:
-                llm = self._tertiary_clients[0]
-                if hasattr(llm, "with_structured_output"):
-                    structured_llm = llm.with_structured_output(StrategyDecision)
-                    decision = await structured_llm.ainvoke(messages, config=llm_config)
-            except Exception as e:
-                log.error(f"Strategy Gemma Backup error: {e}")
-
-        if decision is None:
-            decision = StrategyDecision(strategy="Fallback strategy: attempt to find interactive elements.", vision_requested=False)
-            
-        if decision.vision_requested and shared_reasoning_log:
-            if any("[Gemma 4 Vision]" in log_entry for log_entry in shared_reasoning_log[-2:]):
-                decision.vision_requested = False
-                decision.strategy += " [Forcing tactical action to break loop.]"
-                
-        return decision
-
-class TacticalSelector:
-    def __init__(self) -> None:
-        _, self._secondary_clients, self._tertiary_clients = _build_worker_llms()
-
-    async def select_tactics(
-        self,
-        strategy: str,
-        interactive_regions: list[InteractiveRegion],
-        llm_config: dict[str, Any] = None,
-    ) -> WorkerDecision:
-        if not self._secondary_clients:
-            return WorkerDecision(confused=True, confusion_reason="No Groq model configured.")
-            
-        llm = self._secondary_clients[0]
-        
-        compact_regions = []
-        for idx, region in enumerate(interactive_regions[:80]):
-            compact_regions.append(
-                {
-                    "index": idx,
-                    "tag": region.tag,
-                    "role": region.role,
-                    "text": region.text[:100],
-                    "selector": region.selector[:140],
-                    "x": region.x,
-                    "y": region.y,
-                }
-            )
-            
-        system = (
-            "You are the Tactical Selector (Groq GPT-OSS-120B). Your job is to convert a Strategy into a precise JSON BrowserAction.\\n"
-            "Action must match the schema. Use exact selectors from the DOM whenever possible. Use raw x/y coordinates ONLY as a last resort."
-        )
-        user = f"Strategy: {strategy}\\nInteractive Regions: {json.dumps(compact_regions)}"
-        
-        messages = [SystemMessage(content=system), HumanMessage(content=user)]
-        
-        decision = None
-        if self._secondary_clients:
-            llm = self._secondary_clients[0]
-            if hasattr(llm, "with_structured_output"):
-                structured_llm = llm.with_structured_output(WorkerDecision)
-                try:
-                    decision = await structured_llm.ainvoke(messages, config=llm_config)
-                except Exception as e:
-                    log.error(f"Tactical Groq error: {e}. Falling back to Backup Model (Gemma).")
-                    
-        # Fallback to Gemma (Backup)
-        if decision is None and self._tertiary_clients:
-            try:
-                llm = self._tertiary_clients[0]
-                if hasattr(llm, "with_structured_output"):
-                    structured_llm = llm.with_structured_output(WorkerDecision)
-                    decision = await structured_llm.ainvoke(messages, config=llm_config)
-            except Exception as e:
-                log.error(f"Tactical Gemma Backup error: {e}")
-                
-        if decision is not None:
-            return decision
-
-        return WorkerDecision(confused=True, confusion_reason="Tactical parsing failed entirely.")
-
-class VisionTool:
-    def __init__(self) -> None:
-        _, _, self._tertiary_clients = _build_worker_llms()
-
-    async def analyze(
-        self,
-        screenshot_base64: str,
-        screenshot_encoding: str,
-        llm_config: dict[str, Any] = None,
-    ) -> str:
-        if not self._tertiary_clients:
-            return "Vision analysis unavailable. No Gemma configured."
-            
-        data_url = _decode_screenshot_data_url(screenshot_base64, screenshot_encoding)
-        if not data_url: return "Screenshot decode failed."
-        
-        llm = self._tertiary_clients[0]
-        system = "You are a visual analysis tool (Gemma 4). Describe the UI, login walls, popups, and layout briefly to help the text models."
-        
-        messages = [
-            SystemMessage(content=system),
-            HumanMessage(content=[{"type": "image_url", "image_url": {"url": data_url}}])
-        ]
-        
-        try:
-            res = await llm.ainvoke(messages, config=llm_config)
-            if hasattr(res, "content"):
-                return res.content
-            return str(res)
-        except Exception as e:
-            return f"Vision API error: {e}"
+    return ""
 
 
 def _extract_response_text(raw_response: Any) -> str:
@@ -395,72 +101,203 @@ def _extract_json_payload(text: str) -> dict[str, Any]:
         return json.loads(candidate[start : end + 1])
 
 
-def _decode_screenshot_data_url(encoded: str, encoding: str) -> str:
-    """Normalize state screenshot encoding into a standard image data URL."""
-    try:
-        if encoding == "zlib+base64:jpeg":
-            compressed = base64.b64decode(encoded.encode("ascii"), validate=False)
-            raw_jpeg = zlib.decompress(compressed)
-            plain_base64 = base64.b64encode(raw_jpeg).decode("ascii")
-            return f"data:image/jpeg;base64,{plain_base64}"
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Vision Agent — Uses ModelRegistry VISION chain exclusively
+# ═══════════════════════════════════════════════════════════════════════════════
 
-        if encoding == "base64:jpeg":
-            return f"data:image/jpeg;base64,{encoded}"
+class VisionAgent:
+    """Vision model: detect elements from screenshots and return strict JSON mapping.
 
-        if encoding == "base64:png":
-            return f"data:image/png;base64,{encoded}"
-    except Exception:
-        return ""
+    Pulls its LLM clients from ModelRegistry.get_vision_chain().
+    This ensures ALL vision API keys (Gemini + NVIDIA) are available.
+    """
 
-    return ""
+    def __init__(self) -> None:
+        from model_registry import ModelRegistry
+        registry = ModelRegistry.get_instance()
+        self._model_clients = registry.get_vision_chain()
+        self._llm_clients = [mc.client for mc in self._model_clients]
+        self._client_names = [mc.name for mc in self._model_clients]
+        self._cursor = 0
+        log.info(
+            "VisionAgent: %d vision models loaded — %s",
+            len(self._llm_clients),
+            " → ".join(self._client_names),
+        )
+
+    def _ordered_clients(self) -> list[tuple[int, Any]]:
+        if not self._llm_clients:
+            return []
+        total = len(self._llm_clients)
+        start = self._cursor % total
+        return [((start + offset) % total, self._llm_clients[(start + offset) % total]) for offset in range(total)]
+
+    async def detect_elements(
+        self,
+        *,
+        screenshot_base64: str,
+        screenshot_encoding: str,
+        llm_config: dict[str, Any] | None = None,
+    ) -> str:
+        if not screenshot_base64:
+            return "{}"
+
+        data_url = _decode_screenshot_data_url(screenshot_base64, screenshot_encoding)
+        if not data_url:
+            return "{}"
+
+        if not self._llm_clients:
+            log.warning("Vision agent unavailable: no vision models configured in ModelRegistry.")
+            return "{}"
+
+        system = (
+            "You are a vision-only detector. Return ONLY valid JSON. "
+            "Do not include reasoning, explanations, or markdown. "
+            "Detect all interactive elements, text labels, and buttons. "
+            "Output a JSON object with this schema:\n"
+            "{\"elements\":[{\"id\":\"e1\",\"kind\":\"button|input|link|text|other\",\"text\":\"...\",\"x\":123,\"y\":456}],"
+            "\"image_size\":{\"width\":1234,\"height\":567}}\n"
+            "Use screen pixel coordinates relative to the top-left of the screenshot."
+        )
+        user = (
+            "Return the JSON mapping now. Ensure every element has x and y coordinates."
+        )
+
+        messages = [
+            SystemMessage(content=system),
+            HumanMessage(content=[
+                {"type": "text", "text": user},
+                {"type": "image_url", "image_url": {"url": data_url}},
+            ]),
+        ]
+
+        for idx, llm in self._ordered_clients():
+            client_name = self._client_names[idx] if idx < len(self._client_names) else f"vision:{idx}"
+            try:
+                raw = await llm.ainvoke(messages, config=llm_config)
+                text = _extract_response_text(raw)
+                payload = _extract_json_payload(text)
+                if isinstance(payload, list):
+                    payload = {"elements": payload}
+                elif not isinstance(payload, dict):
+                    payload = {"elements": []}
+                
+                # Handle models that return "interactive_elements" instead of "elements"
+                if "interactive_elements" in payload and "elements" not in payload:
+                    payload["elements"] = payload["interactive_elements"]
+                    
+                payload.setdefault("elements", [])
+                self._cursor = idx
+                log.info("Vision map: %d elements detected (by %s)", len(payload["elements"]), client_name)
+                return json.dumps(payload, ensure_ascii=True)
+            except Exception as exc:
+                log.warning("Vision model failed (%s) [%d/%d]: %s", client_name, idx + 1, len(self._llm_clients), exc)
+
+        return "{}"
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Reasoning Agent — Uses ModelRegistry TEXT chain exclusively
+# ═══════════════════════════════════════════════════════════════════════════════
 
+class ReasoningAgent:
+    """Large reasoning model: choose action based on goal + vision JSON.
 
+    Pulls its LLM clients from ModelRegistry.get_text_chain().
+    This ensures ALL text API keys (Groq + NVIDIA + DeepSeek) are available.
+    """
 
-def _extract_accessibility_hints(tree: dict[str, Any], max_items: int) -> list[dict[str, str]]:
-    """Flatten important accessibility attributes into a bounded hint list."""
-    if not tree:
-        return []
+    def __init__(self) -> None:
+        from model_registry import ModelRegistry
+        registry = ModelRegistry.get_instance()
+        self._model_clients = registry.get_text_chain()
+        self._clients = [(mc.name, mc.client) for mc in self._model_clients]
+        self._cursor = 0
+        log.info(
+            "ReasoningAgent: %d text models loaded — %s",
+            len(self._clients),
+            " → ".join(mc.name for mc in self._model_clients),
+        )
 
-    hints: list[dict[str, str]] = []
-    stack: list[dict[str, Any]] = [tree]
+    def get_failover_chain(self) -> list[Any]:
+        return [client for _, client in self._clients]
 
-    while stack and len(hints) < max_items:
-        node = stack.pop()
-        role = str(node.get("role", "")).strip()
-        name = str(node.get("name", "")).strip()
-        value = str(node.get("value", "")).strip()
-        if role or name or value:
-            hints.append(
-                {
-                    "role": role[:40],
-                    "name": name[:120],
-                    "value": value[:80],
-                }
+    def get_chain_names(self) -> list[str]:
+        return [name for name, _ in self._clients]
+
+    def _ordered_clients(self) -> list[tuple[int, str, Any]]:
+        if not self._clients:
+            return []
+        total = len(self._clients)
+        start = self._cursor % total
+        ordered: list[tuple[int, str, Any]] = []
+        for offset in range(total):
+            idx = (start + offset) % total
+            name, client = self._clients[idx]
+            ordered.append((idx, name, client))
+        return ordered
+
+    async def decide_action(
+        self,
+        *,
+        high_level_command: str,
+        current_url: str,
+        vision_map_json: str,
+        action_history: list[str] | None = None,
+        llm_config: dict[str, Any] | None = None,
+    ) -> ReasoningDecision:
+        cleaned_command = high_level_command.strip()
+        if not cleaned_command:
+            return ReasoningDecision(
+                confused=True,
+                confidence=0.0,
+                confusion_reason="Missing high_level_command from supervisor.",
+                scene_summary="No command provided.",
             )
 
-        children = node.get("children") or []
-        for child in reversed(children):
-            if isinstance(child, dict):
-                stack.append(child)
+        if not self._clients:
+            return ReasoningDecision(
+                confused=True,
+                confidence=0.0,
+                confusion_reason="No reasoning model keys configured.",
+                scene_summary="Reasoning model unavailable.",
+            )
 
-    return hints
+        vision_payload = vision_map_json.strip() or "{}"
+        history = action_history or []
 
+        system = (
+            "You are the reasoning agent. Use ONLY the provided coordinate map to decide the next step. "
+            "Return STRICT JSON for ReasoningDecision with a BrowserAction. "
+            "Do not include extra text, markdown, or explanations outside the JSON. "
+            "When choosing click/type actions, you MUST include x and y from the map. "
+            "Allowed actions: goto, click, type, type_and_enter, scroll, wait, manual_intervention_required, screenshot. "
+            "If the target is not present, choose a safe scroll or wait action."
+        )
 
-def _looks_like_login_wall(scene_summary: str, confusion_reason: str, interactive_regions: list[InteractiveRegion]) -> bool:
-    """Detect login/captcha wall cues that require manual human intervention."""
-    haystack = f"{scene_summary} {confusion_reason}".lower()
-    
-    # Fast fail on known hard blocks
-    hard_blocks = ("captcha", "cloudflare", "hcaptcha", "human verification")
-    if any(kw in haystack for kw in hard_blocks):
-        return True
-        
-    # Verify true login intent by searching UI elements for password/OTP fields
-    for region in interactive_regions:
-        r_text = region.text.lower()
-        if "password" in r_text or "otp" in r_text or "verification code" in r_text:
-            return True
-            
-    return False
+        user_payload = {
+            "goal": cleaned_command,
+            "current_url": current_url,
+            "recent_actions": history[-6:],
+            "vision_map": vision_payload,
+        }
+
+        messages = [SystemMessage(content=system), HumanMessage(content=json.dumps(user_payload))]
+
+        for idx, name, llm in self._ordered_clients():
+            try:
+                structured = llm.with_structured_output(ReasoningDecision)
+                decision = await structured.ainvoke(messages, config=llm_config)
+                if not isinstance(decision, ReasoningDecision):
+                    decision = ReasoningDecision.model_validate(decision)
+                self._cursor = idx
+                return decision
+            except Exception as exc:
+                log.warning("Reasoning model failed (%s): %s", name, exc)
+
+        return ReasoningDecision(
+            confused=True,
+            confidence=0.0,
+            confusion_reason="All reasoning models failed.",
+            scene_summary="Reasoning model failure.",
+        )

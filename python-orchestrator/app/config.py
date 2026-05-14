@@ -61,6 +61,25 @@ GOOGLE_API_KEYS: list[str] = _merge_unique_keys(
     GEMINI_API_KEY_FALLBACKS,
 )
 
+# ─── Vision Model (Gemini / Gemma) ──────────────────────────────────────────
+VISION_GOOGLE_API_KEY: str = (
+    os.getenv("VISION_GOOGLE_API_KEY", "")
+    or os.getenv("VISION_GEMINI_API_KEY", "")
+    or os.getenv("VISION_API_KEY", "")
+)
+VISION_GOOGLE_API_KEY_FALLBACKS: list[str] = _split_env_list(
+    os.getenv("VISION_GOOGLE_API_KEY_FALLBACKS", "")
+)
+VISION_GEMINI_API_KEY_FALLBACKS: list[str] = _split_env_list(
+    os.getenv("VISION_GEMINI_API_KEY_FALLBACKS", "")
+)
+VISION_GOOGLE_API_KEYS: list[str] = _merge_unique_keys(
+    VISION_GOOGLE_API_KEY,
+    VISION_GOOGLE_API_KEY_FALLBACKS,
+    VISION_GEMINI_API_KEY_FALLBACKS,
+)
+VISION_MODEL: str = os.getenv("VISION_MODEL", "gemma-4-32b-it")
+
 # ─── Worker Vision-Language Model ─────────────────────────────────────────────
 WORKER_VLM_API_KEY: str = os.getenv("WORKER_VLM_API_KEY", "") or OPENAI_API_KEY
 WORKER_VLM_API_KEY_FALLBACKS: list[str] = _split_env_list(os.getenv("WORKER_VLM_API_KEY_FALLBACKS", ""))
