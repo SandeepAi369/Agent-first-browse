@@ -14,9 +14,9 @@ from app.browser_promoter.dashboard import (
     resolve_platform_name,
 )
 from app.observability import build_llm_config
-from app.browser_promoter.state import AgentState, BrowserAction, InteractiveRegion, ScreenshotFrame, WorkerFeedback
+from app.browser_promoter.state import AgentState, BrowserAction, ScreenshotFrame, WorkerFeedback
 from app.browser_promoter.supervisor_subgraph import run_supervisor_subgraph
-from app.browser_promoter.worker_planner import StrategicPlanner, TacticalSelector, VisionTool
+from app.browser_promoter.worker_planner import ReasoningAgent, VisionAgent
 from app.browser_promoter.zero_token_executor import (
     ActionExecutionError,
     ActionExecutionResult,
@@ -27,9 +27,8 @@ from app.logger import get_logger
 logger = get_logger(__name__)
 
 
-_STRATEGIC_PLANNER: StrategicPlanner | None = None
-_TACTICAL_SELECTOR: TacticalSelector | None = None
-_VISION_TOOL: VisionTool | None = None
+_VISION_AGENT: VisionAgent | None = None
+_REASONING_AGENT: ReasoningAgent | None = None
 _ZERO_TOKEN_EXECUTOR: ZeroTokenActionExecutor | None = None
 
 
@@ -40,102 +39,102 @@ async def supervisor_node(state: AgentState) -> dict[str, Any]:
     return {"high_level_command": command}
 
 
-def _get_strategic_planner() -> StrategicPlanner:
-    global _STRATEGIC_PLANNER
-    if _STRATEGIC_PLANNER is None:
-        _STRATEGIC_PLANNER = StrategicPlanner()
-    return _STRATEGIC_PLANNER
-
-def _get_tactical_selector() -> TacticalSelector:
-    global _TACTICAL_SELECTOR
-    if _TACTICAL_SELECTOR is None:
-        _TACTICAL_SELECTOR = TacticalSelector()
-    return _TACTICAL_SELECTOR
-
-def _get_vision_tool() -> VisionTool:
-    global _VISION_TOOL
-    if _VISION_TOOL is None:
-        _VISION_TOOL = VisionTool()
-    return _VISION_TOOL
+def _get_vision_agent() -> VisionAgent:
+    global _VISION_AGENT
+    if _VISION_AGENT is None:
+        _VISION_AGENT = VisionAgent()
+    return _VISION_AGENT
 
 
-async def strategic_planner_node(state: AgentState) -> dict[str, Any]:
-    """Tier 1: NVIDIA GLM 5.1 analyzes context and drafts a strategy or requests vision."""
-    logger.info("Strategic Planner (NVIDIA GLM) drafting strategy")
-    planner = _get_strategic_planner()
-    high_level_command = _resolve_high_level_command(state)
-    
+def _get_reasoning_agent() -> ReasoningAgent:
+    global _REASONING_AGENT
+    if _REASONING_AGENT is None:
+        _REASONING_AGENT = ReasoningAgent()
+    return _REASONING_AGENT
+
+
+async def vision_agent_node(state: AgentState) -> dict[str, Any]:
+    """Step 1: Vision agent returns strict JSON mapping of screen coordinates."""
+    if not state.current_screenshot_base64:
+        return {}
+
+    logger.info("Vision Agent mapping interactive elements")
+    vision_agent = _get_vision_agent()
+
     llm_config = build_llm_config(
-        run_name="swarm.strategic_planner",
-        tags=["strategic_planner", "nvidia"],
+        run_name="swarm.vision_agent",
+        tags=["vision_agent"],
         metadata={"thread_id": state.thread_id},
     )
 
-    decision = await planner.draft_strategy(
-        high_level_command=high_level_command,
-        current_url=state.current_url,
-        interactive_regions=state.current_interactive_regions,
-        accessibility_tree=state.current_accessibility_tree,
-        action_history=list(state.action_history),
-        shared_reasoning_log=list(state.shared_reasoning_log),
+    vision_map_json = await vision_agent.detect_elements(
+        screenshot_base64=state.current_screenshot_base64,
+        screenshot_encoding=state.current_screenshot_encoding,
         llm_config=llm_config,
     )
 
-    log_entry = f"[NVIDIA GLM 5.1] Strategy Draft: {decision.strategy}"
-    updated_log = list(state.shared_reasoning_log)
-    updated_log.append(log_entry)
-
     updated_routing = state.routing.model_copy(
         update={
-            "vision_requested": decision.vision_requested,
-            "next_hop": "tactical_selector",
+            "next_hop": "reasoning_agent",
         }
     )
 
     return {
-        "shared_reasoning_log": updated_log,
+        "current_vision_map_json": vision_map_json,
+        "vision_calls": state.vision_calls + 1,
         "routing": updated_routing,
-        "ephemeral": {"current_strategy": decision.strategy},
     }
 
-async def tactical_selector_node(state: AgentState) -> dict[str, Any]:
-    """Tier 2: Groq GPT-OSS-120B converts the strategy into exact JSON BrowserAction."""
-    if state.routing.vision_requested:
-        # If vision is requested, skip tactics and route to vision tool
-        return {}
 
-    logger.info("Tactical Selector (Groq 120B) parsing action from strategy")
-    selector = _get_tactical_selector()
-    current_strategy = state.ephemeral.get("current_strategy", "Proceed with general search.")
-    
+async def reasoning_agent_node(state: AgentState) -> dict[str, Any]:
+    """Step 2: Reasoning agent decides the next BrowserAction from vision JSON."""
+    logger.info("Reasoning Agent selecting action from vision map")
+    reasoning_agent = _get_reasoning_agent()
+    high_level_command = _resolve_high_level_command(state)
+
     llm_config = build_llm_config(
-        run_name="swarm.tactical_selector",
-        tags=["tactical_selector", "groq"],
+        run_name="swarm.reasoning_agent",
+        tags=["reasoning_agent"],
         metadata={"thread_id": state.thread_id},
     )
 
-    decision = await selector.select_tactics(
-        strategy=current_strategy,
-        interactive_regions=state.current_interactive_regions,
+    decision = await reasoning_agent.decide_action(
+        high_level_command=high_level_command,
+        current_url=state.current_url,
+        vision_map_json=state.current_vision_map_json,
+        action_history=list(state.action_history),
         llm_config=llm_config,
     )
-    
-    summary = decision.scene_summary.strip() or f"Tactical selection made."
+
+    if decision.action and decision.action.action in {"click", "type", "type_and_enter"}:
+        if decision.action.x is None or decision.action.y is None:
+            decision = decision.model_copy(
+                update={
+                    "confused": True,
+                    "confusion_reason": "Missing coordinates for targeted action.",
+                }
+            )
+
+    summary = decision.scene_summary.strip() or "Reasoning action selected."
     worker_feedback = list(state.worker_feedback)
     worker_action_queue = list(state.worker_action_queue)
+
+    reasoning_log = list(state.shared_reasoning_log)
+    if decision.reasoning:
+        reasoning_log.append(f"[Reasoning] {decision.reasoning}")
 
     if decision.confused or decision.action is None:
         feedback = WorkerFeedback(
             command_id=_resolve_command_id(state),
             status="failed",
-            message="Tactical Selector could not map strategy to DOM element.",
+            message="Reasoning agent could not produce a valid action.",
             details={"confusion_reason": decision.confusion_reason},
         )
         worker_feedback = [*worker_feedback, feedback][-state.feedback_window_size :]
 
         updated_routing = state.routing.model_copy(
             update={
-                "next_hop": "stuck_evaluator",
+                "next_hop": "router",
                 "requires_browser_action": False,
                 "requires_supervisor_review": True,
             }
@@ -145,16 +144,16 @@ async def tactical_selector_node(state: AgentState) -> dict[str, Any]:
             "worker_feedback": worker_feedback,
             "worker_last_confidence": decision.confidence,
             "worker_last_confused": True,
-            "worker_last_confusion_reason": decision.confusion_reason or "Tactical model was uncertain.",
+            "worker_last_confusion_reason": decision.confusion_reason or "Reasoning model was uncertain.",
             "current_scene_summary": summary,
+            "shared_reasoning_log": reasoning_log,
             "routing": updated_routing,
-            **_garbage_collect_visual_state(state, summary),
         }
 
     feedback = WorkerFeedback(
         command_id=decision.action.action_id,
         status="completed",
-        message="Tactical action mapped successfully.",
+        message="Reasoning action mapped successfully.",
         details={"action": decision.action.model_dump(mode="json")},
     )
     worker_feedback = [*worker_feedback, feedback][-state.feedback_window_size :]
@@ -175,41 +174,9 @@ async def tactical_selector_node(state: AgentState) -> dict[str, Any]:
         "worker_last_confused": False,
         "worker_last_confusion_reason": "",
         "current_scene_summary": summary,
+        "shared_reasoning_log": reasoning_log,
         "routing": updated_routing,
         **_garbage_collect_visual_state(state, summary),
-    }
-
-async def vision_tool_node(state: AgentState) -> dict[str, Any]:
-    """Tier 3: Google Gemma 4 performs visual analysis when requested by text models."""
-    logger.info("Vision Tool (Gemma 4) analyzing screenshot")
-    vision_tool = _get_vision_tool()
-    
-    llm_config = build_llm_config(
-        run_name="swarm.vision_tool",
-        tags=["vision_tool", "gemma"],
-        metadata={"thread_id": state.thread_id},
-    )
-
-    analysis = await vision_tool.analyze(
-        screenshot_base64=state.current_screenshot_base64,
-        screenshot_encoding=state.current_screenshot_encoding,
-        llm_config=llm_config,
-    )
-
-    log_entry = f"[Gemma 4 Vision] Screen Analysis: {analysis}"
-    updated_log = list(state.shared_reasoning_log)
-    updated_log.append(log_entry)
-
-    # Turn off vision_requested so the loop goes back to strategic planner naturally
-    updated_routing = state.routing.model_copy(
-        update={
-            "vision_requested": False,
-        }
-    )
-
-    return {
-        "shared_reasoning_log": updated_log,
-        "routing": updated_routing,
     }
 
 def stuck_evaluator_node(state: AgentState) -> dict[str, Any]:
@@ -294,26 +261,11 @@ _LOGIN_URL_SIGNALS = (
     "dev.to/enter",
 )
 
-# DOM text signals indicating a login/auth form
-_LOGIN_DOM_SIGNALS = (
-    "password",
-    "sign in",
-    "log in",
-    "create account",
-    "captcha",
-    "verification code",
-    "two-factor",
-    "2fa",
-    "mfa",
-)
-
-
 def auth_check_node(state: AgentState) -> dict[str, Any]:
     """Detect login walls and pause execution for human authentication.
 
     Checks two signals:
       1. URL pattern: If the current URL matches known auth endpoints.
-      2. DOM analysis: If interactive regions contain password/login fields.
 
     When a login wall is detected, prints a prominent terminal message and
     blocks on `input()` so the human can log in manually in the open
@@ -324,14 +276,6 @@ def auth_check_node(state: AgentState) -> dict[str, Any]:
 
     url = state.current_url.lower()
     needs_login = any(sig in url for sig in _LOGIN_URL_SIGNALS)
-
-    # Secondary check: scan DOM interactive regions for auth-related fields
-    if not needs_login:
-        for region in state.current_interactive_regions:
-            combined = f"{region.text} {region.role} {region.tag}".lower()
-            if any(kw in combined for kw in _LOGIN_DOM_SIGNALS):
-                needs_login = True
-                break
 
     if not needs_login:
         return {}
@@ -483,13 +427,6 @@ def _has_pending_manual_intervention_action(state: AgentState) -> bool:
     return state.worker_action_queue[0].action == "manual_intervention_required"
 
 
-def _get_worker_planner() -> WorkerVisionPlanner:
-    global _WORKER_PLANNER
-    if _WORKER_PLANNER is None:
-        _WORKER_PLANNER = WorkerVisionPlanner()
-    return _WORKER_PLANNER
-
-
 def _get_zero_token_executor() -> ZeroTokenActionExecutor:
     global _ZERO_TOKEN_EXECUTOR
     if _ZERO_TOKEN_EXECUTOR is None:
@@ -547,8 +484,6 @@ def _garbage_collect_visual_state(state: AgentState, scene_summary: str) -> dict
                     "screenshot_encoding": "purged",
                     "compressed_bytes": 0,
                     "original_bytes": 0,
-                    "accessibility_tree": {},
-                    "interactive_regions": [],
                     "scene_summary": frame.scene_summary or scene_summary,
                 }
             )
@@ -558,8 +493,6 @@ def _garbage_collect_visual_state(state: AgentState, scene_summary: str) -> dict
         "screenshot_history": compact_history,
         "current_screenshot_base64": "",
         "current_screenshot_encoding": "purged",
-        "current_accessibility_tree": {},
-        "current_interactive_regions": [],
     }
 
 
@@ -567,118 +500,9 @@ def _garbage_collect_visual_state(state: AgentState, scene_summary: str) -> dict
 # as resolve_platform_name and used across the codebase.
 
 
-def _trim_accessibility_tree(tree: dict[str, Any] | None, max_nodes: int = 250) -> dict[str, Any]:
-    """Trim accessibility payload to keep memory bounded in long-running loops."""
-    if not tree:
-        return {}
-
-    seen = 0
-
-    def walk(node: dict[str, Any]) -> dict[str, Any] | None:
-        nonlocal seen
-        if seen >= max_nodes:
-            return None
-
-        seen += 1
-        compact: dict[str, Any] = {}
-        for key in (
-            "role",
-            "name",
-            "value",
-            "description",
-            "checked",
-            "selected",
-            "expanded",
-            "disabled",
-            "focused",
-        ):
-            value = node.get(key)
-            if value not in (None, "", False):
-                compact[key] = value
-
-        children = node.get("children") or []
-        compact_children: list[dict[str, Any]] = []
-        for child in children:
-            if seen >= max_nodes:
-                break
-            child_result = walk(child)
-            if child_result is not None:
-                compact_children.append(child_result)
-        if compact_children:
-            compact["children"] = compact_children
-
-        return compact
-
-    return walk(tree) or {}
-
-
-async def _extract_interactive_regions(page: Page, max_regions: int = 120) -> list[InteractiveRegion]:
-    """Collect bounding boxes for clickable/focusable elements."""
-    raw_regions = await page.evaluate(
-        """
-(limit) => {
-  const isVisible = (el) => {
-    const rect = el.getBoundingClientRect();
-    const style = window.getComputedStyle(el);
-    return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
-  };
-
-  const getSimpleSelector = (el) => {
-    if (el.id) return `#${el.id}`;
-    const testId = el.getAttribute('data-testid');
-    if (testId) return `[data-testid="${testId}"]`;
-    const name = el.getAttribute('name');
-    if (name) return `${el.tagName.toLowerCase()}[name="${name}"]`;
-
-    let index = 1;
-    let sibling = el;
-    while ((sibling = sibling.previousElementSibling) != null) {
-      if (sibling.tagName === el.tagName) index += 1;
-    }
-    return `${el.tagName.toLowerCase()}:nth-of-type(${index})`;
-  };
-
-  const candidates = document.querySelectorAll(
-    'a, button, input, textarea, select, [role="button"], [role="link"], [tabindex]'
-  );
-
-  const output = [];
-  for (const el of candidates) {
-    if (!isVisible(el)) continue;
-
-    const rect = el.getBoundingClientRect();
-    output.push({
-      tag: el.tagName.toLowerCase(),
-      role: (el.getAttribute('role') || '').slice(0, 40),
-      text: ((el.innerText || el.value || el.getAttribute('aria-label') || '').trim()).slice(0, 140),
-      selector: getSimpleSelector(el).slice(0, 180),
-      x: Math.round(rect.left + window.scrollX),
-      y: Math.round(rect.top + window.scrollY),
-      width: Math.round(rect.width),
-      height: Math.round(rect.height)
-    });
-
-    if (output.length >= limit) break;
-  }
-
-  return output;
-}
-""",
-        max_regions,
-    )
-
-    regions: list[InteractiveRegion] = []
-    for item in raw_regions:
-        try:
-            regions.append(InteractiveRegion.model_validate(item))
-        except Exception:
-            continue
-    return regions
-
-
 async def _capture_snapshot(page: Page) -> ScreenshotFrame:
     """
-    Capture compressed screenshot and rich UI metadata.
+    Capture a compressed screenshot for the vision agent.
 
     The screenshot is JPEG-compressed first, then zlib-compressed before base64
     encoding so state transport remains compact.
@@ -697,20 +521,6 @@ async def _capture_snapshot(page: Page) -> ScreenshotFrame:
     compressed_bytes = zlib.compress(screenshot_bytes, level=6)
     encoded_image = base64.b64encode(compressed_bytes).decode("ascii")
 
-    # These can fail if a navigation just happened — catch and return empty
-    trimmed_tree: dict[str, Any] = {}
-    interactive_regions: list[InteractiveRegion] = []
-    try:
-        try:
-            raw_tree = await getattr(page, "accessibility").snapshot(interesting_only=False)
-        except AttributeError:
-            raw_tree = {}
-        trimmed_tree = _trim_accessibility_tree(raw_tree, max_nodes=250)
-        interactive_regions = await _extract_interactive_regions(page, max_regions=120)
-    except Exception:
-        # Navigation destroyed the execution context — return what we have
-        pass
-
     return ScreenshotFrame(
         captured_at=datetime.now(UTC),
         url=page.url,
@@ -718,8 +528,6 @@ async def _capture_snapshot(page: Page) -> ScreenshotFrame:
         screenshot_encoding="zlib+base64:jpeg",
         original_bytes=len(screenshot_bytes),
         compressed_bytes=len(compressed_bytes),
-        accessibility_tree=trimmed_tree,
-        interactive_regions=interactive_regions,
     )
 
 
@@ -773,26 +581,7 @@ def _is_destructive_action(action: BrowserAction) -> bool:
 
 
 async def _preview_action_target(page: Page, action: BrowserAction) -> None:
-    """Highlight intended target in dry-run mode instead of executing destructive action."""
-    if action.selector:
-        await page.evaluate(
-            """
-(selector) => {
-  const element = document.querySelector(selector);
-  if (!element) return false;
-
-  element.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
-  const previous = element.style.outline;
-  element.style.outline = '3px solid #ff9800';
-  setTimeout(() => { element.style.outline = previous; }, 1600);
-  return true;
-}
-""",
-            action.selector,
-        )
-        await page.wait_for_timeout(400)
-        return
-
+    """Highlight intended target in dry-run mode using coordinates only."""
     if action.x is not None and action.y is not None:
         await page.evaluate(
             """
@@ -821,8 +610,7 @@ async def browser_controller_node(state: AgentState) -> dict[str, Any]:
     """
     Execute queued worker browser actions on a persistent stealth Playwright page.
 
-    This node updates compressed screenshot payload, accessibility metadata,
-    and interactive bounding boxes each cycle.
+    This node updates compressed screenshot payload each cycle.
     """
     pending_actions = list(state.worker_action_queue)
     screenshot_history = list(state.screenshot_history)
@@ -890,8 +678,7 @@ async def browser_controller_node(state: AgentState) -> dict[str, Any]:
             "current_url": snapshot.url,
             "current_screenshot_base64": snapshot.screenshot_base64,
             "current_screenshot_encoding": snapshot.screenshot_encoding,
-            "current_accessibility_tree": snapshot.accessibility_tree,
-            "current_interactive_regions": snapshot.interactive_regions,
+            "current_vision_map_json": "",
             "routing": updated_routing,
         }
 
@@ -950,8 +737,7 @@ async def browser_controller_node(state: AgentState) -> dict[str, Any]:
         "current_url": snapshot.url,
         "current_screenshot_base64": snapshot.screenshot_base64,
         "current_screenshot_encoding": snapshot.screenshot_encoding,
-        "current_accessibility_tree": snapshot.accessibility_tree,
-        "current_interactive_regions": snapshot.interactive_regions,
+        "current_vision_map_json": "",
         "vision_calls": state.vision_calls + vision_calls_used,
         "routing": updated_routing,
     }

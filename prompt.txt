@@ -1,26 +1,12 @@
-MISSION: Post the COMPLETE SearchWala article on Medium.com (Fixing previous hallucination).
+MISSION: Go to reddit.com/r/test and post the following paragraph.
 
 STEP-BY-STEP EXECUTION PLAN:
-1. Navigate directly to https://medium.com/new-story.
-2. If the page is empty or shows a 'Sign in' prompt, use "Continue with Google" to log in (leverage the 94+ saved cookies).
-3. TRIPLE-CHECK THE TITLE: Click the 'Title' placeholder and type exactly: 
-   SearchWala: I Built a Blazing-Fast Meta-Search Engine in Rust That Queries 90+ Engines Simultaneously
-4. TRIPLE-CHECK THE BODY: Click the main content area (below the title). Do NOT just type 'hello'. You must paste the ENTIRE Markdown article content provided below:
+1. Navigate directly to https://www.reddit.com/r/test/submit.
+2. If the page is empty or shows a 'Sign in' prompt, log in if needed.
+3. Click the 'Title' field and type: Resilient Web Agents
+4. Click the 'Body' or 'Text' field and type exactly the following paragraph:
 
---- ARTICLE START ---
-Hey devs! I want to share a project I have been working on called SearchWala.
+Building resilient web agents requires a delicate balance between visual intelligence and raw speed. By moving away from slow, error-prone vision models and leveraging compressed semantic markup with hardened CDP stealth, developers can achieve unprecedented reliability. The future belongs to lightweight, deterministic orchestration loops that navigate the chaos seamlessly.
 
-SearchWala is an open-source meta-search engine written in Rust that queries 90+ search engines simultaneously (Google, Bing, DuckDuckGo, etc). It aggregates results, ranks them with BM25, and provides AI-powered answers.
-
-Key Features:
-- 90+ Search Engines Integrated
-- Dual LLM Pipeline (Fast vs Research mode)
-- Built in Rust (Async Tokio runtime)
-- Privacy First & Docker Ready (15MB image)
-
-Try it on GitHub: https://github.com/SandeepAi369/SearchWala
---- ARTICLE END ---
-
-5. VERIFICATION: Before clicking publish, verify that the body text contains more than 100 words. If it only contains "hello" or short text, RE-TYPE it.
-6. Click 'Publish' at the top right, then click 'Publish now' in the confirmation sidebar.
-7. Once the story is live, output done.
+5. Click the 'Post' button.
+6. Once the post is live, output done.
