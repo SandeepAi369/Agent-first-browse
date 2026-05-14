@@ -13,7 +13,7 @@ sys.path.append(str(Path(__file__).parent / "python-orchestrator"))
 from playwright.async_api import async_playwright
 from app.browser_promoter.cdp_stealth_launcher import (
     STEALTH_INIT_SCRIPT, STEALTH_LAUNCH_ARGS, STEALTH_USER_AGENT,
-    apply_page_stealth, get_random_viewport,
+    apply_page_stealth, get_random_viewport, VISUAL_CURSOR_INIT_SCRIPT,
 )
 from app.browser_promoter.browser_warmup import run_warmup
 from app.logger import get_logger
@@ -87,6 +87,7 @@ async def main():
         ignore_default_args=["--enable-automation"],
     )
     await context.add_init_script(STEALTH_INIT_SCRIPT)
+    await context.add_init_script(VISUAL_CURSOR_INIT_SCRIPT)
     
     page = context.pages[0] if context.pages else await context.new_page()
     await apply_page_stealth(page)

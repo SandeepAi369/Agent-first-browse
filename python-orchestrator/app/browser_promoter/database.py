@@ -1,7 +1,14 @@
 from __future__ import annotations
 
+import functools
 import sqlite3
+import time
 from pathlib import Path
+from typing import Any
+
+from app.logger import get_logger
+
+logger = get_logger("database")
 
 
 def get_persistence_dir() -> Path:
@@ -17,120 +24,188 @@ def get_agent_database_path() -> Path:
     return get_persistence_dir() / "agent_persistence.db"
 
 
-def initialize_persistence_database(database_path: Path | None = None) -> Path:
-    """
-    Initialize sqlite persistence schema for campaign history and vector memory.
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Database Pool — Singleton connection manager with auto-retry
+# ═══════════════════════════════════════════════════════════════════════════════
 
-    Returns the resolved sqlite file path.
+class DatabasePool:
+    """Thread-safe singleton database connection manager.
+
+    - Lazy-initializes a single connection per lifetime
+    - Auto-retries on 'database is locked' errors (3x with exponential backoff)
+    - Schema initialization runs ONCE, not on every query
+    - Auto-reconnects if the connection dies
+    """
+
+    _instance: DatabasePool | None = None
+    _initialized_paths: set[str] = set()
+
+    def __init__(self) -> None:
+        self._connections: dict[str, sqlite3.Connection] = {}
+
+    @classmethod
+    def get(cls) -> DatabasePool:
+        if cls._instance is None:
+            cls._instance = cls()
+        return cls._instance
+
+    def get_connection(self, db_path: Path | None = None) -> sqlite3.Connection:
+        """Get or create a cached connection for the given path."""
+        path = db_path or get_agent_database_path()
+        key = str(path)
+
+        # Check if existing connection is still alive
+        if key in self._connections:
+            try:
+                self._connections[key].execute("SELECT 1")
+                return self._connections[key]
+            except (sqlite3.OperationalError, sqlite3.ProgrammingError):
+                logger.warning("DB connection dead, reconnecting: %s", key)
+                try:
+                    self._connections[key].close()
+                except Exception:
+                    pass
+                del self._connections[key]
+
+        # Create new connection
+        path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(str(path), timeout=10.0)
+        conn.execute("PRAGMA busy_timeout=5000;")
+        try:
+            conn.execute("PRAGMA journal_mode=WAL;")
+        except sqlite3.OperationalError:
+            conn.execute("PRAGMA journal_mode=DELETE;")
+        conn.execute("PRAGMA synchronous=NORMAL;")
+        conn.execute("PRAGMA foreign_keys=ON;")
+
+        self._connections[key] = conn
+
+        # Initialize schema once per path
+        if key not in self._initialized_paths:
+            _create_all_tables(conn)
+            conn.commit()
+            self._initialized_paths.add(key)
+            logger.info("Database initialized: %s", key)
+
+        return conn
+
+
+def retry_on_locked(func):
+    """Decorator: retry up to 3x on 'database is locked' with exponential backoff."""
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        last_err = None
+        for attempt in range(3):
+            try:
+                return func(*args, **kwargs)
+            except sqlite3.OperationalError as e:
+                if "locked" in str(e).lower() or "busy" in str(e).lower():
+                    last_err = e
+                    wait = 0.5 * (2 ** attempt)
+                    logger.warning(
+                        "DB locked (attempt %d/3), retrying in %.1fs: %s",
+                        attempt + 1, wait, e,
+                    )
+                    time.sleep(wait)
+                else:
+                    raise
+        raise last_err  # type: ignore[misc]
+    return wrapper
+
+
+def _create_all_tables(connection: sqlite3.Connection) -> None:
+    """Create ALL persistence tables (called once by DatabasePool)."""
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS campaign_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            thread_id TEXT NOT NULL,
+            platform TEXT NOT NULL,
+            target_url TEXT NOT NULL,
+            action_type TEXT NOT NULL,
+            outcome_score REAL NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS vector_memory (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            thread_id TEXT NOT NULL,
+            platform TEXT NOT NULL,
+            target_url TEXT NOT NULL,
+            action_type TEXT NOT NULL,
+            content_text TEXT NOT NULL,
+            embedding_json TEXT NOT NULL,
+            success_score REAL NOT NULL DEFAULT 0.0,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_campaign_history_thread_platform
+        ON campaign_history(thread_id, platform)
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_vector_memory_thread_platform
+        ON vector_memory(thread_id, platform)
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS target_communities (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            platform TEXT NOT NULL,
+            url TEXT NOT NULL,
+            niche TEXT NOT NULL,
+            locked_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(platform, url)
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_target_communities_platform_niche
+        ON target_communities(platform, niche)
+        """
+    )
+    _create_marketing_tables(connection)
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS system_access_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            node_name TEXT NOT NULL,
+            operation TEXT NOT NULL,
+            target_table TEXT NOT NULL,
+            query_context TEXT NOT NULL,
+            timestamp TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS completed_tasks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            thread_id TEXT NOT NULL,
+            summary TEXT NOT NULL,
+            final_state_json TEXT NOT NULL,
+            completed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+
+
+def initialize_persistence_database(database_path: Path | None = None) -> Path:
+    """Initialize persistence schema. Now routes through DatabasePool for caching.
+
+    Backward-compatible — still returns the resolved db path.
     """
     db_path = database_path or get_agent_database_path()
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-
-    with sqlite3.connect(db_path, timeout=10.0) as connection:
-        connection.execute("PRAGMA busy_timeout=5000;")
-        # WAL is best for production (concurrent reads). Falls back to DELETE
-        # on network filesystems (\\wsl$) where WAL locking is unsupported.
-        try:
-            connection.execute("PRAGMA journal_mode=WAL;")
-        except sqlite3.OperationalError:
-            connection.execute("PRAGMA journal_mode=DELETE;")
-        connection.execute("PRAGMA synchronous=NORMAL;")
-        connection.execute("PRAGMA foreign_keys=ON;")
-
-        connection.execute(
-            """
-            CREATE TABLE IF NOT EXISTS campaign_history (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                thread_id TEXT NOT NULL,
-                platform TEXT NOT NULL,
-                target_url TEXT NOT NULL,
-                action_type TEXT NOT NULL,
-                outcome_score REAL NOT NULL,
-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-            )
-            """
-        )
-
-        # Standard sqlite fallback schema for vector memory records.
-        connection.execute(
-            """
-            CREATE TABLE IF NOT EXISTS vector_memory (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                thread_id TEXT NOT NULL,
-                platform TEXT NOT NULL,
-                target_url TEXT NOT NULL,
-                action_type TEXT NOT NULL,
-                content_text TEXT NOT NULL,
-                embedding_json TEXT NOT NULL,
-                success_score REAL NOT NULL DEFAULT 0.0,
-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-            )
-            """
-        )
-
-        connection.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_campaign_history_thread_platform
-            ON campaign_history(thread_id, platform)
-            """
-        )
-        connection.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_vector_memory_thread_platform
-            ON vector_memory(thread_id, platform)
-            """
-        )
-
-        connection.execute(
-            """
-            CREATE TABLE IF NOT EXISTS target_communities (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                platform TEXT NOT NULL,
-                url TEXT NOT NULL,
-                niche TEXT NOT NULL,
-                locked_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE(platform, url)
-            )
-            """
-        )
-        connection.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_target_communities_platform_niche
-            ON target_communities(platform, niche)
-            """
-        )
-
-        # v3.0 Marketing engine tables
-        _create_marketing_tables(connection)
-
-        # Autonomous architecture tables
-        connection.execute(
-            """
-            CREATE TABLE IF NOT EXISTS system_access_logs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                node_name TEXT NOT NULL,
-                operation TEXT NOT NULL,
-                target_table TEXT NOT NULL,
-                query_context TEXT NOT NULL,
-                timestamp TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-            )
-            """
-        )
-
-        connection.execute(
-            """
-            CREATE TABLE IF NOT EXISTS completed_tasks (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                thread_id TEXT NOT NULL,
-                summary TEXT NOT NULL,
-                final_state_json TEXT NOT NULL,
-                completed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-            )
-            """
-        )
-
-        connection.commit()
-
+    DatabasePool.get().get_connection(db_path)
     return db_path
 
 

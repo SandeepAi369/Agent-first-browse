@@ -29,6 +29,7 @@ from app.browser_promoter.cdp_stealth_launcher import (
     STEALTH_USER_AGENT,
     apply_page_stealth,
     get_random_viewport,
+    VISUAL_CURSOR_INIT_SCRIPT,
 )
 from app.browser_promoter.state import BrowserConfig
 from app.logger import get_logger
@@ -107,6 +108,7 @@ class BrowserRuntime:
                     ignore_default_args=["--enable-automation"],
                 )
                 await cls._context.add_init_script(STEALTH_INIT_SCRIPT)
+                await cls._context.add_init_script(VISUAL_CURSOR_INIT_SCRIPT)
                 cls._active_session_key = session_key
 
             # Get or create page

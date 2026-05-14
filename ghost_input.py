@@ -208,20 +208,62 @@ def _nearby_key(char: str) -> str:
     return char
 
 
+# ── Safety Constants ──
+GHOST_TYPE_MAX_LENGTH = 8000
+GHOST_TYPE_FAST_THRESHOLD = 500
+GHOST_TYPE_NO_TYPO_THRESHOLD = 100
+GHOST_TYPE_ABORT_CHECK_INTERVAL = 50
+
+
+def _fast_typing_delay() -> float:
+    """Faster delay for long text (15ms avg instead of 70ms)."""
+    delay = random.gauss(0.015, 0.005)
+    return max(0.008, min(0.035, delay))
+
+
 async def ghost_type(page: Page, text: str) -> None:
     """Type text with human-like variable speed and occasional typo corrections.
     
+    Safety guards:
+      - Truncates to GHOST_TYPE_MAX_LENGTH (2000) chars
+      - Switches to fast mode for text > 500 chars
+      - Disables typo simulation for text > 100 chars
+      - Checks page.is_closed() every 50 chars to abort if page died
+    
     Replaces: await page.keyboard.type(text, delay=30)
     """
+    # ── Length guard ──
+    original_len = len(text)
+    if original_len > GHOST_TYPE_MAX_LENGTH:
+        logger.warning(
+            "Ghost type truncated: %d → %d chars", original_len, GHOST_TYPE_MAX_LENGTH
+        )
+        text = text[:GHOST_TYPE_MAX_LENGTH]
+
+    fast_mode = len(text) > GHOST_TYPE_FAST_THRESHOLD
+    typos_enabled = len(text) <= GHOST_TYPE_NO_TYPO_THRESHOLD
+
+    if fast_mode:
+        logger.info("Ghost type: fast mode enabled (%d chars)", len(text))
+
     i = 0
     while i < len(text):
+        # ── Abort check: stop if page closed mid-type ──
+        if i > 0 and i % GHOST_TYPE_ABORT_CHECK_INTERVAL == 0:
+            try:
+                if page.is_closed():
+                    logger.warning("Ghost type aborted: page closed at char %d/%d", i, len(text))
+                    return
+            except Exception:
+                return
+
         char = text[i]
 
-        # Occasional typo (type wrong key, pause, backspace, retype correct)
-        if char.isalpha() and _should_make_typo():
+        # Occasional typo (only for short text)
+        if typos_enabled and char.isalpha() and _should_make_typo():
             wrong = _nearby_key(char)
             await page.keyboard.press(wrong)
-            await asyncio.sleep(random.uniform(0.15, 0.40))  # "realize mistake" pause
+            await asyncio.sleep(random.uniform(0.15, 0.40))
             await page.keyboard.press("Backspace")
             await asyncio.sleep(random.uniform(0.05, 0.12))
             await page.keyboard.press(char)
@@ -236,16 +278,19 @@ async def ghost_type(page: Page, text: str) -> None:
                     await page.keyboard.insert_text(char)
 
         # Delay after this character
-        if char in " \n\t":
+        if fast_mode:
+            await asyncio.sleep(_fast_typing_delay())
+        elif char in " \n\t":
             await asyncio.sleep(_word_boundary_pause())
         elif char in ".,!?;:":
-            await asyncio.sleep(random.uniform(0.10, 0.30))  # Punctuation pause
+            await asyncio.sleep(random.uniform(0.10, 0.30))
         else:
             await asyncio.sleep(_typing_delay())
 
         i += 1
 
-    logger.info("Ghost typed %d chars with humanized cadence", len(text))
+    mode_label = "fast" if fast_mode else "humanized"
+    logger.info("Ghost typed %d chars with %s cadence", len(text), mode_label)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

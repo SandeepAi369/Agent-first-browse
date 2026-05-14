@@ -12,9 +12,8 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.graph import StateGraph, START, END
 
 from app.browser_promoter.nodes import (
-    strategic_planner_node,
-    tactical_selector_node,
-    vision_tool_node,
+    vision_agent_node,
+    reasoning_agent_node,
     browser_controller_node,
     stuck_evaluator_node,
     auth_check_node,
@@ -56,9 +55,8 @@ async def run_form_fill():
     )
 
     graph = StateGraph(AgentState)
-    graph.add_node("strategic_planner", strategic_planner_node)
-    graph.add_node("tactical_selector", tactical_selector_node)
-    graph.add_node("vision_tool", vision_tool_node)
+    graph.add_node("vision_agent", vision_agent_node)
+    graph.add_node("reasoning_agent", reasoning_agent_node)
     graph.add_node("browser_controller", browser_controller_node)
     graph.add_node("stuck_evaluator", stuck_evaluator_node)
     graph.add_node("auth_check", auth_check_node)
@@ -66,24 +64,13 @@ async def run_form_fill():
     graph.add_node("task_logging_node", task_logging_node)
     graph.add_node("housekeeping_node", housekeeping_node)
 
-    # Start directly at the Swarm (Strategic Planner)
-    graph.add_edge(START, "strategic_planner")
-    graph.add_edge("strategic_planner", "tactical_selector")
-    
-    def collaborative_router(state: AgentState) -> str:
-        if state.routing.vision_requested:
-            return "vision_tool"
-        return "stuck_evaluator"
-
-    graph.add_conditional_edges("tactical_selector", collaborative_router, {
-        "vision_tool": "vision_tool",
-        "stuck_evaluator": "stuck_evaluator",
-    })
-    
-    graph.add_edge("vision_tool", "strategic_planner")
+    # Start directly at the vision agent
+    graph.add_edge(START, "vision_agent")
+    graph.add_edge("vision_agent", "reasoning_agent")
+    graph.add_edge("reasoning_agent", "stuck_evaluator")
     graph.add_edge("stuck_evaluator", "auth_check")
     graph.add_edge("auth_check", "router")
-    graph.add_edge("browser_controller", "strategic_planner")
+    graph.add_edge("browser_controller", "vision_agent")
     
     graph.add_conditional_edges(
         "router",
