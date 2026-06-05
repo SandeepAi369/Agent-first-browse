@@ -84,7 +84,7 @@ class ActionFingerprint:
         self.target_ref = target_ref
         self.target_name = target_name
         self.url = url
-        self.timestamp = time.time()
+        self.timestamp = time.monotonic()
 
     @property
     def identity(self) -> str:
@@ -118,7 +118,7 @@ class PageState:
         self.element_refs = element_refs or frozenset()
         self.element_states = element_states or {}
         self.title = title
-        self.timestamp = time.time()
+        self.timestamp = time.monotonic()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
