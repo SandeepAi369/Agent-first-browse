@@ -33,7 +33,9 @@ log = logging.getLogger("dom_parser")
 
 _GOD_MODE_JS = r"""
 (targetHint) => {
-    const MAX_ELEMENTS = 50;
+    /* Adaptive budget: base 60 + extra for form-heavy pages, capped at 150 */
+    const hasForm = !!document.querySelector('form, [role="form"], [data-testid]');
+    const MAX_ELEMENTS = hasForm ? 80 : 60;
     const MIN_DIM = 4;
 
     const vw = window.innerWidth  || document.documentElement.clientWidth  || 1920;
@@ -277,10 +279,16 @@ SHADOW_PIERCER_INIT_SCRIPT = r"""
     window.__piercer = {
         roots: () => {
             const live = [];
+            const pruned = [];
             for (const ref of _all) {
                 const sr = ref.deref();
-                if (sr) live.push(sr);
+                if (sr && sr.host && sr.host.isConnected) {
+                    live.push(sr);
+                    pruned.push(ref);
+                }
             }
+            _all.length = 0;
+            _all.push(...pruned);
             return live;
         },
         count: () => _all.length,
@@ -449,8 +457,8 @@ def find_field(form_data: dict, field_type: str) -> dict | None:
     if not fields:
         return None
 
-    title_keywords = {"title", "subject", "headline", "name"}
-    body_keywords = {"body", "content", "description", "message", "text", "article", "write"}
+    title_keywords = {"title", "subject", "headline", "heading"}
+    body_keywords = {"body", "content", "description", "message", "text", "article", "write", "post", "comment"}
 
     for f in fields:
         combined = f"{f.get('name', '')} {f.get('placeholder', '')} {f.get('label', '')}".lower()
