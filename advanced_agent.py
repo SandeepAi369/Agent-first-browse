@@ -24,7 +24,7 @@ import signal
 import sys
 import time as _time
 import traceback
-from collections import Counter
+from collections import Counter, deque
 from pathlib import Path
 
 from pydantic import BaseModel, Field
@@ -56,6 +56,14 @@ from content_critic import ContentCritic
 from model_registry import ModelRegistry
 import dom_parser
 from content_store import ContentStore
+from form_engine import FormState, classify_field
+from platform_detect import detect_platform, get_char_limit
+from verification_engine import take_snapshot, verify_outcome, fingerprint_ax_tree
+
+# Cognitive Architecture V2.1
+from cognitive_core import PlanState, WorkingMemory, dom_data_to_a11y_format, AgentMetrics
+from orchestrator.critic_v12 import CriticV12, Verdict
+from execution_safety import is_domain_allowed, cove_pre_done_check
 
 logger = get_logger("advanced_agent")
 
@@ -186,31 +194,103 @@ async def _decompose_objective(
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  v9.0 Action Outcome Verifier
+#  v2.1 Three-Layer Action Grounding (RQ-B06 UPGRADE)
+#  Layer 1: element_id → selector_map lookup (Browser-Use pattern, PREFERRED)
+#  Layer 2: elementFromPoint hit-test (from report B, FALLBACK)
+#  Layer 3: nearest-element snap by distance (v2.0, TERTIARY)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-async def _verify_action_outcome(page: Page, prev_url: str, prev_screenshot_hash: int) -> dict:
-    """Check if the last action actually changed the page state."""
-    await asyncio.sleep(0.4)
-    new_url = page.url
-    if new_url != prev_url:
-        return {"changed": True, "type": "url_change", "detail": f"{prev_url} → {new_url}"}
-    try:
-        new_bytes = await page.screenshot(type="jpeg", quality=20)
-        new_hash = hash(new_bytes[:2000])
-        if new_hash != prev_screenshot_hash:
-            return {"changed": True, "type": "visual_change", "detail": "Page content changed"}
-    except Exception:
-        pass
-    try:
-        has_modal = await page.evaluate(
-            "() => !!document.querySelector('[role=\"dialog\"], [role=\"alertdialog\"], .modal')"
+async def _ground_or_reject(
+    decision, selector_map: dict, elements_list: list[dict],
+    page, threshold: float = 60.0
+) -> tuple[dict | None, str | float]:
+    """Three-layer grounding validation (v2.1 RQ-B06).
+
+    Layer 1 (PREFERRED): element_id → selector_map lookup
+    Layer 2 (FALLBACK):  elementFromPoint hit-test on coordinates
+    Layer 3 (TERTIARY):  nearest-element snap by distance
+
+    Returns:
+        (element_dict, distance_float) if grounded successfully
+        (None, reason_string) if coordinates are hallucinated / rejected
+    """
+    # ── Layer 1: Element ID resolution (Browser-Use pattern) ──
+    if decision.element_id is not None:
+        el = selector_map.get(decision.element_id)
+        if el is None:
+            return None, f"element_id '{decision.element_id}' not in current snapshot"
+        # Resolve coordinates from the element
+        decision.x = float(el.get("x", decision.x or 0))
+        decision.y = float(el.get("y", decision.y or 0))
+        logger.info(
+            "🎯 Grounded via element_id [%s] '%s' → (%d,%d)",
+            decision.element_id,
+            el.get("text", el.get("name", "?"))[:30],
+            int(decision.x), int(decision.y),
         )
-        if has_modal:
-            return {"changed": True, "type": "modal_appeared", "detail": "Dialog appeared"}
+        return el, 0.0  # perfect ground
+
+    # Below here: LLM gave coordinates but no element_id
+    if decision.x is None or decision.y is None:
+        return None, "no element_id or coordinates"
+
+    # ── Layer 2: elementFromPoint hit-test (from report B) ──
+    try:
+        hit = await page.evaluate(
+            "([x,y])=>{const e=document.elementFromPoint(x,y);"
+            "if(!e)return null;"
+            "const tag=e.tagName.toUpperCase();"
+            "const interactive=['A','BUTTON','INPUT','SELECT','TEXTAREA']"
+            ".includes(tag)||e.getAttribute('role')==='button'"
+            "||e.getAttribute('contenteditable')==='true';"
+            "return{tag,interactive,text:(e.textContent||'').trim().slice(0,40)};}",
+            [decision.x, decision.y],
+        )
+        if hit and hit.get("interactive"):
+            logger.info(
+                "🎯 Grounded via hit-test: %s '%s' at (%d,%d)",
+                hit.get("tag", "?"), hit.get("text", "?")[:30],
+                int(decision.x), int(decision.y),
+            )
+            return {"ref": "hit-test", "name": hit.get("text", "")[:30],
+                    "x": decision.x, "y": decision.y}, 0.0
     except Exception:
         pass
-    return {"changed": False, "type": "no_change", "detail": "Page appears unchanged"}
+
+    # ── Layer 3: Nearest-element snap (v2.0 fallback) ──
+    if not elements_list:
+        return None, "no elements in snapshot"
+    best_el: dict | None = None
+    best_dist = float("inf")
+    for el in elements_list:
+        ex = el.get("x", 0)
+        ey = el.get("y", 0)
+        if ex == 0 and ey == 0:
+            continue  # Skip elements with no position data
+        dist = ((decision.x - ex) ** 2 + (decision.y - ey) ** 2) ** 0.5
+        if dist < best_dist:
+            best_dist = dist
+            best_el = el
+
+    if best_el is None:
+        return None, "no positioned elements in snapshot"
+    if best_dist > threshold:
+        return None, (
+            f"nearest element [{best_el.get('id', best_el.get('ref', '?'))}] "
+            f"'{best_el.get('text', best_el.get('name', '?'))[:25]}' "
+            f"is {best_dist:.0f}px away (>{threshold:.0f}px threshold)"
+        )
+    # Snap to real element center
+    decision.x = float(best_el.get("x", decision.x))
+    decision.y = float(best_el.get("y", decision.y))
+    if best_dist > 5.0:
+        logger.info(
+            "🎯 Grounded via snap to [%s] '%s' (%.0fpx)",
+            best_el.get('id', best_el.get('ref', '?')),
+            best_el.get('text', best_el.get('name', '?'))[:30],
+            best_dist,
+        )
+    return best_el, best_dist
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -467,9 +547,17 @@ class AutonomousAction(BaseModel):
     action_type: str = Field(
         description="One of: 'goto', 'click', 'type', 'scroll', 'press_enter', 'wait', 'done'"
     )
+    element_id: str | None = Field(
+        default=None,
+        description=(
+            "PREFERRED: The element ID from the page structure (e.g., 'e5'). "
+            "Use this instead of x,y coordinates when possible. "
+            "The system will resolve the element's real position automatically."
+        ),
+    )
     url: str | None = Field(default=None, description="URL for 'goto' action")
-    x: float | None = Field(default=None, description="X coordinate for click/type actions (from vision map)")
-    y: float | None = Field(default=None, description="Y coordinate for click/type actions (from vision map)")
+    x: float | None = Field(default=None, description="X coordinate (fallback if element_id unavailable)")
+    y: float | None = Field(default=None, description="Y coordinate (fallback if element_id unavailable)")
     text: str | None = Field(default=None, description="Text to type for 'type' action")
     wait_ms: int | None = Field(default=None, description="Milliseconds to wait for 'wait' action (default: 1000)")
 
@@ -621,25 +709,41 @@ async def run_agent(objective: str):
     if campaign_log:
         logger.info("Campaign history: %s", memory.get_summary())
 
-    # ── v9.0: Mission Planner — decompose into checkpoints ──
+    # ── v2.0: Mission Planner → PlanState (fixes B-01 amnesia, B-10 dead checkpoints) ──
     mission_checkpoints = await _decompose_objective(llm_objective, failover_chain, breaker, health_tracker)
-    logger.info("📋 Mission Plan (%d checkpoints):", len(mission_checkpoints))
-    for i, cp in enumerate(mission_checkpoints):
-        logger.info("  [%d] %s", i + 1, cp)
+    plan = PlanState.from_checkpoints(llm_objective, mission_checkpoints)
+    working_mem = WorkingMemory()
+    metrics = AgentMetrics()  # v2.1: Quality metrics tracking (S-5)
+    logger.info("📋 Mission Plan (%d steps):", len(plan.steps))
+    for s in plan.steps:
+        logger.info("  [%d] %s", s["id"] + 1, s["desc"])
 
-    action_history: list[str] = []
-    url_history: list[str] = []
+    action_history: deque[str] = deque(maxlen=50)    # Reduced — WorkingMemory handles the rest
+    url_history: deque[str] = deque(maxlen=50)         # V-01: bounded ring buffer
     last_action_signature = ""
     consecutive_identical_actions = 0
     correction_failures = 0  # v9.0: Self-correction streak counter
-    max_steps = 25  # v9.0: Increased from 20 to accommodate verification steps
+    # v2.1: Dynamic budget (RQ-B05) — base + field bonus, extensible on progress
+    base_budget = 20
+    field_bonus = 5 if store.has_article else 0
+    max_steps = base_budget + field_bonus
     step = 0
 
-    # ── v9.0: Progressive State Machine ──
+    # ── v13.0: Form State Machine (replaces phase_tracker aliases) ──
+    form_state = FormState(
+        required_fields={"title", "body"} if store.has_article else {"body"}
+    )
+    # ── v9.0: Progressive State Machine (kept for navigation/submit phases) ──
     phase_tracker = AgentPhaseTracker()
-    # Backwards compat aliases
+    # Backwards compat aliases (kept for code paths that still read them)
     completed_phases = phase_tracker.phases
     typed_text_content = ""
+
+    # ── v13.0: Triple-state loop detector (RQ-12) ──
+    _loop_window: deque[tuple] = deque(maxlen=6)
+
+    # ── v2.0: CriticV12 (RQ-B03) — replaces dead hash verifier ──
+    progress_critic: CriticV12 | None = None  # initialized after page is ready
 
     try:
         for step in range(max_steps):
@@ -661,11 +765,16 @@ async def run_agent(objective: str):
             current_url = page.url
             logger.info("URL: %s", current_url)
 
-            # ── Anti-Loop Watchdog: detect navigation loops ──
+            # ── v2.0: Initialize CriticV12 on first step (needs page reference) ──
+            if progress_critic is None:
+                progress_critic = CriticV12(page)
+                logger.info("🧠 CriticV12 initialized (6-signal progress detection)")
+
+            # ── Anti-Loop Watchdog v13: (url, dom_fp, action_sig) triple ──
             url_history.append(current_url)
             loop_context = ""
             if len(url_history) >= 6:
-                recent_urls = url_history[-6:]
+                recent_urls = list(url_history)[-6:]
                 url_counts = Counter(recent_urls)
                 most_common_url, visit_count = url_counts.most_common(1)[0]
                 if visit_count >= 3:
@@ -697,6 +806,13 @@ async def run_agent(objective: str):
             dom_data = await dom_parser.extract(page, target_hint=target_hint, timeout=5.0)
             elements_list = dom_data.get("elements", [])
             dom_markdown = dom_data.get("markdown", "")
+
+            # v2.1: Build selector_map for element-ID grounding (Browser-Use pattern)
+            selector_map: dict[str, dict] = {}
+            for el in elements_list:
+                eid = el.get("id", el.get("ref", ""))
+                if eid:
+                    selector_map[eid] = el
             vision_map_json = json.dumps({"elements": elements_list, "image_size": dom_data.get("image_size", {})}, ensure_ascii=True)
 
             # ═══ TIER 2: Vision API — ABSOLUTE LAST RESORT ═══
@@ -762,11 +878,20 @@ async def run_agent(objective: str):
             # ════════════════════════════════════════════════════════════════
             #  OTA SYSTEM PROMPT — Autonomous Observe-Think-Act Persona
             # ════════════════════════════════════════════════════════════════
+            # ── v2.0: Plan + Memory injected into system prompt (RQ-B01) ──
+            plan_context = plan.render()
+            facts_context = working_mem.render_facts()
+
             system_prompt = (
                 "You are an elite autonomous web agent with FULL CREATIVE FREEDOM. "
                 "You operate inside a real Chromium browser and control it through actions.\n\n"
 
-                "═══ CORE IDENTITY ═══\n"
+                "═══ YOUR CURRENT PLAN ═══\n"
+                f"{plan_context}\n\n"
+
+                + (f"═══ WHAT YOU KNOW ═══\n{facts_context}\n\n" if facts_context else "")
+
+                + "═══ CORE IDENTITY ═══\n"
                 "You are an INDEPENDENT THINKER, not a step-follower. "
                 "The user gives you a GOAL (their intent). Any numbered steps they provide are "
                 "SUGGESTIONS, not commands. YOU decide the actual actions based on what you SEE.\n\n"
@@ -803,12 +928,13 @@ async def run_agent(objective: str):
                 "═══ PAGE STRUCTURE (Semantic Markdown) ═══\n"
                 "You receive a compressed Markdown map of all interactive elements, grouped by their semantic container (form, nav, header, etc). "
                 "Each element has: [eN] id, kind, label, and (x,y) coordinates. "
-                "Use the coordinates to click/type. Use the container grouping to understand which elements belong together.\n\n"
+                "Use the element_id field (e.g., 'e5') to reference elements — coordinates will be resolved automatically. "
+                "Use the container grouping to understand which elements belong together.\n\n"
 
                 "═══ AVAILABLE ACTIONS ═══\n"
                 "goto — Navigate to a URL (set url field)\n"
-                "click — Click at coordinates (set x, y fields)\n"
-                "type — Click at coordinates, clear field, then type text (set x, y, text fields)\n"
+                "click — Click element (PREFERRED: set element_id like 'e5'; fallback: set x, y)\n"
+                "type — Click then type (PREFERRED: set element_id + text; fallback: x, y + text)\n"
                 "scroll — Scroll down to reveal more content\n"
                 "press_enter — Press Enter key (e.g., to submit a form)\n"
                 "wait — Wait for content to load (set wait_ms, default 1000)\n"
@@ -840,8 +966,8 @@ async def run_agent(objective: str):
                 f"{login_hint}"
                 f"{state_override}"
                 f"{dedup_override}\n\n"
-                f"═══ ACTION HISTORY (recent) ═══\n"
-                f"{json.dumps(action_history[-5:], indent=1) if action_history else '[]'}\n\n"
+                f"═══ ACTION HISTORY (compressed) ═══\n"
+                f"{working_mem.compress_history() if working_mem.episodic else '(first step)'}\n\n"
                 f"═══ PAGE STRUCTURE ═══\n"
                 f"{dom_markdown}\n\n"
                 f"Now OBSERVE the page structure above, THINK about your situation, and choose your NEXT action."
@@ -884,16 +1010,46 @@ async def run_agent(objective: str):
             if decision.url:
                 summary += f" url='{decision.url[:60]}'"
 
+            # ── v2.0: PRE-ACT CriticV12 snapshot (RQ-B03) ──
+            try:
+                pre_a11y = dom_data_to_a11y_format(dom_data)
+                await progress_critic.snapshot_before(pre_a11y)
+            except Exception as snap_err:
+                logger.warning("Critic snapshot failed: %s", snap_err)
+                try:
+                    await progress_critic.snapshot_before(None)
+                except Exception:
+                    pass
+
             # ── Execute with outcome tracking ──
             action_outcome = "→ OK"
 
             # ── Execute ──
             intercepted_by_smart_engine = False
+            metrics.total_actions += 1  # v2.1: Track total actions
+
+            # v2.1: MemGPT eviction check at start of each action
+            working_mem.evict_if_needed()
+
             if decision.action_type == "done":
-                logger.info("✅ Goal Achieved!")
+                # v2.1: CoVe pre-done check (RQ-B10) — block premature done
+                cove_ok, cove_reason = await cove_pre_done_check(page, plan, working_mem)
+                if not cove_ok:
+                    logger.warning("🛡️ CoVe BLOCKED premature done: %s", cove_reason)
+                    action_history.append(f"Step {step+1}: done BLOCKED — {cove_reason}")
+                    working_mem.record_step(step + 1, "done", f"BLOCKED: {cove_reason[:60]}")
+                    metrics.done_blocked += 1
+                    continue
+                logger.info("✅ Goal Achieved! (CoVe verified: %s)", cove_reason[:60])
                 break
 
             elif decision.action_type == "goto":
+                # v2.1: Domain safety check (RQ-B09, arXiv 2511.19477)
+                if decision.url and not is_domain_allowed(decision.url):
+                    logger.warning("🛡️ Domain blocked: %s", decision.url[:80])
+                    action_history.append(f"Step {step+1}: goto BLOCKED — domain not in allowlist")
+                    working_mem.record_step(step + 1, "goto", f"BLOCKED: domain not allowed")
+                    continue
                 logger.info("Navigating → %s", decision.url)
                 try:
                     await page.goto(decision.url, wait_until="domcontentloaded", timeout=15000)
@@ -902,8 +1058,32 @@ async def run_agent(objective: str):
                     action_outcome = f"→ FAILED: {e}"
 
             elif decision.action_type in ("type", "click"):
-                if decision.x is None or decision.y is None:
-                    logger.warning("Missing coordinates for action")
+                # v2.1: Check if element_id was provided (preferred) or coordinates (fallback)
+                has_element_id = decision.element_id is not None
+                has_coords = decision.x is not None and decision.y is not None
+                if not has_element_id and not has_coords:
+                    # V-04: Record rejected action instead of silent step burn
+                    reject_msg = f"Step {step+1}: {decision.action_type} REJECTED — no element_id or coordinates"
+                    logger.warning("⚠️ %s", reject_msg)
+                    action_history.append(reject_msg)
+                    working_mem.record_step(step + 1, decision.action_type, "REJECTED: no target")
+                    metrics.grounding_rejects += 1
+                    continue
+
+                # ── v2.1: Three-Layer Grounding Validation (RQ-B06) ──
+                grounded_el, ground_info = await _ground_or_reject(
+                    decision, selector_map, elements_list, page
+                )
+                if grounded_el is None and isinstance(ground_info, str):
+                    reject_msg = f"Step {step+1}: {decision.action_type} GROUNDING REJECT — {ground_info}"
+                    logger.warning("🎯 %s", reject_msg)
+                    action_history.append(reject_msg)
+                    working_mem.record_failure(
+                        f"{decision.action_type}({decision.element_id or ''}@{int(decision.x or 0)},{int(decision.y or 0)})",
+                        f"grounding: {ground_info}"
+                    )
+                    working_mem.record_step(step + 1, decision.action_type, f"GROUNDING REJECT: {ground_info[:60]}")
+                    metrics.grounding_rejects += 1
                     continue
 
                 # ══════════════════════════════════════════════════════════
@@ -1047,7 +1227,14 @@ async def run_agent(objective: str):
                 elif decision.action_type == "click":
                     logger.info("Clicking at (%d, %d)", decision.x, decision.y)
                     try:
-                        await ghost_click(page, decision.x, decision.y)
+                        # V-14: Timeout-wrapped ghost_click
+                        await asyncio.wait_for(
+                            ghost_click(page, decision.x, decision.y), timeout=15.0
+                        )
+                    except asyncio.TimeoutError:
+                        logger.warning("ghost_click timed out at (%d,%d) — page may be frozen", decision.x, decision.y)
+                        action_history.append(f"Step {step+1}: click TIMEOUT at ({decision.x},{decision.y})")
+                        continue
                     except Exception as e:
                         logger.warning("Click failed: %s", e)
                         action_outcome = f"→ FAILED: {e}"
@@ -1056,16 +1243,8 @@ async def run_agent(objective: str):
                     #  Standard typing (tweets, short posts, etc.)
                     # ══════════════════════════════════════════════════════════
                     text_to_type = decision.text or ""
-                    platform_char_limits = {
-                        "x.com": 280, "twitter.com": 280,
-                        "reddit.com": 40000, "dev.to": 100000,
-                        "medium.com": 100000, "hashnode.com": 100000,
-                    }
-                    max_chars = 280
-                    for domain, limit in platform_char_limits.items():
-                        if domain in current_url:
-                            max_chars = limit
-                            break
+                    # V-06: Proper URL-based platform char limits
+                    max_chars = get_char_limit(current_url)
 
                     if len(text_to_type) > max_chars:
                         logger.warning(
@@ -1198,7 +1377,14 @@ async def run_agent(objective: str):
             elif decision.action_type == "scroll":
                 logger.info("Scrolling down")
                 try:
-                    await ghost_scroll(page, 600)
+                    # V-14: Timeout-wrapped ghost_scroll
+                    await asyncio.wait_for(
+                        ghost_scroll(page, 600), timeout=10.0
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning("ghost_scroll timed out — page may be frozen")
+                    action_history.append(f"Step {step+1}: scroll TIMEOUT")
+                    continue
                 except Exception as e:
                     logger.warning("Scroll failed: %s", e)
                     action_outcome = f"→ FAILED: {e}"
@@ -1209,44 +1395,125 @@ async def run_agent(objective: str):
                 history_entry += f" | Screen: {decision.screen_state[:80]}"
             action_history.append(history_entry)
 
-            # ── v9.0: Action Outcome Verification + Self-Correction ──
-            if decision.action_type in ("click", "type", "goto"):
-                pre_hash = hash(current_url + vision_map_json[:500])
-                outcome = await _verify_action_outcome(page, current_url, pre_hash)
-                if outcome["changed"]:
+            # ── v2.0: WorkingMemory episodic recording ──
+            working_mem.record_step(
+                step + 1,
+                f"{decision.action_type}" + (f"({int(decision.x or 0)},{int(decision.y or 0)})" if decision.x else ""),
+                action_outcome,
+                screen_hint=decision.screen_state[:80] if decision.screen_state else "",
+            )
+            # Update spatial memory with current page elements
+            if elements_list:
+                working_mem.update_page_map(current_url, elements_list)
+
+            # ── v2.1: CriticV12 POST-ACT Verification (RQ-B03) + Reflexion (RQ-B02) + Key-Node (RQ-B05) ──
+            if decision.action_type in ("click", "type", "goto", "scroll"):
+                try:
+                    post_dom = await dom_parser.extract(page, timeout=3.0)
+                    post_a11y = dom_data_to_a11y_format(post_dom)
+                except Exception:
+                    post_a11y = None
+                # Build target_ref from element_id if available, else from coordinates
+                target_ref = decision.element_id or f"({int(decision.x or 0)},{int(decision.y or 0)})"
+                verdict = await progress_critic.evaluate(
+                    action=decision.action_type,
+                    target_ref=target_ref,
+                    target_name=decision.text[:30] if decision.text else "",
+                    a11y_data_after=post_a11y,
+                )
+                if verdict.success:
                     correction_failures = 0
                     phase_tracker.correction_context = ""
-                    logger.info("✓ Verified: %s", outcome["detail"][:100])
+                    metrics.critic_progress += 1
+                    logger.info("✓ Critic: %s [%.0f%%]", verdict.reason[:100], verdict.confidence * 100)
+                    # v2.1: Key-node advancement (RQ-B05)
+                    if not verdict.circuit_breaker_triggered:
+                        working_mem.note(f"step{step+1}_progress", verdict.reason[:60])
+                        cur_step = plan._current()
+                        if cur_step and any(kw in verdict.reason.lower() for kw in
+                                            ["url changed", "structure changed", "state changed",
+                                             "new elements", "elements disappeared"]):
+                            plan.advance()
+                            working_mem.note(
+                                f"keynode_{step+1}",
+                                f"plan step '{cur_step['desc'][:30]}' completed"
+                            )
+                            logger.info(
+                                "🎯 Key-node: plan step '%s' completed (progress=%d%%)",
+                                cur_step['desc'][:40], plan.progress_pct,
+                            )
+                    # v2.1: Dynamic budget extension (RQ-B05)
+                    if step >= max_steps - 3 and plan.progress_pct >= 60:
+                        max_steps += 5
+                        logger.info(
+                            "📊 Budget extended to %d (progress=%d%%)",
+                            max_steps, plan.progress_pct,
+                        )
                 else:
                     correction_failures += 1
+                    metrics.critic_no_progress += 1
                     phase_tracker.failed_actions.append(
-                        f"Step {step+1}: {decision.action_type} → NO EFFECT"
+                        f"Step {step+1}: {decision.action_type} → {verdict.reason[:60]}"
                     )
-                    if correction_failures >= 2:
+                    working_mem.record_failure(
+                        f"{decision.action_type}({target_ref})",
+                        verdict.reason[:80],
+                    )
+                    if verdict.circuit_breaker_triggered:
+                        phase_tracker.correction_context = (
+                            f"\n\n🛑 CRITIC CIRCUIT BREAKER: {verdict.reason} "
+                            "You MUST try a COMPLETELY DIFFERENT approach: scroll, dismiss overlays, wait, or navigate elsewhere."
+                        )
+                        logger.warning("🛑 Critic circuit breaker: %s", verdict.reason[:100])
+                        progress_critic.reset_circuit_breaker()
+                    elif correction_failures >= 2:
                         phase_tracker.correction_context = (
                             f"\n\n⚠️ SELF-CORRECTION: Last {correction_failures} actions had NO visible effect. "
                             f"Failed: {'; '.join(phase_tracker.failed_actions[-3:])}. "
                             "Try a COMPLETELY DIFFERENT approach: scroll, dismiss overlays, or wait."
                         )
-                        logger.warning("🔧 Self-correction activated (streak=%d)", correction_failures)
+                        logger.warning("🧠 Critic: no progress (streak=%d)", correction_failures)
+
+                        # v2.1: Gated Reflexion (RQ-B02) — fires ONLY on stagnation streak ≥ 2
+                        try:
+                            metrics.reflexion_triggers += 1
+                            reflect_prompt = (
+                                f"I attempted {correction_failures} actions with no progress. "
+                                f"Recent failures: {'; '.join(phase_tracker.failed_actions[-3:])}. "
+                                f"Current plan step: {plan._current()['desc'] if plan._current() else 'unknown'}. "
+                                f"What went wrong? What should I try differently?"
+                            )
+                            reflection_msgs = [
+                                SystemMessage(content=(
+                                    "You are a self-reflection agent analyzing a web automation failure. "
+                                    "Be specific about what went wrong and suggest a concrete alternative approach."
+                                )),
+                                HumanMessage(content=reflect_prompt),
+                            ]
+                            reflection_result, _ = await _invoke_with_failover(
+                                failover_chain, reflection_msgs, None,
+                                breaker, health_tracker=health_tracker,
+                            )
+                            if hasattr(reflection_result, 'content') and reflection_result.content:
+                                reflection_text = reflection_result.content[:200]
+                                plan.add_reflection(reflection_text)
+                                working_mem.note("last_reflection", reflection_text)
+                                logger.info("🪞 Reflexion: %s", reflection_text[:150])
+                        except Exception as ref_err:
+                            logger.warning("Reflexion call failed: %s", ref_err)
 
             # ── v9.0: Phase Transitions + Continuous Campaign Logging ──
-            platform = "unknown"
-            for p in ["dev.to", "medium.com", "x.com", "twitter.com", "hashnode.com", "github.com"]:
-                if p in page.url:
-                    platform = p
-                    break
+            # ── v13.0: Platform detection via URL parsing (V-06) ──
+            platform = detect_platform(page.url) or "unknown"
 
             if decision.action_type == "goto" and not phase_tracker.is_done("navigated_to_target"):
                 phase_tracker.mark("navigated_to_target")
                 _record_phase_transition(memory, platform, objective, page.url, step, "navigated")
 
+            # ── v13.0: Submit detection gated on FormState (V-05/V-09) ──
             is_submit_click = False
-            if decision.action_type == "click":
-                if store.has_article:
-                    is_submit_click = phase_tracker.is_done("body_filled") and not intercepted_by_smart_engine
-                else:
-                    is_submit_click = phase_tracker.text_typed_done
+            if decision.action_type == "click" and not intercepted_by_smart_engine:
+                is_submit_click = form_state.ready_to_submit
 
             if is_submit_click:
                 phase_tracker.mark("submit_clicked")

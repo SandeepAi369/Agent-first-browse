@@ -9,9 +9,11 @@ Reads ALL API keys from .env — NVIDIA, Groq, Google Gemini, DeepSeek.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import time
 import logging
+from collections import deque
 from typing import Any
 from pathlib import Path
 
@@ -97,37 +99,133 @@ class ProviderHealthTracker:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  Circuit Breaker
+#  Circuit Breaker — 3-State Machine (Resilience4j-inspired)
+#  CLOSED → OPEN → HALF_OPEN → CLOSED
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class CircuitBreaker:
-    def __init__(self, max_requests: int = 80, max_failures: int = 15):
-        self.request_count = 0
-        self.failure_count = 0
-        self.max_requests = max_requests
-        self.max_failures = max_failures
+    """Three-state circuit breaker with sliding window and auto-recovery.
 
-    def record_success(self):
-        self.request_count += 1
+    - CLOSED: all requests pass; track outcomes in a sliding window.
+      Trip to OPEN when failure RATE over last N >= threshold AND
+      a minimum number of calls recorded (prevents 1/1 false trips).
+    - OPEN: reject immediately. After wait_secs → HALF_OPEN.
+    - HALF_OPEN: allow limited probes; all pass → CLOSED; any fail → OPEN.
+    """
 
-    def record_failure(self):
-        self.failure_count += 1
-        self.request_count += 1
+    def __init__(
+        self,
+        window_size: int = 50,
+        min_calls: int = 10,
+        failure_rate_threshold: float = 0.5,
+        open_wait_secs: float = 30.0,
+        half_open_probes: int = 3,
+        # Legacy compat — ignored but accepted so existing code doesn't break
+        max_requests: int = 80,
+        max_failures: int = 15,
+    ):
+        self._window: deque[bool] = deque(maxlen=window_size)  # True = failure
+        self._min_calls = min_calls
+        self._failure_rate_threshold = failure_rate_threshold
+        self._open_wait_secs = open_wait_secs
+        self._max_probes = half_open_probes
+        self._state = "closed"
+        self._opened_at = 0.0
+        self._probes_done = 0
+        self._probe_failures = 0
+        self._total_requests = 0
+        self._total_failures = 0
+        self._lock = asyncio.Lock()
+
+    @property
+    def state(self) -> str:
+        return self._state
 
     @property
     def tripped(self) -> bool:
-        return self.request_count >= self.max_requests or self.failure_count >= self.max_failures
+        """Legacy compat: True if OPEN and not yet eligible for HALF_OPEN."""
+        if self._state == "open":
+            if time.monotonic() - self._opened_at >= self._open_wait_secs:
+                return False  # Eligible for half-open transition
+            return True
+        return False
+
+    async def allow(self) -> bool:
+        """Check if a request should be allowed through."""
+        async with self._lock:
+            if self._state == "closed":
+                return True
+            if self._state == "open":
+                if time.monotonic() - self._opened_at >= self._open_wait_secs:
+                    self._state = "half_open"
+                    self._probes_done = 0
+                    self._probe_failures = 0
+                    logger.info("⚡ Circuit breaker → HALF_OPEN (probing)")
+                    return True
+                return False
+            # half_open
+            if self._probes_done < self._max_probes:
+                self._probes_done += 1
+                return True
+            return False
+
+    async def record(self, is_failure: bool) -> None:
+        """Record the outcome of a request."""
+        async with self._lock:
+            self._total_requests += 1
+            if is_failure:
+                self._total_failures += 1
+
+            if self._state == "half_open":
+                if is_failure:
+                    self._probe_failures += 1
+                    self._trip("Half-open probe failed")
+                elif self._probes_done >= self._max_probes and self._probe_failures == 0:
+                    self._reset()
+                return
+
+            self._window.append(is_failure)
+            if len(self._window) >= self._min_calls:
+                rate = sum(self._window) / len(self._window)
+                if rate >= self._failure_rate_threshold:
+                    self._trip(f"Failure rate {rate:.0%} >= {self._failure_rate_threshold:.0%}")
+
+    # Legacy sync API (backward compat for callers that haven't migrated)
+    def record_success(self) -> None:
+        self._total_requests += 1
+        self._window.append(False)
+
+    def record_failure(self) -> None:
+        self._total_requests += 1
+        self._total_failures += 1
+        self._window.append(True)
+        if len(self._window) >= self._min_calls:
+            rate = sum(self._window) / len(self._window)
+            if rate >= self._failure_rate_threshold:
+                self._trip(f"Failure rate {rate:.0%} (sync)")
+
+    def _trip(self, reason: str) -> None:
+        self._state = "open"
+        self._opened_at = time.monotonic()
+        logger.warning("🔌 Circuit breaker → OPEN: %s", reason)
+
+    def _reset(self) -> None:
+        self._state = "closed"
+        self._window.clear()
+        self._probes_done = 0
+        logger.info("✅ Circuit breaker → CLOSED (recovered)")
 
     @property
     def reason(self) -> str:
-        if self.request_count >= self.max_requests:
-            return f"Request ceiling ({self.request_count}/{self.max_requests})"
-        if self.failure_count >= self.max_failures:
-            return f"Failure ceiling ({self.failure_count}/{self.max_failures})"
+        if self._state == "open":
+            remaining = max(0, self._open_wait_secs - (time.monotonic() - self._opened_at))
+            return f"OPEN (recovery in {remaining:.0f}s)"
         return ""
 
     def status_line(self) -> str:
-        return f"[CB: {self.request_count}/{self.max_requests} reqs, {self.failure_count}/{self.max_failures} fails]"
+        fails = sum(self._window)
+        total = len(self._window)
+        return f"[CB:{self._state} {fails}/{total} fails, {self._total_requests} total]"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

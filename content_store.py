@@ -285,12 +285,29 @@ class ContentStore:
     # ── Persistence ──
 
     def _persist(self) -> None:
-        """Save current payload to disk."""
+        """Save current payload to disk (atomic: temp → fsync → os.replace)."""
         if not self._current:
             return
         try:
+            import tempfile, os
             data = asdict(self._current)
-            self._path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+            content = json.dumps(data, indent=2, ensure_ascii=False)
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            fd, tmp = tempfile.mkstemp(
+                dir=str(self._path.parent), suffix=".tmp"
+            )
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    f.write(content)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp, str(self._path))
+            except Exception:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                raise
         except Exception as e:
             log.warning("Content store persist failed: %s", e)
 
