@@ -1,13 +1,12 @@
-"""Advanced Single-Agent Browser Automation with Deep Intelligence (v9.0).
+"""Advanced Single-Agent Browser Automation with Deep Intelligence (v14.0).
 
-v9.0 Deep Merge Architecture:
+v14.0 General-Purpose Architecture:
   - ModelRegistry: ALL API keys, strict TEXT/VISION separation, singleton
   - Mission Planner: pre-loop task decomposition into checkpoints
-  - Progressive State Machine: 7-phase tracker with failure memory
+  - CriticV12: 6-signal progress detection
   - Action Outcome Verifier: post-action page-change detection
   - Self-Correction Engine: auto-recover from silently failing actions
   - Recovery Advisor: separate LLM call when stuck
-  - Continuous Campaign Logger: records at every phase transition
   - Enhanced Failover: 3s recovery, not 30s dead time
 
 Session Persistence:
@@ -50,20 +49,23 @@ from app.logger import get_logger
 from playwright.async_api import async_playwright, BrowserContext, Page
 
 # Enterprise modules
-from ghost_input import ghost_click, ghost_type, ghost_scroll
+from ghost_input import ghost_click, ghost_type, ghost_scroll, ghost_move_to
 from campaign_memory import CampaignMemory
-from content_critic import ContentCritic
 from model_registry import ModelRegistry
+from cdp_input import resilient_type
+from overlay_detector import smart_click_with_penetration, check_click_target
+from cdp_click import resilient_click, ClickResult
+from action_verifier import ActionVerifier, VerificationResult
+from action_classifier import classify_action, ActionRisk, requires_simulation
+from web_dreamer import WebDreamer, should_invoke_dreamer, DreamerResult, CandidateAction
+from prm_critic import PRMCritic, ChecklistItem, StepScore
+from skill_memory import SkillMemory
 import dom_parser
-from content_store import ContentStore
-from form_engine import FormState, classify_field
-from platform_detect import detect_platform, get_char_limit
-from verification_engine import take_snapshot, verify_outcome, fingerprint_ax_tree
 
 # Cognitive Architecture V2.1
 from cognitive_core import PlanState, WorkingMemory, dom_data_to_a11y_format, AgentMetrics
 from orchestrator.critic_v12 import CriticV12, Verdict
-from execution_safety import is_domain_allowed, cove_pre_done_check
+from execution_safety import is_domain_allowed, cove_pre_done_check, auto_allow_from_objective
 
 logger = get_logger("advanced_agent")
 
@@ -72,87 +74,24 @@ logger = get_logger("advanced_agent")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  v10.0 Progressive State Machine — Multi-field tracker with failure memory
+#  v14.0 Task Progress Tracker — Neutral, general-purpose
 # ═══════════════════════════════════════════════════════════════════════════════
 
-class AgentPhaseTracker:
-    """Track completed phases per field, failed actions, and correction context."""
+class TaskProgressTracker:
+    """Track task progress, failed actions, and correction context.
+
+    This is a general-purpose tracker — no assumptions about task type.
+    """
 
     def __init__(self):
-        self.phases = {
-            "navigated_to_target": False,
-            "login_verified": False,
-            "compose_opened": False,
-            "title_filled": False,
-            "body_filled": False,
-            "all_fields_ready": False,
-            "submit_clicked": False,
-            "submit_verified": False,
-        }
-        self.typed_text = ""
-        self.current_checkpoint = ""
         self.failed_actions: list[str] = []
         self.correction_context = ""
         self.recovery_advice = ""
-        # v10.0: track what's in each field
-        self.title_content = ""
-        self.body_content = ""
+        self.mission_success = False
 
-    def mark(self, phase: str):
-        if phase in self.phases:
-            self.phases[phase] = True
-            logger.info("✅ Phase '%s' completed", phase)
-
-    def is_done(self, phase: str) -> bool:
-        return self.phases.get(phase, False)
-
-    def progress_pct(self) -> int:
-        done = sum(1 for v in self.phases.values() if v)
-        return int(100 * done / max(len(self.phases), 1))
-
-    # Backwards compatibility aliases
-    @property
-    def text_typed_done(self) -> bool:
-        return self.is_done("title_filled") or self.is_done("body_filled")
-
-    def get_state_override(self, has_article: bool = False) -> str:
-        """Build contextual state info for the LLM based on field fill status."""
+    def get_state_override(self) -> str:
+        """Build contextual state info for the LLM based on progress."""
         parts = []
-
-        title_done = self.is_done("title_filled")
-        body_done = self.is_done("body_filled")
-        all_ready = self.is_done("all_fields_ready")
-
-        if all_ready:
-            parts.append(
-                "\n\n🚨 ALL FIELDS ARE FILLED. Click the Publish/Post/Submit button NOW. "
-                "Do NOT type anything else."
-            )
-        elif title_done and not body_done:
-            if has_article:
-                parts.append(
-                    f"\n\n📝 FIELD STATUS: Title filled ✓ ({len(self.title_content)} chars). "
-                    "Body/Content field is still EMPTY — click on the body/content textarea "
-                    "and the system will auto-inject the article content."
-                )
-            else:
-                parts.append(
-                    f"\n\n📝 FIELD STATUS: Title/First field filled ✓. "
-                    "Now type into the body/content field, or click Post/Submit if finished."
-                )
-        elif title_done and body_done:
-            parts.append(
-                f"\n\n📝 FIELD STATUS: Title ✓ ({len(self.title_content)} chars) | "
-                f"Body ✓ ({len(self.body_content)} chars). "
-                "All fields filled — click Publish/Post/Submit button."
-            )
-        elif not title_done and self.typed_text:
-            parts.append(
-                f"\n\n📝 FIELD STATUS: You typed: '{self.typed_text[:60]}...' — "
-                "now fill the remaining fields or click Submit."
-            )
-
-
         if self.correction_context:
             parts.append(self.correction_context)
         if self.recovery_advice:
@@ -306,7 +245,7 @@ async def _ask_recovery_advisor(
         "You are a browser automation RECOVERY CONSULTANT. The agent is STUCK. "
         "Analyze the situation and give ONE specific actionable instruction.\n\n"
         f"OBJECTIVE: {objective}\nURL: {current_url}\n"
-        f"RECENT ACTIONS:\n{json.dumps(action_history[-6:], indent=1)}\n\n"
+        f"RECENT ACTIONS:\n{json.dumps(list(action_history)[-6:], indent=1)}\n\n"
         "Respond in 1-2 sentences ONLY."
     )
     try:
@@ -322,23 +261,7 @@ async def _ask_recovery_advisor(
         return "Try scrolling down or dismissing any visible popups."
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  v9.0 Continuous Campaign Logger
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def _record_phase_transition(memory, platform: str, objective: str, url: str, step: int, phase: str):
-    """Record progress to campaign memory at each phase transition."""
-    try:
-        memory.record_post(
-            platform=platform,
-            title=f"[Phase:{phase}] {objective[:80]}",
-            content=objective,
-            url=url,
-            agent_model="v9.0-deep-merge",
-            steps_taken=step + 1,
-        )
-    except Exception as e:
-        logger.warning("Campaign log failed: %s", e)
+# (v14.0: Campaign logger removed — task history recorded at end of run only)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  Persistence Paths (all inside WSL)
@@ -653,11 +576,11 @@ async def _invoke_with_failover(
 
 
 async def run_agent(objective: str):
-    """Core autonomous agent loop — v9.0 Deep Intelligence Architecture.
+    """Core autonomous agent loop — v14.0 General-Purpose Architecture.
 
-    Features: ModelRegistry, Mission Planner, Progressive State Machine,
+    Features: ModelRegistry, Mission Planner, CriticV12,
     Action Verifier, Self-Correction Engine, Recovery Advisor,
-    Continuous Campaign Logger, Enhanced Failover.
+    Enhanced Failover.
     """
     context, page = await launch_browser()
     guard = SessionGuard.get()
@@ -669,12 +592,14 @@ async def run_agent(objective: str):
     except Exception as warmup_err:
         logger.warning("Warm-up routine failed (non-fatal): %s", warmup_err)
 
-    # ── v9.0: ModelRegistry as single source of truth ──
+    # ── v14.0: ModelRegistry as single source of truth ──
     registry = ModelRegistry.get_instance()
-    memory = CampaignMemory()
-    critic = ContentCritic()
+    memory = CampaignMemory()  # Neutral task history recorder
     breaker = registry.breaker  # Shared circuit breaker
     health_tracker = registry.health  # Shared health tracker
+
+    # v14.0: Auto-allow domains mentioned in the objective
+    auto_allow_from_objective(objective)
 
     # Agents pull from ModelRegistry automatically
     vision_agent = VisionAgent()
@@ -692,22 +617,8 @@ async def run_agent(objective: str):
     logger.info("LLM Failover Chain (%d models): %s", len(failover_chain), " → ".join(chain_names))
     logger.info("Objective: %s", objective[:200])
 
-    # ── v10.0: Content Store — separate long articles from objective ──
-    store = ContentStore(base_dir=Path(__file__).parent / "persistence")
-    llm_objective, has_article = store.load_from_objective(objective)
-    if has_article:
-        logger.info(
-            "📄 Article loaded: title='%s' | body=%d chars | platform=%s",
-            store.get_title()[:60], len(store.get_body()), store.article.target_platform,
-        )
-        logger.info("📄 Shortened objective for LLM (%d chars)", len(llm_objective))
-    else:
-        llm_objective = objective
-
-    # ── Campaign memory context ──
-    campaign_log = memory.get_campaign_log(limit=5)
-    if campaign_log:
-        logger.info("Campaign history: %s", memory.get_summary())
+    # v14.0: Pass objective through to the LLM verbatim — no ContentStore rewriting
+    llm_objective = objective
 
     # ── v2.0: Mission Planner → PlanState (fixes B-01 amnesia, B-10 dead checkpoints) ──
     mission_checkpoints = await _decompose_objective(llm_objective, failover_chain, breaker, health_tracker)
@@ -718,32 +629,75 @@ async def run_agent(objective: str):
     for s in plan.steps:
         logger.info("  [%d] %s", s["id"] + 1, s["desc"])
 
+    # ── Phase 2: PRM Checklist Generation ──
+    prm_critic: PRMCritic | None = None
+    prm_checklist: list[ChecklistItem] = []
+    try:
+        prm_critic = PRMCritic(_invoke_with_failover, failover_chain, breaker, health_tracker)
+        prm_checklist = await prm_critic.generate_checklist(llm_objective)
+        logger.info("📋 PRM Checklist (%d items) generated", len(prm_checklist))
+    except Exception as e:
+        logger.warning("PRM checklist generation failed (non-fatal): %s", e)
+
+    # ── Phase 1: WebDreamer Initialization ──
+    dreamer: WebDreamer | None = None
+    try:
+        dreamer = WebDreamer(
+            invoke_fn=_invoke_with_failover,
+            failover_chain=failover_chain,
+            breaker=breaker,
+            health_tracker=health_tracker,
+            num_candidates=3,
+            num_simulations=1,
+        )
+        logger.info("🌙 WebDreamer planning engine initialized (k=3, H=1)")
+    except Exception as e:
+        logger.warning("WebDreamer init failed (non-fatal): %s", e)
+
+    # ── Phase 3: Skill Memory — Retrieve relevant workflows ──
+    skill_mem: SkillMemory | None = None
+    skill_context = ""
+    try:
+        skill_mem = SkillMemory()
+        auto_domain = ""
+        for url_part in [llm_objective]:
+            import re as _re
+            url_match = _re.search(r'https?://(?:www\.)?([\w.-]+)', url_part)
+            if url_match:
+                auto_domain = url_match.group(1)
+                break
+        relevant_workflows = skill_mem.retrieve_relevant(llm_objective, domain=auto_domain)
+        skill_context = skill_mem.inject_into_prompt(relevant_workflows)
+        if skill_context:
+            logger.info("🧠 SkillMemory: %d relevant workflows injected into prompt", len(relevant_workflows))
+        stats = skill_mem.get_stats()
+        logger.info("🧠 SkillMemory: %d total workflows, %d reliable, %d domains",
+                    stats['total_workflows'], stats['reliable_workflows'], stats['domains_covered'])
+    except Exception as e:
+        logger.warning("SkillMemory init failed (non-fatal): %s", e)
+
     action_history: deque[str] = deque(maxlen=50)    # Reduced — WorkingMemory handles the rest
     url_history: deque[str] = deque(maxlen=50)         # V-01: bounded ring buffer
     last_action_signature = ""
     consecutive_identical_actions = 0
-    correction_failures = 0  # v9.0: Self-correction streak counter
-    # v2.1: Dynamic budget (RQ-B05) — base + field bonus, extensible on progress
-    base_budget = 20
-    field_bonus = 5 if store.has_article else 0
-    max_steps = base_budget + field_bonus
+    correction_failures = 0  # Self-correction streak counter
+    same_url_streak = 0  # Phase 1: How many steps on same URL
+    last_url_for_streak = ""  # Phase 1: Track URL changes
+    # v14.0: Flat step budget — no publishing bonus
+    max_steps = 25
     step = 0
 
-    # ── v13.0: Form State Machine (replaces phase_tracker aliases) ──
-    form_state = FormState(
-        required_fields={"title", "body"} if store.has_article else {"body"}
-    )
-    # ── v9.0: Progressive State Machine (kept for navigation/submit phases) ──
-    phase_tracker = AgentPhaseTracker()
-    # Backwards compat aliases (kept for code paths that still read them)
-    completed_phases = phase_tracker.phases
-    typed_text_content = ""
+    # ── v14.0: General-purpose progress tracker (no publishing phases) ──
+    progress_tracker = TaskProgressTracker()
 
     # ── v13.0: Triple-state loop detector (RQ-12) ──
     _loop_window: deque[tuple] = deque(maxlen=6)
 
     # ── v2.0: CriticV12 (RQ-B03) — replaces dead hash verifier ──
     progress_critic: CriticV12 | None = None  # initialized after page is ready
+
+    # ── Phase 0: Action Verifier for post-action DOM diff + React recheck ──
+    action_verifier: ActionVerifier | None = None
 
     try:
         for step in range(max_steps):
@@ -770,6 +724,11 @@ async def run_agent(objective: str):
                 progress_critic = CriticV12(page)
                 logger.info("🧠 CriticV12 initialized (6-signal progress detection)")
 
+            # ── Phase 0: Initialize ActionVerifier ──
+            if action_verifier is None:
+                action_verifier = ActionVerifier(page)
+                logger.info("🔍 ActionVerifier initialized (DOM diff + React recheck)")
+
             # ── Anti-Loop Watchdog v13: (url, dom_fp, action_sig) triple ──
             url_history.append(current_url)
             loop_context = ""
@@ -778,29 +737,50 @@ async def run_agent(objective: str):
                 url_counts = Counter(recent_urls)
                 most_common_url, visit_count = url_counts.most_common(1)[0]
                 if visit_count >= 3:
-                    logger.warning(
-                        "🔄 LOOP DETECTED: '%s' visited %d times in last 6 steps!",
-                        most_common_url, visit_count,
-                    )
-                    loop_context = (
-                        f"\n\n⚠️ CRITICAL LOOP WARNING: You have visited '{most_common_url}' "
-                        f"{visit_count} times in the last 6 steps. You are stuck. "
-                        "STOP and THINK deeply: Why are you repeating the same navigation? "
-                        "Your previous approach is NOT working. You MUST try a DIFFERENT strategy: "
-                        "scroll to reveal hidden elements, wait for dynamic content to load, "
-                        "click a different element, or re-evaluate whether the goal is already achieved. "
-                        "Do NOT repeat the same action you just tried."
-                    )
+                    # V15.0 F7: Smart loop detection — check action DIVERSITY before flagging
+                    # On form pages, agent legitimately stays on same URL for 4+ steps
+                    # (type title → type body → click submit). That's NOT a loop.
+                    FORM_URL_PATTERNS = ('/submit', '/compose', '/new', '/create',
+                                         '/checkout', '/form', '/editor', '/settings',
+                                         '/cart', '/review')
+                    is_form_page = any(p in most_common_url for p in FORM_URL_PATTERNS)
 
-            # ── Determine Context-Aware Target Hint for Sniper Mode ──
+                    # Check action diversity: same action on same target = loop
+                    # Different actions on different targets = form fill (OK)
+                    recent_actions_strs = list(action_history)[-6:] if len(action_history) >= 6 else list(action_history)
+                    unique_action_targets = set()
+                    for entry in recent_actions_strs:
+                        # Extract "type at (x,y)" or "click at (x,y)" pattern
+                        import re as _re
+                        _match = _re.search(r'(type|click|scroll)\s+at\s+\((\d+),(\d+)\)', entry)
+                        if _match:
+                            unique_action_targets.add(f"{_match.group(1)}_{_match.group(2)}_{_match.group(3)}")
+
+                    has_action_diversity = len(unique_action_targets) >= 2
+
+                    if is_form_page and has_action_diversity:
+                        # Agent is filling a form — different actions on different fields. Not a loop.
+                        logger.debug(
+                            "🔄 Same URL '%s' %d times but form page with diverse actions — not a loop",
+                            most_common_url[:60], visit_count,
+                        )
+                    else:
+                        logger.warning(
+                            "🔄 LOOP DETECTED: '%s' visited %d times in last 6 steps!",
+                            most_common_url, visit_count,
+                        )
+                        loop_context = (
+                            f"\n\n⚠️ CRITICAL LOOP WARNING: You have visited '{most_common_url}' "
+                            f"{visit_count} times in the last 6 steps. You are stuck. "
+                            "STOP and THINK deeply: Why are you repeating the same navigation? "
+                            "Your previous approach is NOT working. You MUST try a DIFFERENT strategy: "
+                            "scroll to reveal hidden elements, wait for dynamic content to load, "
+                            "click a different element, or re-evaluate whether the goal is already achieved. "
+                            "Do NOT repeat the same action you just tried."
+                        )
+
+            # v14.0: No target_hint bias — DOM parser extracts ALL interactive elements neutrally
             target_hint = None
-            if store.has_article:
-                if not phase_tracker.is_done("title_filled"):
-                    target_hint = "title"
-                elif not phase_tracker.is_done("body_filled"):
-                    target_hint = "body"
-                elif not phase_tracker.is_done("submit_clicked"):
-                    target_hint = "submit"
 
             # ═══ TIER 1: God-Mode DOM Parser V11 (instant, ~50ms) ═══
             dom_data = await dom_parser.extract(page, target_hint=target_hint, timeout=5.0)
@@ -845,30 +825,44 @@ async def run_agent(objective: str):
                 () => {
                     const url = window.location.href;
                     const body = document.body ? document.body.innerText.slice(0, 500) : '';
-                    const hasProfile = !!document.querySelector('[data-testid="AppTabBar_Profile_Link"], [aria-label="Profile"], img[alt*="profile" i]');
-                    const hasCompose = !!document.querySelector('[data-testid="tweetTextarea_0"], [data-testid="tweetButtonInline"], [aria-label="Post"]');
-                    const hasFeed = !!document.querySelector('[data-testid="primaryColumn"], [data-testid="tweet"]');
-                    const hasLoginForm = !!document.querySelector('input[name="text"], input[name="password"], [data-testid="LoginForm_Login_Button"]');
+                    // Generic profile/auth indicators
+                    const hasProfile = !!document.querySelector(
+                        '[aria-label*="profile" i], [aria-label*="account" i], '
+                        + 'img[alt*="avatar" i], img[alt*="profile" i], '
+                        + '[data-testid*="profile" i], [data-testid*="user" i], '
+                        + '.user-menu, .profile-menu, #user-nav'
+                    );
+                    // Generic login form indicators (valid CSS only — no :has-text)
+                    let hasLoginForm = !!document.querySelector(
+                        'input[type="password"], '
+                        + 'form[action*="login" i], form[action*="signin" i]'
+                    );
+                    // Check for sign-in/log-in buttons via textContent (CSS can't do this)
+                    if (!hasLoginForm) {
+                        const buttons = document.querySelectorAll('button, a[role="button"], input[type="submit"]');
+                        for (const btn of buttons) {
+                            const txt = (btn.textContent || '').trim().toLowerCase();
+                            if (txt === 'sign in' || txt === 'log in' || txt === 'login' || txt === 'signin') {
+                                hasLoginForm = true;
+                                break;
+                            }
+                        }
+                    }
                     return {
                         url: url,
                         hasProfile: hasProfile,
-                        hasCompose: hasCompose,
-                        hasFeed: hasFeed,
                         hasLoginForm: hasLoginForm
                     };
                 }
                 """), timeout=5.0)
 
-                if login_state.get("hasProfile") or login_state.get("hasFeed") or login_state.get("hasCompose"):
+                if login_state.get("hasProfile"):
                     login_hint = (
-                        "\n\n🔑 LOGIN STATUS: You are ALREADY LOGGED IN. "
-                        "Profile icon and/or feed content detected. "
-                        "DO NOT attempt to log in again. Skip any login steps and proceed directly to your goal."
+                        "\n\n🔑 LOGIN STATUS: You appear to be LOGGED IN. "
+                        "Profile/account indicators detected. "
+                        "DO NOT attempt to log in again. Proceed directly to your goal."
                     )
-                    if login_state.get("hasCompose"):
-                        login_hint += " A tweet compose area is available on this page."
-                    logger.info("🔑 Login detected: profile=%s feed=%s compose=%s",
-                                login_state.get("hasProfile"), login_state.get("hasFeed"), login_state.get("hasCompose"))
+                    logger.info("🔑 Login detected: profile=%s", login_state.get("hasProfile"))
                 elif login_state.get("hasLoginForm"):
                     login_hint = "\n\n🔑 LOGIN STATUS: You are NOT logged in. A login form is visible."
                     logger.info("🔑 Login form detected — user is logged out")
@@ -883,7 +877,7 @@ async def run_agent(objective: str):
             facts_context = working_mem.render_facts()
 
             system_prompt = (
-                "You are an elite autonomous web agent with FULL CREATIVE FREEDOM. "
+                "You are an autonomous browser automation agent. "
                 "You operate inside a real Chromium browser and control it through actions.\n\n"
 
                 "═══ YOUR CURRENT PLAN ═══\n"
@@ -891,61 +885,55 @@ async def run_agent(objective: str):
 
                 + (f"═══ WHAT YOU KNOW ═══\n{facts_context}\n\n" if facts_context else "")
 
-                + "═══ CORE IDENTITY ═══\n"
-                "You are an INDEPENDENT THINKER, not a step-follower. "
-                "The user gives you a GOAL (their intent). Any numbered steps they provide are "
-                "SUGGESTIONS, not commands. YOU decide the actual actions based on what you SEE.\n\n"
+                + "═══ CORE RULES ═══\n"
+                "1. READ the user's objective carefully. Do EXACTLY what they ask — "
+                "nothing more, nothing less. NEVER invent tasks the user didn't ask for.\n"
+                "2. OBSERVE the page before acting. Describe what you see.\n"
+                "3. THINK about which action brings you closer to the goal. "
+                "Consider at least 2 possible actions and explain why you chose one.\n"
+                "4. ACT with one precise action per turn.\n"
+                "5. If a popup, overlay, modal, or cookie banner blocks you, DISMISS IT FIRST.\n"
+                "6. If an action FAILED (visible in action history), do NOT repeat it. Try an alternative approach.\n"
+                "7. SCROLL if you can't find the target element — it may be below the fold.\n"
+                "8. Use 'wait' (1000-2000ms) after clicks that trigger page loads.\n"
+                "9. When the goal is FULLY achieved, output action_type='done' immediately.\n"
+                "10. When the user provides specific text to type, type it EXACTLY as given.\n\n"
 
-                "═══ OBSERVE-THINK-ACT LOOP ═══\n"
+                "═══ OBSERVE-THINK-ACT FORMAT ═══\n"
                 "Every turn you MUST:\n"
-                "1. OBSERVE: Describe what you actually see on screen (screen_state field).\n"
-                "   - Is this a login page? A feed? A compose dialog? An error?\n"
-                "   - Are there popups, overlays, cookie banners, or CAPTCHAs blocking you?\n"
-                "   - Is the user logged in or logged out? Look for profile icons, usernames, feeds.\n"
-                "2. THINK: Reason through the situation (previous_action_result + goal_progress + reasoning).\n"
+                "1. OBSERVE: Describe what you see on screen (screen_state).\n"
+                "   - What kind of page is this? What are the key visible elements?\n"
+                "   - Are there any blocking elements (popups, overlays)?\n"
+                "2. THINK: Evaluate your last action, assess progress, reason about next step.\n"
                 "   - Did your last action work? How do you know?\n"
                 "   - What fraction of the goal is done? What remains?\n"
-                "   - Consider at least 2 possible next actions and explain why you chose one.\n"
-                "3. ACT: Execute exactly ONE action based on your reasoning.\n\n"
-
-                "═══ AUTONOMOUS INTELLIGENCE RULES ═══\n"
-                "• NEVER blindly follow user steps if the screen shows a different state. "
-                "If the user says 'login' but you see a feed with a profile icon, you are ALREADY logged in — skip login.\n"
-                "• If an action FAILED (you can see from action history), do NOT repeat it. Try an alternative approach.\n"
-                "• If you see a popup, overlay, modal, or cookie banner, HANDLE IT FIRST before continuing your main task.\n"
-                "• ARTICLES: For long articles, the content is pre-loaded. Type ONLY the title into the title field. "
-                "For the body/content field, just click on it with a type action — the system will auto-inject the full article.\n"
-                "• MULTI-FIELD FORMS: On platforms like dev.to, there are SEPARATE title and body fields. "
-                "Fill the TITLE first, then click the BODY field. Do NOT re-type the title.\n"
-                "• If the FIELD STATUS says 'All fields filled', your ONLY remaining action is to click Publish/Submit.\n"
-                "• SCROLL if you cannot find the target element in the vision map — it may be below the fold.\n"
-                "• Use 'wait' (1000-2000ms) after clicks that trigger page loads or dynamic content.\n"
-                "• When the goal is FULLY achieved, output action_type='done' immediately. Do not take unnecessary extra steps.\n"
-                "• PLATFORM LIMITS: Twitter/X = 280 chars max. Reddit titles = 300. Keep text within limits.\n"
-                "• EXACT TEXT: When the user provides specific text to post, type it EXACTLY as given. Do NOT rewrite, shorten, or modify it.\n"
-                "• After typing text, your NEXT action should be to CLICK the submit/post button. Do not re-type.\n\n"
+                "3. ACT: Execute exactly ONE action.\n\n"
 
                 "═══ PAGE STRUCTURE (Semantic Markdown) ═══\n"
-                "You receive a compressed Markdown map of all interactive elements, grouped by their semantic container (form, nav, header, etc). "
+                "You receive a semantic map of all interactive elements. "
                 "Each element has: [eN] id, kind, label, and (x,y) coordinates. "
-                "Use the element_id field (e.g., 'e5') to reference elements — coordinates will be resolved automatically. "
-                "Use the container grouping to understand which elements belong together.\n\n"
+                "Use the element_id field (e.g., 'e5') to reference elements — coordinates are resolved automatically.\n\n"
 
                 "═══ AVAILABLE ACTIONS ═══\n"
                 "goto — Navigate to a URL (set url field)\n"
                 "click — Click element (PREFERRED: set element_id like 'e5'; fallback: set x, y)\n"
                 "type — Click then type (PREFERRED: set element_id + text; fallback: x, y + text)\n"
                 "scroll — Scroll down to reveal more content\n"
-                "press_enter — Press Enter key (e.g., to submit a form)\n"
+                "press_enter — Press Enter key (e.g., to submit a search or form)\n"
                 "wait — Wait for content to load (set wait_ms, default 1000)\n"
                 "done — Goal achieved, stop execution\n"
             )
+
+            # ── Phase 3: Inject learned workflows into system prompt ──
+            if skill_context:
+                system_prompt += f"\n\n{skill_context}"
 
             # ════════════════════════════════════════════════════════════════
             #  USER PROMPT — Intent + Context + Vision Map
             # ════════════════════════════════════════════════════════════════
             # ── v9.0: Consolidated State Override ──
-            state_override = phase_tracker.get_state_override(store.has_article)
+            # ── v14.0: Neutral progress state ──
+            state_override = progress_tracker.get_state_override()
 
             # ── Hard Action Dedup: break repetition loops ──
             dedup_override = ""
@@ -1000,6 +988,100 @@ async def run_agent(objective: str):
             logger.info("🧠 REASONING: %s", decision.reasoning[:200])
             logger.info("⚡ ACTION: %s", decision.action_type)
 
+            # ── Phase 1: Track same-URL streak for WebDreamer gate ──
+            if current_url == last_url_for_streak:
+                same_url_streak += 1
+            else:
+                same_url_streak = 0
+                last_url_for_streak = current_url
+                if dreamer:
+                    dreamer.clear_cache()  # Clear sim cache on navigation
+
+            # ── Phase 0: Action Risk Classification ──
+            target_name = ""
+            if decision.element_id and decision.element_id in selector_map:
+                el_data = selector_map[decision.element_id]
+                target_name = el_data.get("name", el_data.get("text", ""))[:60]
+            action_risk = classify_action(
+                action_type=decision.action_type,
+                target_name=target_name,
+                target_text=decision.text[:60] if decision.text else "",
+                url=current_url,
+                element_kind=selector_map.get(decision.element_id, {}).get("kind", "") if decision.element_id else "",
+            )
+            if action_risk != ActionRisk.REVERSIBLE:
+                logger.info("⚠️ ACTION RISK: %s", action_risk.name)
+
+            # ── Phase 1: WebDreamer Simulate-Before-Acting Gate ──
+            if dreamer and decision.action_type not in ("done", "wait"):
+                invoke_dreamer = should_invoke_dreamer(
+                    element_count=dom_data.get("element_count", 0),
+                    action_risk_level=action_risk.name,
+                    consecutive_no_progress=correction_failures,
+                    step_number=step,
+                    same_url_streak=same_url_streak,
+                )
+                if invoke_dreamer:
+                    try:
+                        logger.info("🌙 WebDreamer: Simulating %d candidates before acting...", 3)
+                        proposed_candidate = CandidateAction(
+                            action_type=decision.action_type,
+                            element_id=decision.element_id,
+                            text=decision.text,
+                            url=decision.url,
+                            x=decision.x,
+                            y=decision.y,
+                            reasoning=decision.reasoning,
+                        )
+                        dreamer_result = await asyncio.wait_for(
+                            dreamer.plan_and_select(
+                                dom_markdown=dom_markdown,
+                                objective=llm_objective,
+                                plan_context=plan.render(),
+                                action_history=working_mem.compress_history(),
+                                current_url=current_url,
+                                proposed_action=proposed_candidate,
+                            ),
+                            timeout=60.0,
+                        )
+
+                        # Override decision if WebDreamer found a better action
+                        best = dreamer_result.best_action
+                        if dreamer_result.best_score >= 0.4:
+                            # Map WebDreamer candidate back to AutonomousAction fields
+                            if best.action_type != decision.action_type or best.element_id != decision.element_id:
+                                logger.info(
+                                    "🌙 WebDreamer OVERRIDE: %s (score=%.2f) replaces %s",
+                                    best.describe(), dreamer_result.best_score,
+                                    decision.action_type,
+                                )
+                                decision.action_type = best.action_type
+                                if best.element_id:
+                                    decision.element_id = best.element_id
+                                    # Re-resolve coordinates from selector_map
+                                    if best.element_id in selector_map:
+                                        coords = selector_map[best.element_id]
+                                        decision.x = coords.get("x", decision.x)
+                                        decision.y = coords.get("y", decision.y)
+                                if best.text:
+                                    decision.text = best.text
+                                if best.url:
+                                    decision.url = best.url
+                            else:
+                                logger.info(
+                                    "🌙 WebDreamer CONFIRMS: %s (score=%.2f)",
+                                    best.describe(), dreamer_result.best_score,
+                                )
+                        else:
+                            logger.warning(
+                                "🌙 WebDreamer: All candidates scored low (best=%.2f). Proceeding with original.",
+                                dreamer_result.best_score,
+                            )
+                    except asyncio.TimeoutError:
+                        logger.warning("🌙 WebDreamer timed out — proceeding with original decision")
+                    except Exception as dreamer_err:
+                        logger.warning("🌙 WebDreamer error (non-fatal): %s", dreamer_err)
+
             # ── Build enriched action history entry ──
             summary = f"Step {step+1}: {decision.action_type}"
             if decision.x is not None and decision.y is not None:
@@ -1025,7 +1107,6 @@ async def run_agent(objective: str):
             action_outcome = "→ OK"
 
             # ── Execute ──
-            intercepted_by_smart_engine = False
             metrics.total_actions += 1  # v2.1: Track total actions
 
             # v2.1: MemGPT eviction check at start of each action
@@ -1033,7 +1114,7 @@ async def run_agent(objective: str):
 
             if decision.action_type == "done":
                 # v2.1: CoVe pre-done check (RQ-B10) — block premature done
-                cove_ok, cove_reason = await cove_pre_done_check(page, plan, working_mem)
+                cove_ok, cove_reason = await cove_pre_done_check(page, plan, working_mem, objective)
                 if not cove_ok:
                     logger.warning("🛡️ CoVe BLOCKED premature done: %s", cove_reason)
                     action_history.append(f"Step {step+1}: done BLOCKED — {cove_reason}")
@@ -1041,6 +1122,7 @@ async def run_agent(objective: str):
                     metrics.done_blocked += 1
                     continue
                 logger.info("✅ Goal Achieved! (CoVe verified: %s)", cove_reason[:60])
+                progress_tracker.mission_success = True
                 break
 
             elif decision.action_type == "goto":
@@ -1086,153 +1168,58 @@ async def run_agent(objective: str):
                     metrics.grounding_rejects += 1
                     continue
 
-                # ══════════════════════════════════════════════════════════
-                #  v10.0: Smart Content Injection Engine
-                # ══════════════════════════════════════════════════════════
-                is_article_mode = store.has_article
-                intercepted_by_smart_engine = False
+                # V15.2: Scroll target element into viewport center before action
+                if decision.element_id:
+                    try:
+                        await page.evaluate("""(eid) => {
+                            const el = document.querySelector(`[data-eid="${eid}"]`);
+                            if (el) el.scrollIntoView({behavior: 'smooth', block: 'center'});
+                        }""", decision.element_id)
+                        await asyncio.sleep(0.5)  # Let scroll settle
+                    except Exception as e:
+                        logger.debug("Failed to scroll element %s into view: %s", decision.element_id, e)
 
-                if is_article_mode and not phase_tracker.is_done("all_fields_ready"):
-                    # ── Detect which field we're targeting ──
-                    form_data = await dom_parser.detect_form_fields(page)
-                    title_field = dom_parser.find_field(form_data, "title")
-                    body_field = dom_parser.find_field(form_data, "body")
+                # v14.0: No content injection engine — LLM decides what to type/click
 
-                    target_is_title = False
-                    target_is_body = False
-
-                    if title_field and not phase_tracker.is_done("title_filled"):
-                        tdist = abs(decision.y - title_field["y"]) + abs(decision.x - title_field["x"])
-                        if tdist < 200:
-                            target_is_title = True
-                    if body_field and not phase_tracker.is_done("body_filled"):
-                        bdist = abs(decision.y - body_field["y"]) + abs(decision.x - body_field["x"])
-                        if bdist < 200:
-                            target_is_body = True
-
-                    # (Removed heuristic fallback that wrongly triggered on Publish button)
-
-
-                    if target_is_title:
-                        intercepted_by_smart_engine = True
-                        # ── TITLE: Use ghost_type ──
-                        title_text = store.get_title()
-                        logger.info("📝 TITLE INJECTION: '%s' (%d chars) at (%d, %d)",
-                                    title_text[:60], len(title_text), decision.x, decision.y)
-                        try:
-                            await ghost_click(page, decision.x, decision.y)
-                            await asyncio.sleep(0.3)
-                            await page.keyboard.press("Control+A")
-                            await asyncio.sleep(0.1)
-                            await page.keyboard.press("Delete")
-                            await asyncio.sleep(0.2)
-                            await page.keyboard.insert_text(title_text)
-                            await asyncio.sleep(0.3)
-
-                            audit = await dom_parser.audit_form_fields(page)
-                            title_audit = audit.get("title", {})
-                            if title_audit.get("found") and title_audit.get("length", 0) > 0:
-                                logger.info("✅ TITLE VERIFIED: %d chars — '%s'",
-                                            title_audit["length"], title_audit.get("value", "")[:60])
-                                phase_tracker.mark("title_filled")
-                                phase_tracker.title_content = title_text
-                                phase_tracker.typed_text = title_text
-                                completed_phases["title_filled"] = True
-                                action_outcome = f"→ TITLE OK ({title_audit['length']} chars)"
-                            else:
-                                logger.warning("⚠️ TITLE UNVERIFIED — field not found after typing")
-                                phase_tracker.mark("title_filled")
-                                phase_tracker.title_content = title_text
-                                completed_phases["title_filled"] = True
-                                action_outcome = "→ TITLE typed (unverified)"
-
-                            _record_phase_transition(memory, "unknown", objective, page.url, step, "title_filled")
-                        except Exception as e:
-                            logger.warning("Title typing failed: %s", e)
-                            action_outcome = f"→ FAILED: {e}"
-
-                    elif target_is_body:
-                        intercepted_by_smart_engine = True
-                        # ── BODY: Direct injection ──
-                        body_text = store.get_body()
-                        logger.info("📄 BODY INJECTION: %d chars via insert_text at (%d, %d)",
-                                    len(body_text), decision.x, decision.y)
-                        try:
-                            await ghost_click(page, decision.x, decision.y)
-                            await asyncio.sleep(0.5)
-                            await page.keyboard.press("Control+A")
-                            await asyncio.sleep(0.1)
-                            await page.keyboard.press("Delete")
-                            await asyncio.sleep(0.2)
-                            # Direct injection — Instant and rate-limit safe via JS evaluation + input events
-                            try:
-                                await page.evaluate('''
-                                    (text) => {
-                                        const el = document.activeElement;
-                                        if (!el) return;
-                                        if (typeof el.value !== "undefined") {
-                                            const nativeSetter = Object.getOwnPropertyDescriptor(
-                                                window.HTMLTextAreaElement.prototype, "value"
-                                            )?.set || Object.getOwnPropertyDescriptor(
-                                                window.HTMLInputElement.prototype, "value"
-                                            )?.set;
-                                            if (nativeSetter) {
-                                                nativeSetter.call(el, text);
-                                            } else {
-                                                el.value = text;
-                                            }
-                                            el.dispatchEvent(new Event('input', { bubbles: true }));
-                                            el.dispatchEvent(new Event('change', { bubbles: true }));
-                                        } else if (el.isContentEditable) {
-                                            el.textContent = text;
-                                            el.dispatchEvent(new Event('input', { bubbles: true }));
-                                        }
-                                    }
-                                ''', body_text)
-                                await asyncio.sleep(0.5)
-                            except Exception as js_err:
-                                logger.warning("JS direct injection failed (%s), falling back to insert_text", js_err)
-                                await page.keyboard.insert_text(body_text)
-                            
-                            await asyncio.sleep(1.0)
-
-                            audit = await dom_parser.audit_form_fields(page)
-                            body_audit = audit.get("body", {})
-                            if body_audit.get("found") and body_audit.get("length", 0) > 100:
-                                logger.info("✅ BODY VERIFIED: %d chars injected", body_audit["length"])
-                                phase_tracker.mark("body_filled")
-                                phase_tracker.body_content = body_text
-                                completed_phases["body_filled"] = True
-                                action_outcome = f"→ BODY OK ({body_audit['length']} chars)"
-                            else:
-                                logger.warning("⚠️ BODY INJECTION PARTIAL: audit=%d chars", body_audit.get("length", 0))
-                                phase_tracker.mark("body_filled")
-                                phase_tracker.body_content = body_text
-                                completed_phases["body_filled"] = True
-                                action_outcome = f"→ BODY injected (audit: {body_audit.get('length', 0)} chars)"
-
-                            _record_phase_transition(memory, "unknown", objective, page.url, step, "body_filled")
-                        except Exception as e:
-                            logger.warning("Body injection failed: %s", e)
-                            action_outcome = f"→ FAILED: {e}"
-
-                    if phase_tracker.is_done("title_filled") and phase_tracker.is_done("body_filled"):
-                        if not phase_tracker.is_done("all_fields_ready"):
-                            phase_tracker.mark("all_fields_ready")
-                            completed_phases["all_fields_ready"] = True
-                            logger.info("🎯 ALL ARTICLE FIELDS READY — awaiting submit click")
-
-                if intercepted_by_smart_engine:
-                    pass # We handled it above
-                elif decision.action_type == "click":
+                if decision.action_type == "click":
                     logger.info("Clicking at (%d, %d)", decision.x, decision.y)
                     try:
-                        # V-14: Timeout-wrapped ghost_click
-                        await asyncio.wait_for(
-                            ghost_click(page, decision.x, decision.y), timeout=15.0
+                        # UCRF: Pre-flight overlay detection before click
+                        penetration = await smart_click_with_penetration(
+                            page, decision.x, decision.y
                         )
+                        if penetration.get("overlay_bypassed"):
+                            logger.info(
+                                "🎯 Overlay penetrated at (%d, %d) via %s",
+                                decision.x, decision.y, penetration.get("method", "?")
+                            )
+                            # Small delay to let pointer-events disable take effect
+                            await asyncio.sleep(0.1)
+
+                        # Phase 0: Humanized mouse movement + CDP native click
+                        # Step 1: Move mouse along Bézier curve to target
+                        await ghost_move_to(page, decision.x, decision.y)
+
+                        # Step 2: Dispatch click via CDP resilient waterfall
+                        click_result = await asyncio.wait_for(
+                            resilient_click(
+                                page, decision.x, decision.y,
+                                max_retries=4, settle_ms=800,
+                            ),
+                            timeout=30.0,
+                        )
+                        if click_result.success:
+                            action_outcome = (
+                                f"→ OK (click via {click_result.strategy}"
+                                f"{', navigated' if click_result.navigation else ''}"
+                                f"{', DOM changed' if click_result.dom_changed else ''})"
+                            )
+                        else:
+                            action_outcome = f"→ CLICK INEFFECTIVE: {click_result.error[:80]}"
+                            logger.warning("Click had no effect after %d strategies", click_result.attempts)
+
                     except asyncio.TimeoutError:
-                        logger.warning("ghost_click timed out at (%d,%d) — page may be frozen", decision.x, decision.y)
+                        logger.warning("resilient_click timed out at (%d,%d) — page may be frozen", decision.x, decision.y)
                         action_history.append(f"Step {step+1}: click TIMEOUT at ({decision.x},{decision.y})")
                         continue
                     except Exception as e:
@@ -1240,118 +1227,37 @@ async def run_agent(objective: str):
                         action_outcome = f"→ FAILED: {e}"
                 elif decision.action_type == "type":
                     # ══════════════════════════════════════════════════════════
-                    #  Standard typing (tweets, short posts, etc.)
+                    #  UCRF: Multi-strategy CDP typing with waterfall & verify
                     # ══════════════════════════════════════════════════════════
                     text_to_type = decision.text or ""
-                    # V-06: Proper URL-based platform char limits
-                    max_chars = get_char_limit(current_url)
-
-                    if len(text_to_type) > max_chars:
-                        logger.warning(
-                            "⚠️ Text too long (%d chars) for platform limit (%d). Truncating.",
-                            len(text_to_type), max_chars,
-                        )
-                        text_to_type = text_to_type[:max_chars]
-
-                    # ── Content Critic: ONLY for agent-generated content ──
-                    objective_lower = objective.lower()
-                    words_in_objective = sum(1 for w in text_to_type.split() if w.lower() in objective_lower)
-                    text_from_user = words_in_objective >= len(text_to_type.split()) * 0.5
-
-                    if len(text_to_type) > 100 and not text_from_user:
-                        logger.info("Content Critic: reviewing %d-char AGENT-GENERATED body...", len(text_to_type))
-                        try:
-                            verdict = await critic.review(
-                                content=text_to_type,
-                                platform=current_url,
-                                failover_chain=failover_chain,
-                                invoke_fn=_invoke_with_failover,
-                            )
-                            if not verdict.approved and verdict.rewritten_content:
-                                rewritten = verdict.rewritten_content
-                                if len(rewritten) <= max_chars:
-                                    logger.info(
-                                        "Critic rewrote content (tone=%.2f, issues=%d): %s",
-                                        verdict.tone_score, len(verdict.issues),
-                                        "; ".join(verdict.issues[:3]),
-                                    )
-                                    text_to_type = rewritten
-                                else:
-                                    logger.warning(
-                                        "Critic rewrite (%d chars) exceeds %d limit — using original",
-                                        len(rewritten), max_chars,
-                                    )
-                            elif verdict.approved:
-                                logger.info("Critic approved content (tone=%.2f)", verdict.tone_score)
-                        except Exception as e:
-                            logger.warning("Critic review failed: %s — using original content", e)
-                    elif text_from_user:
-                        logger.info("📝 User-provided text detected — skipping critic review")
 
                     logger.info("Typing '%s' (%d chars) at (%d, %d)", text_to_type[:80], len(text_to_type), decision.x, decision.y)
                     try:
-                        # Click to focus the field
-                        await ghost_click(page, decision.x, decision.y)
-                        await asyncio.sleep(0.3)
-
-                        # Clear existing content
-                        await page.mouse.click(decision.x, decision.y, click_count=3)
-                        await asyncio.sleep(0.15)
-                        await page.keyboard.press("Backspace")
-                        await asyncio.sleep(0.15)
-                        await page.keyboard.press("Control+A")
-                        await asyncio.sleep(0.1)
-                        await page.keyboard.press("Delete")
-                        await asyncio.sleep(0.2)
-
-                        # INSTANT FILL — replace slow ghost_type with insert_text
-                        await page.keyboard.insert_text(text_to_type)
-                        await asyncio.sleep(0.3)
-
-                        # ── Post-Type Verification ──
-                        try:
-                            audit = await dom_parser.audit_form_fields(page)
-                            # Check title first, then body, then generic
-                            t = audit.get("title", {})
-                            b = audit.get("body", {})
-                            verified_len = max(t.get("length", 0), b.get("length", 0))
-                            if verified_len > 0:
-                                logger.info("✅ TYPE VERIFIED: %d chars in field", verified_len)
-                                phase_tracker.mark("title_filled")
-                                phase_tracker.typed_text = text_to_type
-                                completed_phases["title_filled"] = True
-                                typed_text_content = text_to_type
-                                action_outcome = f"→ OK (verified: {verified_len} chars)"
-                                _record_phase_transition(memory, "unknown", objective, page.url, step, "title_filled")
-                            else:
-                                # Fallback: try the old selector method
-                                verify_result = await asyncio.wait_for(page.evaluate("""
-                                () => {
-                                    const el = document.querySelector('[data-testid="tweetTextarea_0"], [contenteditable="true"], textarea:focus, input:focus');
-                                    if (el) {
-                                        const text = el.textContent || el.value || '';
-                                        return { found: true, length: text.length, preview: text.slice(0, 100) };
-                                    }
-                                    return { found: false, length: 0, preview: '' };
-                                }
-                                """), timeout=3.0)
-                                if verify_result.get("found") and verify_result.get("length", 0) > 0:
-                                    logger.info("✅ TYPE VERIFIED (fallback): %d chars — '%s'",
-                                                verify_result["length"], verify_result["preview"][:60])
-                                    phase_tracker.mark("title_filled")
-                                    phase_tracker.typed_text = text_to_type
-                                    completed_phases["title_filled"] = True
-                                    typed_text_content = text_to_type
-                                    action_outcome = f"→ OK (verified: {verify_result['length']} chars)"
-                                else:
-                                    logger.warning("⚠️ TYPE UNVERIFIED: field not found or empty after typing")
-                                    action_outcome = "→ PARTIAL (field not verified)"
-                        except Exception as verify_err:
-                            logger.warning("Type verification failed: %s", verify_err)
-                            phase_tracker.mark("title_filled")
-                            phase_tracker.typed_text = text_to_type
-                            completed_phases["title_filled"] = True
-                            typed_text_content = text_to_type
+                        type_result = await asyncio.wait_for(
+                            resilient_type(
+                                page,
+                                text_to_type,
+                                x=decision.x,
+                                y=decision.y,
+                                clear_first=True,
+                                max_retries=3,
+                            ),
+                            timeout=60.0,  # Allow up to 60s for long text with retries
+                        )
+                        if type_result["success"]:
+                            logger.info(
+                                "✅ TYPE VERIFIED via %s: %d chars (attempt %d)",
+                                type_result["strategy"],
+                                type_result["actual_length"],
+                                type_result["attempts"],
+                            )
+                            action_outcome = f"→ OK (verified: {type_result['actual_length']} chars via {type_result['strategy']})"
+                        else:
+                            logger.warning("⚠️ TYPE UNVERIFIED: all strategies exhausted")
+                            action_outcome = "→ PARTIAL (type unverified after all strategies)"
+                    except asyncio.TimeoutError:
+                        logger.warning("Type timed out after 60s")
+                        action_outcome = "→ TIMEOUT"
                     except Exception as e:
                         logger.warning("Type failed: %s", e)
                         action_outcome = f"→ FAILED: {e}"
@@ -1423,7 +1329,7 @@ async def run_agent(objective: str):
                 )
                 if verdict.success:
                     correction_failures = 0
-                    phase_tracker.correction_context = ""
+                    progress_tracker.correction_context = ""
                     metrics.critic_progress += 1
                     logger.info("✓ Critic: %s [%.0f%%]", verdict.reason[:100], verdict.confidence * 100)
                     # v2.1: Key-node advancement (RQ-B05)
@@ -1452,7 +1358,7 @@ async def run_agent(objective: str):
                 else:
                     correction_failures += 1
                     metrics.critic_no_progress += 1
-                    phase_tracker.failed_actions.append(
+                    progress_tracker.failed_actions.append(
                         f"Step {step+1}: {decision.action_type} → {verdict.reason[:60]}"
                     )
                     working_mem.record_failure(
@@ -1460,16 +1366,16 @@ async def run_agent(objective: str):
                         verdict.reason[:80],
                     )
                     if verdict.circuit_breaker_triggered:
-                        phase_tracker.correction_context = (
+                        progress_tracker.correction_context = (
                             f"\n\n🛑 CRITIC CIRCUIT BREAKER: {verdict.reason} "
                             "You MUST try a COMPLETELY DIFFERENT approach: scroll, dismiss overlays, wait, or navigate elsewhere."
                         )
                         logger.warning("🛑 Critic circuit breaker: %s", verdict.reason[:100])
                         progress_critic.reset_circuit_breaker()
                     elif correction_failures >= 2:
-                        phase_tracker.correction_context = (
+                        progress_tracker.correction_context = (
                             f"\n\n⚠️ SELF-CORRECTION: Last {correction_failures} actions had NO visible effect. "
-                            f"Failed: {'; '.join(phase_tracker.failed_actions[-3:])}. "
+                            f"Failed: {'; '.join(progress_tracker.failed_actions[-3:])}. "
                             "Try a COMPLETELY DIFFERENT approach: scroll, dismiss overlays, or wait."
                         )
                         logger.warning("🧠 Critic: no progress (streak=%d)", correction_failures)
@@ -1479,7 +1385,7 @@ async def run_agent(objective: str):
                             metrics.reflexion_triggers += 1
                             reflect_prompt = (
                                 f"I attempted {correction_failures} actions with no progress. "
-                                f"Recent failures: {'; '.join(phase_tracker.failed_actions[-3:])}. "
+                                f"Recent failures: {'; '.join(progress_tracker.failed_actions[-3:])}. "
                                 f"Current plan step: {plan._current()['desc'] if plan._current() else 'unknown'}. "
                                 f"What went wrong? What should I try differently?"
                             )
@@ -1502,104 +1408,34 @@ async def run_agent(objective: str):
                         except Exception as ref_err:
                             logger.warning("Reflexion call failed: %s", ref_err)
 
-            # ── v9.0: Phase Transitions + Continuous Campaign Logging ──
-            # ── v13.0: Platform detection via URL parsing (V-06) ──
-            platform = detect_platform(page.url) or "unknown"
+            # v14.0: No publishing-specific phase transitions.
+            # The LLM decides when the task is 'done' via action_type='done'.
 
-            if decision.action_type == "goto" and not phase_tracker.is_done("navigated_to_target"):
-                phase_tracker.mark("navigated_to_target")
-                _record_phase_transition(memory, platform, objective, page.url, step, "navigated")
-
-            # ── v13.0: Submit detection gated on FormState (V-05/V-09) ──
-            is_submit_click = False
-            if decision.action_type == "click" and not intercepted_by_smart_engine:
-                is_submit_click = form_state.ready_to_submit
-
-            if is_submit_click:
-                phase_tracker.mark("submit_clicked")
-                completed_phases["submit_clicked"] = True
-                logger.info("📤 Post button click detected")
-                _record_phase_transition(memory, platform, objective, page.url, step, "submit_clicked")
-
-                # ── Mission Completion: verify and exit gracefully ──
-                await asyncio.sleep(3.0)  # Let the platform process the post
+            # ── Phase 2: PRM Checklist Scoring (dense goal-aware progress) ──
+            if prm_critic and prm_checklist and decision.action_type in ("click", "type", "goto"):
                 try:
-                    post_url = page.url
-
-                    # CRITICAL FIX: Handle /content_disclosure popup on X
-                    # This popup is NOT success — it's a blocker that needs dismissal
-                    if "content_disclosure" in post_url:
-                        logger.warning("⚠️ Content disclosure popup detected — attempting to dismiss")
-                        try:
-                            # Look for dismiss/continue/post buttons in the popup
-                            dismiss_btn = await page.query_selector(
-                                'button:has-text("Post"), button:has-text("Continue"), '
-                                'button:has-text("Got it"), button:has-text("Dismiss"), '
-                                '[data-testid="confirmationSheetConfirm"]'
-                            )
-                            if dismiss_btn:
-                                await dismiss_btn.click()
-                                logger.info("✅ Disclosure popup dismissed")
-                                await asyncio.sleep(3.0)
-                                post_url = page.url  # Re-check URL after dismissal
-                            else:
-                                logger.warning("No dismiss button found in disclosure popup")
-                        except Exception as disc_err:
-                            logger.warning("Disclosure dismissal failed: %s", disc_err)
-
-                    # Check if compose box cleared (post went through) or URL changed
-                    compose_empty = await asyncio.wait_for(page.evaluate("""
-                    () => {
-                        const href = window.location.href;
-                        // On X, the URL stays /compose/post but the box disappears
-                        if (href.includes('twitter.com') || href.includes('x.com')) {
-                            const box = document.querySelector('[data-testid="tweetTextarea_0"]');
-                            return !box || (box.textContent || '').trim().length < 5;
-                        }
-                        // On Reddit, successful post ALWAYS navigates away from /submit
-                        if (href.includes('reddit.com/submit') || href.includes('reddit.com/user/me/submit')) {
-                            return false;
-                        }
-                        // Generic fallback: check if we navigated away from a submit-like URL
-                        if (href.includes('/submit') || href.includes('/compose')) {
-                            return false;
-                        }
-                        return true;
-                    }
-                    """), timeout=3.0)
-
-                    # Only consider it a real success if we're NOT still on a blocker URL
-                    still_blocked = "content_disclosure" in page.url or "compose" in page.url
-                    real_success = compose_empty and not still_blocked
-
-                except Exception:
-                    real_success = False  # Don't assume success on errors
-                    still_blocked = False
-
-                if real_success:
-                    phase_tracker.mark("submit_verified")
-                    _record_phase_transition(memory, platform, objective, page.url, step, "submit_verified")
-                    completed_phases["mission_success"] = True
-
-                    # v10.0: Clean up content store after successful post
-                    if store.has_article:
-                        store.mark_posted()
-
-                    # ── SUCCESS BANNER ──
-                    total_phases = len(phase_tracker.phases)
-                    done_phases = sum(1 for v in phase_tracker.phases.values() if v)
-                    logger.info("")
-                    logger.info("━" * 60)
-                    logger.info("🎯  MISSION ACCOMPLISHED")
-                    logger.info("━" * 60)
-                    logger.info("  Platform:  %s", platform)
-                    logger.info("  URL:       %s", post_url)
-                    logger.info("  Steps:     %d", step + 1)
-                    logger.info("  Phases:    %d/%d (%d%%)", done_phases, total_phases, phase_tracker.progress_pct())
-                    logger.info("  Objective: %s", objective[:80])
-                    logger.info("━" * 60)
-                    logger.info("")
-                    break  # Exit the OTA loop — mission complete
+                    # Re-extract DOM for PRM (shares the post_dom from CriticV12 above)
+                    prm_dom_md = dom_markdown  # Reuse current step's DOM markdown
+                    prm_score = await prm_critic.score_step(
+                        checklist=prm_checklist,
+                        dom_markdown=prm_dom_md,
+                        current_url=current_url,
+                        step_number=step + 1,
+                    )
+                    if prm_score.newly_completed:
+                        logger.info(
+                            "✅ PRM: Completed: %s",
+                            ", ".join(c[:40] for c in prm_score.newly_completed),
+                        )
+                    # Use PRM to extend budget if making good progress
+                    if prm_score.total_score >= 0.7 and step >= max_steps - 3:
+                        max_steps += 5
+                        logger.info(
+                            "📊 PRM Budget extended to %d (checklist %.0f%%)",
+                            max_steps, prm_score.total_score * 100,
+                        )
+                except Exception as prm_err:
+                    logger.debug("PRM scoring error (non-fatal): %s", prm_err)
 
             # ── Progressive Perception: Track action dedup ──
             current_action_signature = f"{decision.action_type}:{decision.text[:30] if decision.text else 'none'}"
@@ -1615,26 +1451,21 @@ async def run_agent(objective: str):
                         objective, page.url, action_history,
                         failover_chain, breaker, health_tracker,
                     )
-                    phase_tracker.recovery_advice = advice
+                    progress_tracker.recovery_advice = advice
                     consecutive_identical_actions = 0  # Reset after getting advice
             else:
                 consecutive_identical_actions = 0
-                phase_tracker.recovery_advice = ""  # Clear old advice on new action
+                progress_tracker.recovery_advice = ""  # Clear old advice on new action
 
             last_action_signature = current_action_signature
 
         logger.info("Agent loop finished after %d steps.", step + 1)
 
-        # ── Record in campaign memory ──
+        # ── Record task execution in history ──
         try:
-            platform = "unknown"
             final_url = page.url
-            for p in ["dev.to", "medium.com", "x.com", "twitter.com", "hashnode.com", "github.com"]:
-                if p in final_url:
-                    platform = p
-                    break
             memory.record_post(
-                platform=platform,
+                platform="web",
                 title=objective[:120],
                 content=objective,
                 url=final_url,
@@ -1642,7 +1473,27 @@ async def run_agent(objective: str):
                 steps_taken=step + 1,
             )
         except Exception as e:
-            logger.warning("Campaign memory record failed: %s", e)
+            logger.warning("Task history record failed: %s", e)
+
+        # ── Phase 3: Record workflow in Skill Memory ──
+        try:
+            if skill_mem and working_mem.episodic:
+                episodic_steps = [dict(s) for s in working_mem.episodic]
+                skill_mem.record_workflow(
+                    objective=objective,
+                    steps=episodic_steps,
+                    success=progress_tracker.mission_success,
+                    total_steps=step + 1,
+                )
+                logger.info("📝 Workflow recorded in SkillMemory (success=%s)", progress_tracker.mission_success)
+        except Exception as e:
+            logger.warning("SkillMemory record failed: %s", e)
+
+        # ── Log Phase metrics ──
+        if dreamer:
+            logger.info("🌙 WebDreamer total LLM calls: %d", dreamer.total_llm_calls)
+        if prm_critic:
+            logger.info("📊 PRM Critic total LLM calls: %d", prm_critic.total_llm_calls)
 
     except KeyboardInterrupt:
         logger.warning("KeyboardInterrupt caught — saving session before exit...")
@@ -1666,7 +1517,7 @@ async def run_agent(objective: str):
         # ════════════════════════════════════════════════════════════════════
         #  CLEAN SHUTDOWN — context.close() flushes all native state to disk
         # ════════════════════════════════════════════════════════════════════
-        mission_success = completed_phases.get("mission_success", False)
+        mission_success = progress_tracker.mission_success
         if mission_success:
             logger.info("✅ Agent shutting down after successful mission.")
         else:
@@ -1680,7 +1531,7 @@ async def run_agent(objective: str):
 
         if mission_success:
             print("\n" + "═" * 60)
-            print("  ✅  MISSION COMPLETE — Post published successfully!")
+            print("  ✅  MISSION COMPLETE — Task finished successfully!")
             print("═" * 60 + "\n")
 
 

@@ -1,0 +1,434 @@
+"""MCP Tool Wrappers — Model Context Protocol interface to existing browser primitives.
+
+Wraps the battle-tested execution layer (cdp_click, cdp_input, ghost_input,
+dom_parser, overlay_detector) as MCP-compatible tool functions.
+
+These tools are the ONLY way worker nodes interact with the browser.
+They never commit state — they return results that Overwatch validates.
+
+Design:
+  - Each tool delegates to an existing, proven module
+  - Tool results are structured dicts, not raw strings
+  - Page reference is injected at graph construction time
+  - All tools are async for Playwright compatibility
+
+References:
+  - MCP (Anthropic, Nov 2024): standardized agent-to-tool protocol
+  - Playwright MCP: accessibility-tree-first interaction pattern
+"""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import json
+import logging
+from typing import Any
+
+logger = logging.getLogger("mcp_tools")
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Tool Registry — holds the live page reference
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_PAGE = None  # Set by brain_graph.py at startup
+_SELECTOR_MAP: dict[str, dict] = {}
+
+
+def set_page(page) -> None:
+    """Inject the live Playwright page reference (called once at startup)."""
+    global _PAGE
+    _PAGE = page
+
+
+def set_selector_map(smap: dict) -> None:
+    """Update the current selector map (called each perception cycle)."""
+    global _SELECTOR_MAP
+    _SELECTOR_MAP = smap
+
+
+def _get_page():
+    if _PAGE is None:
+        raise RuntimeError("MCP tools not initialized — call set_page() first")
+    return _PAGE
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Tool: Navigate
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def mcp_navigate(url: str) -> dict:
+    """Navigate the browser to a URL.
+
+    Delegates to: page.goto()
+    Returns: {"success": bool, "url": str, "error": str}
+    """
+    page = _get_page()
+    try:
+        # Domain safety check (existing module)
+        from execution_safety import is_domain_allowed
+        if not is_domain_allowed(url):
+            return {"success": False, "url": page.url, "error": f"Domain blocked: {url[:80]}"}
+
+        await page.goto(url, wait_until="domcontentloaded", timeout=15000)
+        return {"success": True, "url": page.url, "error": ""}
+    except Exception as e:
+        logger.warning("mcp_navigate failed: %s", e)
+        return {"success": False, "url": page.url, "error": str(e)[:200]}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Tool: Click
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def mcp_click(
+    x: float, y: float,
+    element_id: str | None = None,
+) -> dict:
+    """Click an element at (x, y) with overlay penetration and CDP resilience.
+
+    Delegates to:
+      1. overlay_detector.smart_click_with_penetration()
+      2. ghost_input.ghost_move_to() — Bézier curve humanization
+      3. cdp_click.resilient_click() — 4-strategy waterfall
+
+    Returns: {"success": bool, "strategy": str, "navigated": bool, "dom_changed": bool, "error": str}
+    """
+    page = _get_page()
+
+    try:
+        # V15.2: Scroll element into viewport center before action
+        if element_id:
+            try:
+                await page.evaluate("""(eid) => {
+                    const el = document.querySelector(`[data-eid="${eid}"]`);
+                    if (el) el.scrollIntoView({behavior: 'smooth', block: 'center'});
+                }""", element_id)
+                await asyncio.sleep(0.5)
+            except Exception:
+                pass
+
+        # Step 1: Overlay penetration
+        from overlay_detector import smart_click_with_penetration
+        penetration = await smart_click_with_penetration(page, x, y)
+        if penetration.get("overlay_bypassed"):
+            logger.info("🎯 Overlay penetrated at (%d, %d) via %s", x, y, penetration.get("method", "?"))
+            await asyncio.sleep(0.1)
+
+        # Step 2: Humanized mouse movement
+        from ghost_input import ghost_move_to
+        await ghost_move_to(page, x, y)
+
+        # Step 3: CDP resilient click
+        from cdp_click import resilient_click
+        click_result = await asyncio.wait_for(
+            resilient_click(page, x, y, max_retries=4, settle_ms=800),
+            timeout=30.0,
+        )
+
+        if click_result.success:
+            return {
+                "success": True,
+                "strategy": click_result.strategy,
+                "navigated": click_result.navigation,
+                "dom_changed": click_result.dom_changed,
+                "error": "",
+            }
+        else:
+            return {
+                "success": False,
+                "strategy": "",
+                "navigated": False,
+                "dom_changed": False,
+                "error": f"Click ineffective: {click_result.error[:80]}",
+            }
+
+    except asyncio.TimeoutError:
+        return {"success": False, "strategy": "", "navigated": False,
+                "dom_changed": False, "error": "Click timed out (30s)"}
+    except Exception as e:
+        logger.warning("mcp_click failed: %s", e)
+        return {"success": False, "strategy": "", "navigated": False,
+                "dom_changed": False, "error": str(e)[:200]}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Tool: Type
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def mcp_type(
+    text: str,
+    x: float, y: float,
+    element_id: str | None = None,
+    clear_first: bool = True,
+) -> dict:
+    """Type text into an element with CDP resilient typing.
+
+    Delegates to: cdp_input.resilient_type()
+    Returns: {"success": bool, "strategy": str, "actual_length": int, "error": str}
+    """
+    page = _get_page()
+
+    try:
+        # V15.2: Scroll into view
+        if element_id:
+            try:
+                await page.evaluate("""(eid) => {
+                    const el = document.querySelector(`[data-eid="${eid}"]`);
+                    if (el) el.scrollIntoView({behavior: 'smooth', block: 'center'});
+                }""", element_id)
+                await asyncio.sleep(0.5)
+            except Exception:
+                pass
+
+        from cdp_input import resilient_type
+        type_result = await asyncio.wait_for(
+            resilient_type(
+                page, text, x=x, y=y,
+                clear_first=clear_first, max_retries=3,
+            ),
+            timeout=60.0,
+        )
+
+        if type_result["success"]:
+            return {
+                "success": True,
+                "strategy": type_result["strategy"],
+                "actual_length": type_result["actual_length"],
+                "error": "",
+            }
+        else:
+            return {
+                "success": False,
+                "strategy": "",
+                "actual_length": 0,
+                "error": "Type unverified after all strategies",
+            }
+
+    except asyncio.TimeoutError:
+        return {"success": False, "strategy": "", "actual_length": 0, "error": "Type timed out (60s)"}
+    except Exception as e:
+        logger.warning("mcp_type failed: %s", e)
+        return {"success": False, "strategy": "", "actual_length": 0, "error": str(e)[:200]}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Tool: Scroll
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def mcp_scroll(pixels: int = 600) -> dict:
+    """Scroll the page down by a given number of pixels.
+
+    Delegates to: ghost_input.ghost_scroll()
+    Returns: {"success": bool, "error": str}
+    """
+    page = _get_page()
+    try:
+        from ghost_input import ghost_scroll
+        await asyncio.wait_for(ghost_scroll(page, pixels), timeout=10.0)
+        return {"success": True, "error": ""}
+    except asyncio.TimeoutError:
+        return {"success": False, "error": "Scroll timed out (10s)"}
+    except Exception as e:
+        logger.warning("mcp_scroll failed: %s", e)
+        return {"success": False, "error": str(e)[:200]}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Tool: Press Enter
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def mcp_press_enter() -> dict:
+    """Press the Enter key.
+
+    Returns: {"success": bool, "error": str}
+    """
+    page = _get_page()
+    try:
+        await page.keyboard.press("Enter")
+        return {"success": True, "error": ""}
+    except Exception as e:
+        logger.warning("mcp_press_enter failed: %s", e)
+        return {"success": False, "error": str(e)[:200]}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Tool: Snapshot (DOM Perception)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def mcp_snapshot() -> dict:
+    """Take an accessibility-tree snapshot of the current page.
+
+    Delegates to: dom_parser.extract()
+    Returns: {"elements": list, "markdown": str, "element_count": int, "selector_map": dict}
+    """
+    page = _get_page()
+    try:
+        import dom_parser
+        dom_data = await dom_parser.extract(page, target_hint=None, timeout=5.0)
+        elements_list = dom_data.get("elements", [])
+
+        # Build selector map
+        smap: dict[str, dict] = {}
+        for el in elements_list:
+            eid = el.get("id", el.get("ref", ""))
+            if eid:
+                smap[eid] = el
+
+        # Update global selector map
+        set_selector_map(smap)
+
+        return {
+            "elements": elements_list,
+            "markdown": dom_data.get("markdown", ""),
+            "element_count": dom_data.get("element_count", len(elements_list)),
+            "selector_map": smap,
+            "image_size": dom_data.get("image_size", {}),
+        }
+    except Exception as e:
+        logger.warning("mcp_snapshot failed: %s", e)
+        return {"elements": [], "markdown": "", "element_count": 0,
+                "selector_map": {}, "image_size": {}}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Tool: Wait
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def mcp_wait(ms: int = 800) -> dict:
+    """Wait for a specified number of milliseconds.
+
+    Returns: {"success": bool, "waited_ms": int}
+    """
+    page = _get_page()
+    try:
+        await page.wait_for_timeout(ms)
+        return {"success": True, "waited_ms": ms}
+    except Exception as e:
+        return {"success": False, "waited_ms": 0}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Tool: Login State Detection
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def mcp_detect_login() -> dict:
+    """Detect login state of the current page.
+
+    Returns: {"logged_in": bool, "has_login_form": bool}
+    """
+    page = _get_page()
+    try:
+        login_state = await asyncio.wait_for(page.evaluate("""
+        () => {
+            const hasProfile = !!document.querySelector(
+                '[aria-label*="profile" i], [aria-label*="account" i], '
+                + 'img[alt*="avatar" i], img[alt*="profile" i], '
+                + '[data-testid*="profile" i], [data-testid*="user" i], '
+                + '.user-menu, .profile-menu, #user-nav'
+            );
+            let hasLoginForm = !!document.querySelector(
+                'input[type="password"], '
+                + 'form[action*="login" i], form[action*="signin" i]'
+            );
+            if (!hasLoginForm) {
+                const buttons = document.querySelectorAll('button, a[role="button"], input[type="submit"]');
+                for (const btn of buttons) {
+                    const txt = (btn.textContent || '').trim().toLowerCase();
+                    if (['sign in', 'log in', 'login', 'signin'].includes(txt)) {
+                        hasLoginForm = true;
+                        break;
+                    }
+                }
+            }
+            return { hasProfile, hasLoginForm };
+        }
+        """), timeout=5.0)
+
+        return {
+            "logged_in": login_state.get("hasProfile", False),
+            "has_login_form": login_state.get("hasLoginForm", False),
+        }
+    except Exception:
+        return {"logged_in": False, "has_login_form": False}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Tool: Grounding Validation
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def mcp_ground_action(
+    element_id: str | None,
+    x: float | None,
+    y: float | None,
+    selector_map: dict | None = None,
+    elements_list: list | None = None,
+) -> dict:
+    """Validate and ground an action's target coordinates.
+
+    Delegates to: advanced_agent._ground_or_reject() logic
+    Returns: {"grounded": bool, "x": float, "y": float, "element": dict|None, "reason": str}
+    """
+    page = _get_page()
+    smap = selector_map or _SELECTOR_MAP
+
+    # Layer 1: Element ID resolution
+    if element_id is not None:
+        el = smap.get(element_id)
+        if el is None:
+            return {"grounded": False, "x": 0, "y": 0, "element": None,
+                    "reason": f"element_id '{element_id}' not in current snapshot"}
+        resolved_x = float(el.get("x", 0))
+        resolved_y = float(el.get("y", 0))
+        return {"grounded": True, "x": resolved_x, "y": resolved_y,
+                "element": el, "reason": "element_id resolved"}
+
+    if x is None or y is None:
+        return {"grounded": False, "x": 0, "y": 0, "element": None,
+                "reason": "no element_id or coordinates"}
+
+    # Layer 2: elementFromPoint hit-test
+    try:
+        hit = await page.evaluate(
+            "([x,y])=>{const e=document.elementFromPoint(x,y);"
+            "if(!e)return null;"
+            "const tag=e.tagName.toUpperCase();"
+            "const interactive=['A','BUTTON','INPUT','SELECT','TEXTAREA']"
+            ".includes(tag)||e.getAttribute('role')==='button'"
+            "||e.getAttribute('contenteditable')==='true';"
+            "return{tag,interactive,text:(e.textContent||'').trim().slice(0,40)};}",
+            [x, y],
+        )
+        if hit and hit.get("interactive"):
+            return {"grounded": True, "x": x, "y": y,
+                    "element": {"ref": "hit-test", "name": hit.get("text", "")[:30]},
+                    "reason": "hit-test grounded"}
+    except Exception:
+        pass
+
+    # Layer 3: Nearest-element snap
+    elems = elements_list or []
+    if not elems:
+        return {"grounded": False, "x": x, "y": y, "element": None,
+                "reason": "no elements in snapshot"}
+
+    best_el = None
+    best_dist = float("inf")
+    for el in elems:
+        ex = el.get("x", 0)
+        ey = el.get("y", 0)
+        if ex == 0 and ey == 0:
+            continue
+        dist = ((x - ex) ** 2 + (y - ey) ** 2) ** 0.5
+        if dist < best_dist:
+            best_dist = dist
+            best_el = el
+
+    threshold = 60.0
+    if best_el is None or best_dist > threshold:
+        return {"grounded": False, "x": x, "y": y, "element": None,
+                "reason": f"nearest element is {best_dist:.0f}px away (>{threshold:.0f}px)"}
+
+    return {"grounded": True, "x": float(best_el.get("x", x)),
+            "y": float(best_el.get("y", y)), "element": best_el,
+            "reason": f"snapped to nearest ({best_dist:.0f}px)"}
