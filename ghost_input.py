@@ -167,6 +167,35 @@ async def ghost_click(page: Page, x: float, y: float) -> None:
     await asyncio.sleep(random.uniform(0.1, 0.25))
 
 
+async def ghost_move_to(page: Page, x: float, y: float) -> None:
+    """Move the mouse along a Bézier curve to (x, y) WITHOUT clicking.
+    
+    Used by the CDP native click engine: ghost_move_to() handles the
+    human-like mouse path, then cdp_click dispatches the actual click
+    via CDP Input.dispatchMouseEvent for isTrusted=true events.
+    """
+    global _last_mouse_pos
+
+    start = _last_mouse_pos
+    end = (float(x), float(y))
+    distance = math.sqrt((end[0] - start[0])**2 + (end[1] - start[1])**2)
+
+    # Scale path complexity with distance
+    num_points = max(8, min(30, int(distance / 15)))
+    path = _generate_bezier_path(start, end, num_points=num_points)
+
+    step_delay = _movement_delay(distance)
+
+    for point in path:
+        await page.mouse.move(point[0], point[1])
+        await asyncio.sleep(step_delay + random.uniform(0, 0.004))
+
+    _last_mouse_pos = end
+
+    # Small pre-click pause (humans hesitate slightly before clicking)
+    await asyncio.sleep(random.uniform(0.05, 0.15))
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #  Ghost Type — Variable-speed typing with occasional corrections
 # ═══════════════════════════════════════════════════════════════════════════════

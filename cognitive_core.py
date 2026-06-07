@@ -54,6 +54,16 @@ class PlanState:
     steps: list[dict] = field(default_factory=list)
     current_step_id: int = 0
     reflections: list[str] = field(default_factory=list)
+    checklist: list[Any] = field(default_factory=list)  # Phase 2: PRM ChecklistItems
+
+    @property
+    def checklist_progress(self) -> float:
+        """Aggregate progress from PRM checklist (0.0 to 1.0)."""
+        if not self.checklist:
+            return 0.0
+        done = sum(1 for item in self.checklist
+                   if getattr(item, 'status', '') == 'done')
+        return done / len(self.checklist)
 
     @classmethod
     def from_checkpoints(cls, mission: str, checkpoints: list[str]) -> PlanState:
