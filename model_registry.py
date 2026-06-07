@@ -51,10 +51,38 @@ def _collect_keys(*env_vars: str) -> list[str]:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class ProviderHealthTracker:
-    """Per-model exponential backoff quarantine."""
+    """Per-model exponential backoff quarantine with V15.0/V15.1 improvements.
+
+    V15.0 F6:
+      - Quarantine cap at 16s (was uncapped up to 120s)
+      - Cold-start reset: if model idle 5+ min, streak resets to 0
+      - Schema blacklist: models that fail structured output permanently
+
+    V15.1 Patch A+C:
+      - Base-model-name blacklist: 'groq:openai/gpt-oss-120b:0' blacklist
+        also blocks ':1' and ':2' (same underlying model, different API key)
+      - Per-schema blacklist: 'ChecklistEvaluation' vs 'CandidateSet' tracked
+        separately so a model that fails on one schema can still serve others
+    """
 
     def __init__(self):
         self._health: dict[str, dict] = {}
+        self._schema_blacklist: dict[str, set[str]] = {}  # base_model → {schema_names}
+
+    @staticmethod
+    def _base_model_name(instance_name: str) -> str:
+        """Extract base model from instance name.
+
+        'groq:openai/gpt-oss-120b:0'  → 'openai/gpt-oss-120b'
+        'nvidia-text:z-ai/glm-5.1:1'  → 'z-ai/glm-5.1'
+        'gemini-text:gemma-4-31b-it:2' → 'gemma-4-31b-it'
+        'some-model'                   → 'some-model' (fallback)
+        """
+        parts = instance_name.split(":")
+        if len(parts) >= 3:
+            # provider:model_path:key_index → extract model_path
+            return ":".join(parts[1:-1])
+        return instance_name
 
     def _get(self, name: str) -> dict:
         if name not in self._health:
@@ -63,30 +91,92 @@ class ProviderHealthTracker:
                 "quarantine_until": 0.0,
                 "total_calls": 0,
                 "total_failures": 0,
+                "last_call_time": 0.0,
             }
         return self._health[name]
 
-    def is_available(self, name: str) -> bool:
-        return time.monotonic() >= self._get(name)["quarantine_until"]
+    def is_available(self, name: str, schema_name: str = "") -> bool:
+        # V15.1: Check schema blacklist by BASE model name
+        if schema_name:
+            base = self._base_model_name(name)
+            if base in self._schema_blacklist:
+                bl = self._schema_blacklist[base]
+                if schema_name in bl or "__structured_output__" in bl:
+                    return False
+
+        s = self._get(name)
+        # V15.0: Cold-start reset — if model idle 5+ min, treat as fresh
+        if s["last_call_time"] > 0 and time.monotonic() - s["last_call_time"] > 300:
+            s["consecutive_failures"] = 0
+            s["quarantine_until"] = 0.0
+
+        return time.monotonic() >= s["quarantine_until"]
 
     def record_success(self, name: str) -> None:
         s = self._get(name)
         s["consecutive_failures"] = 0
         s["quarantine_until"] = 0.0
         s["total_calls"] += 1
+        s["last_call_time"] = time.monotonic()
 
-    def record_failure(self, name: str, is_rate_limit: bool = False) -> None:
+    def record_failure(self, name: str, is_rate_limit: bool = False, error_msg: str = "") -> None:
         s = self._get(name)
         s["consecutive_failures"] += 1
         s["total_calls"] += 1
         s["total_failures"] += 1
-        backoff = min(120.0, 2.0 ** s["consecutive_failures"])
+        s["last_call_time"] = time.monotonic()
+
+        # V15.0: Cap quarantine at 16s (was min(120, 2^n))
+        backoff = min(16.0, 2.0 ** s["consecutive_failures"])
         if is_rate_limit:
-            backoff = min(120.0, backoff * 2)
+            backoff = min(16.0, backoff * 2)
         s["quarantine_until"] = time.monotonic() + backoff
         logger.warning(
             "🔒 '%s' quarantined %.1fs (streak=%d)", name, backoff, s["consecutive_failures"],
         )
+
+        # V15.1 Patch A+C: Schema blacklist by BASE model name + per-schema keys
+        if error_msg and ("400" in error_msg or "Bad Request" in error_msg):
+            if "additionalProperties" in error_msg or "schema" in error_msg.lower():
+                base = self._base_model_name(name)
+                if base not in self._schema_blacklist:
+                    self._schema_blacklist[base] = set()
+
+                # Patch C: Extract specific schema name from error message
+                # Error format: "response_format: 'ChecklistEvaluation': /properties/..."
+                # We target the schema name after 'response_format:' specifically
+                import re
+                schema_match = re.search(r"response_format:\s*'(\w+)'", error_msg)
+                if not schema_match:
+                    # Fallback: look for CamelCase class names (Pydantic schema pattern)
+                    schema_match = re.search(r"'([A-Z]\w{5,})'", error_msg)
+                specific_schema = schema_match.group(1) if schema_match else None
+
+                if specific_schema:
+                    self._schema_blacklist[base].add(specific_schema)
+                    logger.warning(
+                        "🚫 Base model '%s' blacklisted for schema '%s' "
+                        "(all %s instances will be skipped)",
+                        base, specific_schema, name.split(":")[0],
+                    )
+                else:
+                    # Catch-all: blacklist for all structured output
+                    self._schema_blacklist[base].add("__structured_output__")
+                    logger.warning(
+                        "🚫 Base model '%s' blacklisted for ALL structured output",
+                        base,
+                    )
+
+    def is_schema_blacklisted(self, name: str, schema_name: str = "__structured_output__") -> bool:
+        """Check if a model is permanently blacklisted for a specific schema.
+
+        V15.1: Uses base model name so all key-variants are covered.
+        """
+        base = self._base_model_name(name)
+        if base not in self._schema_blacklist:
+            return False
+        bl = self._schema_blacklist[base]
+        return schema_name in bl or "__structured_output__" in bl
 
     def all_quarantined(self, names: list[str]) -> bool:
         return all(not self.is_available(n) for n in names)
@@ -440,7 +530,15 @@ class ModelRegistry:
         self._text_pipeline: list[ModelClient] = _build_text_pipeline()
         self._vision_pipeline: list[ModelClient] = _build_vision_pipeline()
         self.health = ProviderHealthTracker()
-        self.breaker = CircuitBreaker(max_requests=80, max_failures=15)
+        # UCRF: Higher tolerance — LLM failovers are expected, not critical failures
+        # With 9-model chain, 3-4 timeouts per call is normal before success
+        self.breaker = CircuitBreaker(
+            window_size=50,
+            min_calls=20,                  # Need 20+ calls before evaluating (was 10)
+            failure_rate_threshold=0.70,   # 70% failure rate to trip (was 50%)
+            open_wait_secs=10.0,           # Recover faster (was 30s)
+            half_open_probes=3,
+        )
 
         # Validate no overlap
         t = {m.name for m in self._text_pipeline}
@@ -512,8 +610,15 @@ async def invoke_with_failover(
     for idx, mc in enumerate(chain):
         name = mc.name
 
+        # V15.1: Check both quarantine AND schema blacklist
         if health and not health.is_available(name):
             if not health.all_quarantined([m.name for m in chain]):
+                continue
+        # V15.1 Patch A+C: Skip models blacklisted for this specific schema
+        if health and schema is not None:
+            schema_name = schema.__name__ if hasattr(schema, '__name__') else "__structured_output__"
+            if health.is_schema_blacklisted(name, schema_name):
+                logger.debug("Skipping '%s' — blacklisted for schema '%s'", name, schema_name)
                 continue
 
         try:
@@ -542,7 +647,7 @@ async def invoke_with_failover(
             last_error = f"{name}: {err[:150]}"
             is_rl = "429" in err or "rate" in err.lower()
             if health:
-                health.record_failure(name, is_rate_limit=is_rl)
+                health.record_failure(name, is_rate_limit=is_rl, error_msg=err)
             if breaker:
                 breaker.record_failure()
             logger.warning("⚠️ FAILOVER [%d/%d]: %s", idx + 1, len(chain), last_error)

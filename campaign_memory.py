@@ -1,9 +1,9 @@
-"""Episodic Campaign Memory — Persistent record of all marketing actions.
+"""Episodic Task Memory — Persistent record of all task execution actions.
 
-Prevents duplicate spam by recording every published post and providing
-deduplication checks before new campaigns execute.
+Prevents duplicate work by recording every published post and providing
+deduplication checks before new tasks execute.
 
-Uses the existing SQLite schema from database.py (campaign_history table)
+Uses the existing SQLite schema from database.py (task_history table)
 but is a standalone module that advanced_agent.py can import directly.
 """
 
@@ -26,7 +26,7 @@ DB_PATH = PERSISTENCE_ROOT / "agent_persistence.db"
 
 
 def _ensure_db() -> sqlite3.Connection:
-    """Open (and initialize if needed) the campaign memory database."""
+    """Open (and initialize if needed) the task memory database."""
     PERSISTENCE_ROOT.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(DB_PATH), timeout=10.0)
     conn.execute("PRAGMA busy_timeout=5000;")
@@ -56,7 +56,7 @@ def _ensure_db() -> sqlite3.Connection:
         ON published_posts(platform)
     """)
 
-    # Cooldown tracking table
+    # Timing tracking table
     conn.execute("""
         CREATE TABLE IF NOT EXISTS platform_cooldowns (
             platform TEXT PRIMARY KEY,
@@ -69,7 +69,7 @@ def _ensure_db() -> sqlite3.Connection:
 
 
 class CampaignMemory:
-    """Lightweight episodic memory for the marketing agent.
+    """Lightweight episodic task execution history tracker.
 
     Auto-reconnects on database errors — no single failure kills the memory.
     """
@@ -91,7 +91,7 @@ class CampaignMemory:
                     pass
             self._conn = _ensure_db()
         except Exception as e:
-            logger.error("Campaign memory DB connect failed: %s", e)
+            logger.error("Task memory DB connect failed: %s", e)
             self._conn = None
 
     def _get_conn(self) -> sqlite3.Connection:
@@ -103,10 +103,10 @@ class CampaignMemory:
                 self._conn.execute("SELECT 1")
                 return self._conn
             except (sqlite3.OperationalError, sqlite3.ProgrammingError):
-                logger.warning("Campaign memory connection dead, reconnecting...")
+                logger.warning("Task memory connection dead, reconnecting...")
                 self._connect()
         if self._conn is None:
-            raise sqlite3.OperationalError("Cannot connect to campaign memory DB")
+            raise sqlite3.OperationalError("Cannot connect to task memory DB")
         return self._conn
 
     def record_post(
@@ -118,7 +118,7 @@ class CampaignMemory:
         agent_model: str = "",
         steps_taken: int = 0,
     ) -> bool:
-        """Record a published post. Returns True if recorded, False if duplicate."""
+        """Record a completed task action. Returns True if recorded, False if duplicate."""
         content_hash = hashlib.sha256(content.encode()).hexdigest()[:16]
         now = datetime.now(timezone.utc).isoformat()
 
@@ -168,35 +168,15 @@ class CampaignMemory:
         return count > 0
 
     def is_on_cooldown(self, platform: str, cooldown_hours: int = 168) -> tuple[bool, str]:
-        """Check if the platform is on cooldown (default: 7 days).
-        
+        """Cooldown check stub — always returns not on cooldown.
+
+        Kept for backwards compatibility.
         Returns: (is_cooling_down, reason_message)
         """
-        cursor = self._get_conn().execute(
-            "SELECT last_post_at FROM platform_cooldowns WHERE platform = ?",
-            (platform.lower().strip(),),
-        )
-        row = cursor.fetchone()
-        if not row:
-            return False, ""
-
-        last_post = datetime.fromisoformat(row[0])
-        now = datetime.now(timezone.utc)
-        elapsed_hours = (now - last_post).total_seconds() / 3600
-
-        if elapsed_hours < cooldown_hours:
-            remaining = cooldown_hours - elapsed_hours
-            msg = (
-                f"Platform '{platform}' is on cooldown. "
-                f"Last post: {last_post.strftime('%Y-%m-%d %H:%M UTC')}. "
-                f"Remaining: {remaining:.1f} hours."
-            )
-            return True, msg
-
         return False, ""
 
-    def get_campaign_log(self, limit: int = 20) -> list[dict[str, Any]]:
-        """Return the most recent published posts for context injection."""
+    def get_campaign_log(self, limit: int = 20) -> list[dict[str, Any]]:  # name kept for compat
+        """Return the most recent task actions for context injection."""
         cursor = self._get_conn().execute(
             """SELECT platform, url, title, content_preview, published_at, agent_model, steps_taken
                FROM published_posts
@@ -219,7 +199,7 @@ class CampaignMemory:
         return cursor.fetchone()[0]
 
     def get_summary(self) -> str:
-        """Return a human-readable summary of the campaign history."""
+        """Return a human-readable summary of the task history."""
         total = self.get_post_count()
         if total == 0:
             return "No posts published yet."
@@ -229,7 +209,7 @@ class CampaignMemory:
         )
         platforms = [row[0] for row in cursor.fetchall()]
 
-        lines = [f"Campaign History: {total} post(s) across {len(platforms)} platform(s)"]
+        lines = [f"Task History: {total} post(s) across {len(platforms)} platform(s)"]
         for p in platforms:
             count = self.get_post_count(p)
             lines.append(f"  • {p}: {count} post(s)")

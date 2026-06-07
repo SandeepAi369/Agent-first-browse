@@ -166,6 +166,12 @@ _GOD_MODE_JS = r"""
         const inViewport = rect.top >= 0 && rect.bottom <= vh && rect.left >= 0 && rect.right <= vw;
         if (!inViewport) score += 10000;
 
+        /* ── V15.0 F1: Fixed/sticky elements are ALWAYS visible (W3C getComputedStyle) ── */
+        const cssPos = cs.position;
+        if (cssPos === 'fixed' || cssPos === 'sticky') {
+            score -= 20000;  /* Guarantee inclusion — always-visible to user */
+        }
+
         /* ── Input state detection ── */
         let inputState = null;
         if (kind === 'input') {
@@ -173,7 +179,7 @@ _GOD_MODE_JS = r"""
                 const val = el.value || el.textContent || '';
                 const trimVal = val.trim();
                 inputState = trimVal.length > 0
-                    ? { filled: true, length: trimVal.length, preview: trimVal.slice(0, 60) }
+                    ? { filled: true, length: trimVal.length, preview: trimVal.slice(0, 250) }
                     : { filled: false, length: 0 };
             } catch(_) { inputState = { filled: false, length: 0 }; }
         }
@@ -203,6 +209,16 @@ _GOD_MODE_JS = r"""
     scored.sort((a, b) => a.score - b.score);
     const top = scored.slice(0, MAX_ELEMENTS);
 
+    /* ── V15.0 F1: Reserved slots for fixed/sticky elements cut by budget ── */
+    const RESERVED_FIXED = 10;
+    const fixedCut = scored.slice(MAX_ELEMENTS).filter(s => {
+        try { return ['fixed','sticky'].includes(window.getComputedStyle(s.el).position); }
+        catch(_) { return false; }
+    });
+    for (const f of fixedCut.slice(0, RESERVED_FIXED)) {
+        top.push(f);
+    }
+
     /* ━━━ 3. BUILD OUTPUTS ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
 
     /* 3a. Structured elements array (for coordinates) */
@@ -212,7 +228,7 @@ _GOD_MODE_JS = r"""
         let label = text || top[i].tag.toLowerCase();
         if (inputState) {
             label += inputState.filled
-                ? ` [filled: "${inputState.preview}" ${inputState.length}ch]`
+                ? ` [filled: "${inputState.preview}"${inputState.length > 250 ? ' ...(' + inputState.length + ' total)' : ''} ${inputState.length}ch]`
                 : ' [empty]';
         }
         elements.push({ id: 'e' + (i+1), kind, text: label, x: cx, y: cy });
