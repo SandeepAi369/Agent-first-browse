@@ -155,7 +155,7 @@ async def invoke_worker(
         )
         logger.info("Worker answered by: %s", used_model)
     except RuntimeError as e:
-        wait_secs = min(health_tracker.shortest_quarantine_wait() + 1.0, 15.0) if health_tracker else 5.0
+        wait_secs = 5.0
         logger.error("Worker LLM FAILURE: %s — waiting %.1fs", e, wait_secs)
         await asyncio.sleep(wait_secs)
         return {}  # Empty update — step will be retried

@@ -496,12 +496,12 @@ async def _invoke_with_failover(
     base64_image: str | None = None,
     health_tracker=None,
 ) -> tuple:
-    """Try each model in the failover chain until one succeeds.
+    """V16.1 — Try each model in sequence. No per-model quarantine.
 
-    v9.0 improvements:
-      - Configurable timeout (30s default, not hardcoded 20s)
-      - 3s quarantine wait, not 30s dead time
-      - Proper exponential backoff via ProviderHealthTracker
+    Quarantine was catastrophic when multiple models shared one API key
+    (e.g., NVIDIA NIM). Quarantining model A effectively blocked models B-E
+    on the same key. Now we just walk the chain and try each model immediately.
+    Only schema blacklist (permanent 400 errors) is preserved.
     """
     if circuit_breaker and circuit_breaker.tripped:
         raise RuntimeError(f"🔌 CIRCUIT BREAKER TRIPPED: {circuit_breaker.reason}")
@@ -512,18 +512,8 @@ async def _invoke_with_failover(
         for m in failover_chain
     ]
 
-    # If all providers quarantined, wait briefly for recovery
-    if health_tracker and health_tracker.all_quarantined(model_names):
-        wait_time = min(health_tracker.shortest_quarantine_wait() + 0.5, 8.0)
-        logger.warning("⏳ All providers quarantined. Waiting %.1fs...", wait_time)
-        await asyncio.sleep(wait_time)
-
     for idx, llm in enumerate(failover_chain):
         model_name = model_names[idx]
-
-        if health_tracker and not health_tracker.is_available(model_name):
-            if idx < len(failover_chain) - 1:
-                continue
 
         # Dynamic Vision Payload Support
         supports_vision = any(x in model_name.lower() for x in [
@@ -556,8 +546,6 @@ async def _invoke_with_failover(
         except asyncio.TimeoutError:
             if circuit_breaker:
                 circuit_breaker.record_failure()
-            if health_tracker:
-                health_tracker.record_failure(model_name)
             logger.warning("⚠️  FAILOVER [%d/%d]: %s TIMED OUT (>30s)", idx + 1, len(failover_chain), model_name)
             last_error = TimeoutError(f"{model_name} timed out")
         except Exception as e:
@@ -565,11 +553,9 @@ async def _invoke_with_failover(
                 circuit_breaker.record_failure()
             error_str = str(e)
             is_rate_limit = "429" in error_str or "rate_limit" in error_str.lower()
-            if health_tracker:
-                health_tracker.record_failure(model_name, is_rate_limit=is_rate_limit)
             logger.warning("⚠️  FAILOVER [%d/%d]: %s — %s", idx + 1, len(failover_chain), model_name, error_str[:150])
             if is_rate_limit:
-                await asyncio.sleep(1.5)
+                await asyncio.sleep(2.0)
             last_error = e
 
     raise RuntimeError(f"ALL {len(failover_chain)} models failed. Last: {last_error}")
@@ -975,8 +961,8 @@ async def run_agent(objective: str):
                 )
                 logger.info("Answered by: %s", used_model)
             except RuntimeError as e:
-                wait_secs = min(health_tracker.shortest_quarantine_wait() + 1.0, 15.0) if health_tracker else 5.0
-                logger.error("LLM FAILURE: %s — waiting %.1fs for recovery...", e, wait_secs)
+                wait_secs = 5.0
+                logger.error("LLM FAILURE: %s — waiting %.1fs before retry...", e, wait_secs)
                 await asyncio.sleep(wait_secs)
                 step -= 1  # Don't burn a step when ALL models are down
                 continue
