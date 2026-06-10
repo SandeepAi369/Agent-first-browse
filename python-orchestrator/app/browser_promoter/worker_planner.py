@@ -211,7 +211,7 @@ class ReasoningAgent:
         from model_registry import ModelRegistry
         registry = ModelRegistry.get_instance()
         self._model_clients = registry.get_text_chain()
-        self._clients = [(mc.name, mc.client) for mc in self._model_clients]
+        self._clients = self._model_clients  # Keep full ModelClient objects
         self._cursor = 0
         log.info(
             "ReasoningAgent: %d text models loaded — %s",
@@ -220,10 +220,10 @@ class ReasoningAgent:
         )
 
     def get_failover_chain(self) -> list[Any]:
-        return [client for _, client in self._clients]
+        return list(self._clients)  # Return ModelClient objects
 
     def get_chain_names(self) -> list[str]:
-        return [name for name, _ in self._clients]
+        return [mc.name for mc in self._clients]
 
     def _ordered_clients(self) -> list[tuple[int, str, Any]]:
         if not self._clients:
@@ -233,8 +233,8 @@ class ReasoningAgent:
         ordered: list[tuple[int, str, Any]] = []
         for offset in range(total):
             idx = (start + offset) % total
-            name, client = self._clients[idx]
-            ordered.append((idx, name, client))
+            mc = self._clients[idx]
+            ordered.append((idx, mc.name, mc.client))
         return ordered
 
     async def decide_action(
