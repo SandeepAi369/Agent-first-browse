@@ -337,7 +337,13 @@ class ModelClient:
 
 # ═══════════════════════════════════════════════════════════════════════════════
 def _build_text_pipeline() -> list[ModelClient]:
-    """TEXT-ONLY pipeline for Manager & Helper. NEVER receives images."""
+    """TEXT-ONLY pipeline for Manager & Helper. NEVER receives images.
+
+    V16.1 — Multi-model-per-key architecture:
+      On NVIDIA NIM, ONE API key gives access to ALL models. So we register
+      multiple models under the same key. The failover loop tries every model
+      on each key before moving to the next provider.
+    """
     from langchain_openai import ChatOpenAI
 
     clients: list[ModelClient] = []
@@ -345,14 +351,13 @@ def _build_text_pipeline() -> list[ModelClient]:
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"
     }
 
-    # ── Groq — PRIMARY (all 3 keys from .env) ──
+    # ── Groq — PRIMARY (all keys from .env) ──
     groq_keys = _collect_keys(
         "GROQ_API_KEY",
         "GROQ_API_KEYS",
-        "OPENAI_API_KEY_FALLBACKS",       # gsk_QTj79y... is a Groq key here
-        "SUPERVISOR_MODEL_API_KEY_FALLBACKS",  # gsk_ZQTnjT..., gsk_QTj79y...
+        "OPENAI_API_KEY_FALLBACKS",
+        "SUPERVISOR_MODEL_API_KEY_FALLBACKS",
     )
-    # Filter: only keys starting with "gsk_" are Groq keys
     groq_keys = [k for k in groq_keys if k.startswith("gsk_")]
     model = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
     for idx, key in enumerate(groq_keys):
@@ -369,27 +374,39 @@ def _build_text_pipeline() -> list[ModelClient]:
     if groq_keys:
         logger.info("TEXT ── Groq (PRIMARY): %d keys loaded (%s)", len(groq_keys), model)
 
-    # ── NVIDIA NIM — SECONDARY ──
+    # ── NVIDIA NIM — SECONDARY (multiple models, same key) ──
+    # V16.1: One NVIDIA API key → try 5 different models before giving up
     nvidia_keys = _collect_keys("NVIDIA_NIM_API_KEY", "NVIDIA_NIM_API_KEYS")
-    model = os.getenv("NVIDIA_NIM_MODEL", "z-ai/glm-5.1")
     base = os.getenv("NVIDIA_NIM_BASE_URL", "https://integrate.api.nvidia.com/v1")
-    for idx, key in enumerate(nvidia_keys):
-        clients.append(ModelClient(
-            name=f"nvidia-text:{model}:{idx}",
-            client=ChatOpenAI(
-                model=model, api_key=key,
-                base_url=base, temperature=0.0, timeout=25,
-                default_headers=headers,
-            ),
-            provider="nvidia", pipeline="text",
-        ))
+    nvidia_text_models = [
+        ("nvidia/nemotron-3-super-120b-a12b", 25),   # Fast MoE, 1M context, tool calling
+        ("nvidia/nemotron-3-nano-30b-a3b", 20),      # Ultra-fast, 1M context
+        ("qwen/qwen3-235b-a22b", 25),                # Strong reasoning + coding
+        ("mistralai/mistral-medium-3.5-128b", 25),   # 256K context, reliable
+        ("nvidia/nemotron-3-ultra-550b-a55b", 35),   # Heavyweight fallback
+    ]
+    for key_idx, key in enumerate(nvidia_keys):
+        for model_name, timeout_s in nvidia_text_models:
+            clients.append(ModelClient(
+                name=f"nvidia-text:{model_name}:{key_idx}",
+                client=ChatOpenAI(
+                    model=model_name, api_key=key,
+                    base_url=base, temperature=0.0, timeout=timeout_s,
+                    default_headers=headers,
+                ),
+                provider="nvidia", pipeline="text",
+            ))
     if nvidia_keys:
-        logger.info("TEXT ── NVIDIA NIM (SECONDARY): %d keys loaded (%s)", len(nvidia_keys), model)
+        logger.info(
+            "TEXT ── NVIDIA NIM (SECONDARY): %d keys × %d models = %d instances",
+            len(nvidia_keys), len(nvidia_text_models),
+            len(nvidia_keys) * len(nvidia_text_models),
+        )
 
-    # ── Cerebras — TERTIARY (fast inference, generous rate limits) ──
+    # ── Cerebras — TERTIARY ──
     cerebras_keys = _collect_keys("CEREBRAS_API_KEY", "CEREBRAS_API_KEYS")
     if cerebras_keys:
-        cerebras_model = os.getenv("CEREBRAS_MODEL", "qwen-3-235b-a22b-instruct-2507")
+        cerebras_model = os.getenv("CEREBRAS_MODEL", "qwen-3-235b-a22b")
         cerebras_base = os.getenv("CEREBRAS_BASE_URL", "https://api.cerebras.ai/v1")
         for idx, key in enumerate(cerebras_keys):
             clients.append(ModelClient(
@@ -403,7 +420,7 @@ def _build_text_pipeline() -> list[ModelClient]:
             ))
         logger.info("TEXT ── Cerebras (TERTIARY): %d keys loaded (%s)", len(cerebras_keys), cerebras_model)
 
-    # ── Google Gemini — QUATERNARY TEXT FALLBACK (always available) ──
+    # ── Google Gemini — QUATERNARY TEXT FALLBACK ──
     gemini_text_keys = _collect_keys("GEMINI_API_KEY", "GEMINI_API_KEY_FALLBACKS")
     if gemini_text_keys:
         try:
@@ -486,33 +503,33 @@ def _build_vision_pipeline() -> list[ModelClient]:
         except Exception as e:
             logger.error("VISION ── Gemini bootstrap failed: %s", e)
 
-    # ── NVIDIA NIM Vision — SECONDARY (Phi-4 + Llama-3.2-90B) ──
+    # ── NVIDIA NIM Vision — SECONDARY (multi-model, same key) ──
+    # V16.1: google/gemma-4-32b-it is the user's preferred vision model
     nvidia_vision_key = os.getenv("NVIDIA_VISION_API_KEY", "").strip()
     if nvidia_vision_key:
         from langchain_openai import ChatOpenAI
         base = os.getenv("NVIDIA_VISION_BASE_URL", "https://integrate.api.nvidia.com/v1")
 
-        primary = os.getenv("NVIDIA_VISION_MODEL", "microsoft/phi-4-multimodal-instruct")
-        clients.append(ModelClient(
-            name=f"nvidia-vision:{primary}:0",
-            client=ChatOpenAI(
-                model=primary, api_key=nvidia_vision_key,
-                base_url=base, temperature=0.0, timeout=60,
-            ),
-            provider="nvidia", pipeline="vision",
-        ))
-        logger.info("VISION ── NVIDIA NIM (SECONDARY): %s loaded", primary)
-
-        fallback = os.getenv("NVIDIA_VISION_FALLBACK_MODEL", "meta/llama-3.2-90b-vision-instruct")
-        clients.append(ModelClient(
-            name=f"nvidia-vision:{fallback}:0",
-            client=ChatOpenAI(
-                model=fallback, api_key=nvidia_vision_key,
-                base_url=base, temperature=0.0, timeout=60,
-            ),
-            provider="nvidia", pipeline="vision",
-        ))
-        logger.info("VISION ── NVIDIA NIM (TERTIARY): %s loaded", fallback)
+        nvidia_vision_models = [
+            ("google/gemma-4-32b-it", 30),                    # User's preferred — fast, excellent vision
+            ("meta/llama-4-maverick-17b-128e-instruct", 35),  # 1M context, strong native vision
+            ("microsoft/phi-4-multimodal-instruct", 45),      # Lightweight 5.6B, text+image+audio
+            ("meta/llama-3.2-90b-vision-instruct", 50),       # Strong 90B vision fallback
+        ]
+        for model_name, timeout_s in nvidia_vision_models:
+            clients.append(ModelClient(
+                name=f"nvidia-vision:{model_name}:0",
+                client=ChatOpenAI(
+                    model=model_name, api_key=nvidia_vision_key,
+                    base_url=base, temperature=0.0, timeout=timeout_s,
+                ),
+                provider="nvidia", pipeline="vision",
+            ))
+        logger.info(
+            "VISION ── NVIDIA NIM (SECONDARY): %d vision models loaded (%s)",
+            len(nvidia_vision_models),
+            ", ".join(m for m, _ in nvidia_vision_models),
+        )
 
     return clients
 
@@ -598,29 +615,44 @@ async def invoke_with_failover(
     breaker: CircuitBreaker | None = None,
     health: ProviderHealthTracker | None = None,
     timeout_seconds: float = 30.0,
+    health_tracker: "ProviderHealthTracker | None" = None,
 ) -> tuple[Any, str]:
-    """Try each model in the chain until one succeeds."""
+    """V16.1 — Try each model in sequence. No per-model quarantine.
+
+    Old logic quarantined individual models for 2-16s on failure. This was
+    catastrophic when multiple models shared one API key (e.g., NVIDIA NIM)
+    because quarantining model A also effectively blocked models B-E on the
+    same key — the quarantine timer would expire and immediately re-trigger.
+
+    New logic:
+      1. Walk the chain sequentially, try every model.
+      2. Only skip models that are schema-blacklisted (400/Bad Request on
+         structured output — a permanent, not transient, issue).
+      3. On rate-limit (429), wait 2s then continue to next model.
+      4. No exponential backoff per model. Just try the next one.
+    """
     import asyncio
+
+    # Accept either kwarg name for backward compatibility
+    _health = health or health_tracker
 
     if breaker and breaker.tripped:
         raise RuntimeError(f"Circuit breaker tripped: {breaker.reason}")
 
     last_error: str = ""
+    attempts = 0
 
     for idx, mc in enumerate(chain):
         name = mc.name
 
-        # V15.1: Check both quarantine AND schema blacklist
-        if health and not health.is_available(name):
-            if not health.all_quarantined([m.name for m in chain]):
-                continue
-        # V15.1 Patch A+C: Skip models blacklisted for this specific schema
-        if health and schema is not None:
+        # Only skip: schema blacklist (permanent 400 errors on structured output)
+        if _health and schema is not None:
             schema_name = schema.__name__ if hasattr(schema, '__name__') else "__structured_output__"
-            if health.is_schema_blacklisted(name, schema_name):
+            if _health.is_schema_blacklisted(name, schema_name):
                 logger.debug("Skipping '%s' — blacklisted for schema '%s'", name, schema_name)
                 continue
 
+        attempts += 1
         try:
             llm = mc.client
             if schema is not None:
@@ -628,30 +660,34 @@ async def invoke_with_failover(
 
             response = await asyncio.wait_for(llm.ainvoke(messages), timeout=timeout_seconds)
 
-            if health:
-                health.record_success(name)
+            if _health:
+                _health.record_success(name)
             if breaker:
                 breaker.record_success()
             return response, name
 
         except asyncio.TimeoutError:
-            last_error = f"{name} TIMEOUT (>{timeout_seconds}s)"
-            if health:
-                health.record_failure(name)
+            last_error = f"{name} timed out — waiting 5.0s"
             if breaker:
                 breaker.record_failure()
-            logger.warning("⚠️ FAILOVER [%d/%d]: %s", idx + 1, len(chain), last_error)
+            logger.warning("⚠️  FAILOVER [%d/%d]: %s TIMED OUT (>%ds)", idx + 1, len(chain), name, timeout_seconds)
 
         except Exception as exc:
             err = str(exc)
-            last_error = f"{name}: {err[:150]}"
+            last_error = f"{name} — {err[:150]}"
             is_rl = "429" in err or "rate" in err.lower()
-            if health:
-                health.record_failure(name, is_rate_limit=is_rl, error_msg=err)
+            is_schema_err = "400" in err and ("additionalProperties" in err or "schema" in err.lower())
+
+            # Only record schema blacklist (permanent issue)
+            if _health and is_schema_err:
+                _health.record_failure(name, is_rate_limit=False, error_msg=err)
+
             if breaker:
                 breaker.record_failure()
-            logger.warning("⚠️ FAILOVER [%d/%d]: %s", idx + 1, len(chain), last_error)
+            logger.warning("⚠️  FAILOVER [%d/%d]: %s — %s", idx + 1, len(chain), name, err[:200])
+
+            # On rate limit, short 2s pause then move to next model immediately
             if is_rl:
-                await asyncio.sleep(1.5)
+                await asyncio.sleep(2.0)
 
     raise RuntimeError(f"ALL {len(chain)} models failed. Last: {last_error}")
