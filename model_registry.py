@@ -381,6 +381,11 @@ def _build_text_pipeline() -> list[ModelClient]:
     base = os.getenv("NVIDIA_NIM_BASE_URL", "https://integrate.api.nvidia.com/v1")
     nvidia_text_models = [
         ("openai/gpt-oss-120b", 30),
+        # ("nvidia/nemotron-3-super-120b-a12b", 25),   # Fast MoE, 1M context, tool calling
+        # ("nvidia/nemotron-3-nano-30b-a3b", 20),      # Ultra-fast, 1M context
+        # ("qwen/qwen3-235b-a22b", 25),                # Strong reasoning + coding
+        # ("mistralai/mistral-medium-3.5-128b", 25),   # 256K context, reliable
+        # ("nvidia/nemotron-3-ultra-550b-a55b", 35),   # Heavyweight fallback
     ]
     for key_idx, key in enumerate(nvidia_keys):
         for model_name, timeout_s in nvidia_text_models:
