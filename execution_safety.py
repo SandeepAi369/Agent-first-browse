@@ -102,10 +102,19 @@ def _has_performed_critical_action(working_mem, keywords: list[str]) -> bool:
                 return True
         elif isinstance(step, dict):
             action = step.get("action", {})
-            if action.get("type") in ("click", "type"):
-                action_desc = str(action).lower()
-                if any(kw in action_desc for kw in keywords):
+            if isinstance(action, str):
+                # action is a plain string like "click on Create Post"
+                if any(kw in action.lower() for kw in keywords):
                     return True
+            elif isinstance(action, dict):
+                if action.get("type") in ("click", "type"):
+                    action_desc = str(action).lower()
+                    if any(kw in action_desc for kw in keywords):
+                        return True
+            # Also check other top-level dict keys for keyword matches
+            step_text = str(step).lower()
+            if any(kw in step_text for kw in keywords):
+                return True
     return False
 
 

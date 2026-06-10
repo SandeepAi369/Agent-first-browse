@@ -503,10 +503,14 @@ def _build_vision_pipeline() -> list[ModelClient]:
         except Exception as e:
             logger.error("VISION ── Gemini bootstrap failed: %s", e)
 
-    # ── NVIDIA NIM Vision — SECONDARY (multi-model, same key) ──
-    # V16.1: google/gemma-4-32b-it is the user's preferred vision model
-    nvidia_vision_key = os.getenv("NVIDIA_VISION_API_KEY", "").strip()
-    if nvidia_vision_key:
+    # ── NVIDIA NIM Vision — SECONDARY (multi-model × ALL NVIDIA keys) ──
+    # V16.1: Collect ALL NVIDIA keys so every vision model gets tried on every key
+    nvidia_vision_keys = _collect_keys(
+        "NVIDIA_VISION_API_KEY",
+        "NVIDIA_NIM_API_KEY",
+        "NVIDIA_NIM_API_KEYS",
+    )
+    if nvidia_vision_keys:
         from langchain_openai import ChatOpenAI
         base = os.getenv("NVIDIA_VISION_BASE_URL", "https://integrate.api.nvidia.com/v1")
 
@@ -516,19 +520,20 @@ def _build_vision_pipeline() -> list[ModelClient]:
             ("microsoft/phi-4-multimodal-instruct", 45),      # Lightweight 5.6B, text+image+audio
             ("meta/llama-3.2-90b-vision-instruct", 50),       # Strong 90B vision fallback
         ]
-        for model_name, timeout_s in nvidia_vision_models:
-            clients.append(ModelClient(
-                name=f"nvidia-vision:{model_name}:0",
-                client=ChatOpenAI(
-                    model=model_name, api_key=nvidia_vision_key,
-                    base_url=base, temperature=0.0, timeout=timeout_s,
-                ),
-                provider="nvidia", pipeline="vision",
-            ))
+        for key_idx, key in enumerate(nvidia_vision_keys):
+            for model_name, timeout_s in nvidia_vision_models:
+                clients.append(ModelClient(
+                    name=f"nvidia-vision:{model_name}:{key_idx}",
+                    client=ChatOpenAI(
+                        model=model_name, api_key=key,
+                        base_url=base, temperature=0.0, timeout=timeout_s,
+                    ),
+                    provider="nvidia", pipeline="vision",
+                ))
         logger.info(
-            "VISION ── NVIDIA NIM (SECONDARY): %d vision models loaded (%s)",
-            len(nvidia_vision_models),
-            ", ".join(m for m, _ in nvidia_vision_models),
+            "VISION ── NVIDIA NIM (SECONDARY): %d keys × %d models = %d instances",
+            len(nvidia_vision_keys), len(nvidia_vision_models),
+            len(nvidia_vision_keys) * len(nvidia_vision_models),
         )
 
     return clients
