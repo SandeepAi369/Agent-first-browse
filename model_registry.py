@@ -380,7 +380,7 @@ def _build_text_pipeline() -> list[ModelClient]:
     nvidia_keys = _collect_keys("NVIDIA_NIM_API_KEY", "NVIDIA_NIM_API_KEYS")
     base = os.getenv("NVIDIA_NIM_BASE_URL", "https://integrate.api.nvidia.com/v1")
     nvidia_text_models = [
-        ("openai/gpt-oss-120b", 30),
+        ("google/gemma-4-31b-it", 30),
         # ("nvidia/nemotron-3-super-120b-a12b", 25),   # Fast MoE, 1M context, tool calling
         # ("nvidia/nemotron-3-nano-30b-a3b", 20),      # Ultra-fast, 1M context
         # ("qwen/qwen3-235b-a22b", 25),                # Strong reasoning + coding
