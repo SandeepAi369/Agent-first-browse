@@ -588,19 +588,19 @@ VISUAL_CURSOR_INIT_SCRIPT = """
 
     const box = document.createElement('div');
     box.id = 'playwright-visual-cursor';
-    box.style.width = '20px';
-    box.style.height = '20px';
+    box.style.width = '40px';
+    box.style.height = '40px';
     box.style.position = 'absolute';
     box.style.top = '0';
     box.style.left = '0';
     box.style.zIndex = '2147483647';
     box.style.pointerEvents = 'none';
     box.style.borderRadius = '50%';
-    box.style.backgroundColor = 'rgba(255, 0, 0, 0.5)';
-    box.style.border = '2px solid red';
+    box.style.backgroundColor = 'rgba(255, 0, 0, 0.4)';
+    box.style.border = '3px solid red';
     box.style.transition = 'background-color 0.1s, transform 0.1s';
     box.style.transform = 'translate(-50%, -50%)';
-    box.style.boxShadow = '0 0 5px rgba(0,0,0,0.3)';
+    box.style.boxShadow = '0 0 8px rgba(0,0,0,0.5)';
 
     // Wait for body to be ready
     const initCursor = () => {
