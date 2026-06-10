@@ -57,23 +57,16 @@ def get_stealth_user_agent() -> str:
 # Default export for backward compatibility
 STEALTH_USER_AGENT = get_stealth_user_agent()
 
-# ── Randomized Viewport Pool ──
-# Real-world common resolutions to prevent fingerprint linkage across sessions.
-import random as _random
-
-VIEWPORT_POOL: list[dict[str, int]] = [
-    {"width": 1920, "height": 1080},
-    {"width": 1536, "height": 864},
-    {"width": 1440, "height": 900},
-    {"width": 1366, "height": 768},
-    {"width": 1600, "height": 900},
-    {"width": 1280, "height": 800},
-]
+# ── Fixed Viewport ──
+# V16.1: Consistent viewport that fills the LEFT half of a 1920×1080 screen,
+# top-to-bottom. Right side remains free for the user to monitor.
+# This eliminates confusing random viewport changes between sessions.
+_FIXED_VIEWPORT: dict[str, int] = {"width": 960, "height": 1080}
 
 
 def get_random_viewport() -> dict[str, int]:
-    """Return a random viewport from the pool for this session."""
-    return _random.choice(VIEWPORT_POOL)
+    """Return the fixed viewport. Name kept for backward compatibility."""
+    return dict(_FIXED_VIEWPORT)
 
 
 STEALTH_LAUNCH_ARGS = [
@@ -476,7 +469,7 @@ async def launch_stealth_context(
     context = await playwright.chromium.launch_persistent_context(
         user_data_dir=str(user_data_dir),
         headless=browser_config.headless,
-        viewport={"width": 1440, "height": 900},
+        viewport=_FIXED_VIEWPORT,
         locale="en-US",
         timezone_id="UTC",
         user_agent=STEALTH_USER_AGENT,
@@ -519,7 +512,7 @@ async def _try_launch_with_cloakbrowser(
         "user_data_dir": str(user_data_dir),
         "args": list(STEALTH_LAUNCH_ARGS),
         "ignore_default_args": ["--enable-automation"],
-        "viewport": {"width": 1440, "height": 900},
+        "viewport": dict(_FIXED_VIEWPORT),
         "locale": "en-US",
         "timezone_id": "UTC",
         "user_agent": STEALTH_USER_AGENT,
