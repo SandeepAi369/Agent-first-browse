@@ -95,12 +95,17 @@ def _extract_critical_actions(objective: str) -> list[str]:
 
 def _has_performed_critical_action(working_mem, keywords: list[str]) -> bool:
     """Scan action history for a click or type action matching critical keywords."""
-    for step in working_mem.history:
-        action = step.get("action", {})
-        if action.get("type") in ("click", "type"):
-            action_desc = str(action).lower()
-            if any(kw in action_desc for kw in keywords):
+    for step in working_mem.episodic:
+        if isinstance(step, str):
+            step_desc = step.lower()
+            if any(kw in step_desc for kw in keywords):
                 return True
+        elif isinstance(step, dict):
+            action = step.get("action", {})
+            if action.get("type") in ("click", "type"):
+                action_desc = str(action).lower()
+                if any(kw in action_desc for kw in keywords):
+                    return True
     return False
 
 
