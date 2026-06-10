@@ -58,10 +58,10 @@ def get_stealth_user_agent() -> str:
 STEALTH_USER_AGENT = get_stealth_user_agent()
 
 # ── Fixed Viewport ──
-# V16.1: Consistent viewport that fills the LEFT half of a 1920×1080 screen,
-# top-to-bottom. Right side remains free for the user to monitor.
-# This eliminates confusing random viewport changes between sessions.
-_FIXED_VIEWPORT: dict[str, int] = {"width": 960, "height": 1080}
+# V16.1: Consistent viewport that fills ~75% of a 1920×1080 screen,
+# top-to-bottom from the left corner. Right 25% remains free for the user.
+# Large enough for vision models to work properly and user to see everything.
+_FIXED_VIEWPORT: dict[str, int] = {"width": 1440, "height": 1080}
 
 
 def get_random_viewport() -> dict[str, int]:
