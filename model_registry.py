@@ -375,15 +375,12 @@ def _build_text_pipeline() -> list[ModelClient]:
         logger.info("TEXT ── Groq (PRIMARY): %d keys loaded (%s)", len(groq_keys), model)
 
     # ── NVIDIA NIM — SECONDARY (multiple models, same key) ──
-    # V16.1: One NVIDIA API key → try 5 different models before giving up
+    # V16.3: The user specifically requested openai/gpt-oss-120b as the ONLY text model
+    # for NVIDIA, completely replacing the nemotron, qwen, and mistral models.
     nvidia_keys = _collect_keys("NVIDIA_NIM_API_KEY", "NVIDIA_NIM_API_KEYS")
     base = os.getenv("NVIDIA_NIM_BASE_URL", "https://integrate.api.nvidia.com/v1")
     nvidia_text_models = [
-        ("nvidia/nemotron-3-super-120b-a12b", 25),   # Fast MoE, 1M context, tool calling
-        ("nvidia/nemotron-3-nano-30b-a3b", 20),      # Ultra-fast, 1M context
-        ("qwen/qwen3-235b-a22b", 25),                # Strong reasoning + coding
-        ("mistralai/mistral-medium-3.5-128b", 25),   # 256K context, reliable
-        ("nvidia/nemotron-3-ultra-550b-a55b", 35),   # Heavyweight fallback
+        ("openai/gpt-oss-120b", 30),
     ]
     for key_idx, key in enumerate(nvidia_keys):
         for model_name, timeout_s in nvidia_text_models:
