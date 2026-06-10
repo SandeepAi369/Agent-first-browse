@@ -84,6 +84,9 @@ STEALTH_LAUNCH_ARGS = [
     "--disable-background-networking",
     # Suppress "Chrome is being controlled by automated software" infobar
     "--disable-client-side-phishing-detection",
+    # V16.1: Pin window to top-left corner, full height, 75% width
+    "--window-position=0,0",
+    f"--window-size={_FIXED_VIEWPORT['width']},{_FIXED_VIEWPORT['height']}",
 ]
 
 # ═══════════════════════════════════════════════════════════════════════════════
