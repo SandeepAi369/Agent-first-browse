@@ -496,24 +496,37 @@ async def _invoke_with_failover(
     base64_image: str | None = None,
     health_tracker=None,
 ) -> tuple:
-    """V16.1 — Try each model in sequence. No per-model quarantine.
+    """V16.2 — Provider-aware failover with 429 skip.
 
-    Quarantine was catastrophic when multiple models shared one API key
-    (e.g., NVIDIA NIM). Quarantining model A effectively blocked models B-E
-    on the same key. Now we just walk the chain and try each model immediately.
-    Only schema blacklist (permanent 400 errors) is preserved.
+    When a provider (e.g., Groq) hits a 429 rate limit, ALL remaining
+    models from that provider are skipped instantly. The loop jumps
+    directly to the next provider (e.g., NVIDIA).
+
+    Accepts either ModelClient objects or raw LLM clients for backward compat.
     """
     if circuit_breaker and circuit_breaker.tripped:
         raise RuntimeError(f"🔌 CIRCUIT BREAKER TRIPPED: {circuit_breaker.reason}")
 
     last_error = None
-    model_names = [
-        getattr(m, 'model_name', getattr(m, 'model', str(m)))
-        for m in failover_chain
-    ]
+    rate_limited_providers: set[str] = set()  # Providers that hit 429
 
-    for idx, llm in enumerate(failover_chain):
-        model_name = model_names[idx]
+    # Support both ModelClient objects and raw LLM clients
+    from model_registry import ModelClient
+    entries: list[tuple[str, str, object]] = []  # (name, provider, llm_client)
+    for item in failover_chain:
+        if isinstance(item, ModelClient):
+            entries.append((item.name, item.provider, item.client))
+        else:
+            # Raw LLM client (backward compat)
+            name = getattr(item, 'model_name', getattr(item, 'model', str(item)))
+            entries.append((name, "unknown", item))
+
+    for idx, (model_name, provider, llm) in enumerate(entries):
+        # Skip ALL models from rate-limited providers
+        if provider in rate_limited_providers:
+            logger.debug("⏭️ SKIP [%d/%d]: %s (provider '%s' rate-limited)",
+                         idx + 1, len(entries), model_name, provider)
+            continue
 
         # Dynamic Vision Payload Support
         supports_vision = any(x in model_name.lower() for x in [
@@ -546,19 +559,22 @@ async def _invoke_with_failover(
         except asyncio.TimeoutError:
             if circuit_breaker:
                 circuit_breaker.record_failure()
-            logger.warning("⚠️  FAILOVER [%d/%d]: %s TIMED OUT (>30s)", idx + 1, len(failover_chain), model_name)
+            logger.warning("⚠️  FAILOVER [%d/%d]: %s TIMED OUT (>30s)", idx + 1, len(entries), model_name)
             last_error = TimeoutError(f"{model_name} timed out")
         except Exception as e:
             if circuit_breaker:
                 circuit_breaker.record_failure()
             error_str = str(e)
             is_rate_limit = "429" in error_str or "rate_limit" in error_str.lower()
-            logger.warning("⚠️  FAILOVER [%d/%d]: %s — %s", idx + 1, len(failover_chain), model_name, error_str[:150])
+            logger.warning("⚠️  FAILOVER [%d/%d]: %s — %s", idx + 1, len(entries), model_name, error_str[:150])
             if is_rate_limit:
-                await asyncio.sleep(2.0)
+                # Mark entire provider as rate-limited — skip all remaining models from it
+                rate_limited_providers.add(provider)
+                logger.info("⏭️ Provider '%s' rate-limited — skipping all remaining %s models",
+                            provider, provider)
             last_error = e
 
-    raise RuntimeError(f"ALL {len(failover_chain)} models failed. Last: {last_error}")
+    raise RuntimeError(f"ALL {len(entries)} models failed. Last: {last_error}")
 
 
 async def run_agent(objective: str):
