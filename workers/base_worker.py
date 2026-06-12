@@ -65,6 +65,20 @@ class WorkerAction(BaseModel):
     y: float | None = Field(default=None, description="Y coordinate (fallback)")
     text: str | None = Field(default=None, description="Text to type for 'type' action")
     wait_ms: int | None = Field(default=None, description="Milliseconds for 'wait' action")
+    needs_vision: bool = Field(
+        default=False,
+        description=(
+            "Set TRUE only when you genuinely CANNOT resolve this step from the "
+            "text element map alone — e.g. several controls look identical, you "
+            "can't tell if your last action worked, the layout is unclear, or you "
+            "need to visually confirm an outcome. Be honest: most steps do NOT "
+            "need vision. When true, a screenshot is taken and re-evaluated."
+        ),
+    )
+    vision_question: str = Field(
+        default="",
+        description="If needs_vision: the specific thing to resolve by looking (e.g. 'which button is the real Add to Cart?').",
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -78,6 +92,7 @@ async def invoke_worker(
     breaker,
     health_tracker,
     invoke_fn,
+    vision_chain: list | None = None,
 ) -> dict[str, Any]:
     """Core worker invocation logic shared by all specialists.
 
@@ -220,8 +235,35 @@ async def invoke_worker(
         "wait_ms": decision.wait_ms,
     }
 
+    # ── Vision-on-demand (V21): the agent works on the a11y DOM by default and
+    #    "opens its eyes" for ONE step only when it cannot resolve the page from
+    #    text — then this update reverts (force_vision cleared) and the next step
+    #    is text-only again. ──
+    vision_update: dict[str, Any] = {}
+    from vision_consult import should_consult_vision, consult_vision, apply_vision_verdict
+    consult, why = should_consult_vision(
+        needs_vision=getattr(decision, "needs_vision", False),
+        state=state,
+        action_type=decision.action_type,
+    )
+    if consult and vision_chain:
+        logger.info("🧠→👁️ Escalating to vision: %s", why)
+        verdict, _vm = await consult_vision(
+            invoke_fn, vision_chain, breaker, health_tracker,
+            objective=objective,
+            question=getattr(decision, "vision_question", "") or why,
+            a11y_markdown=dom_markdown,
+            history_tail=history_compressed,
+        )
+        proposed, overridden = apply_vision_verdict(proposed, verdict)
+        vision_update["vision_consults"] = state.get("vision_consults", 0) + 1
+        vision_update["force_vision"] = False  # consumed — revert to a11y DOM
+        if overridden:
+            logger.info("👁️→⚡ Vision refined the action → %s [%s]",
+                        proposed["verb"], proposed.get("element_id") or "")
+
     # ── Action dedup tracking ──
-    current_sig = f"{decision.action_type}:{(decision.text or 'none')[:30]}"
+    current_sig = f"{proposed['verb']}:{(proposed.get('text') or 'none')[:30]}"
     last_sig = state.get("last_action_signature", "")
     if current_sig == last_sig:
         new_consecutive = state.get("consecutive_identical_actions", 0) + 1
@@ -232,6 +274,7 @@ async def invoke_worker(
         "proposed_action": proposed,
         "last_action_signature": current_sig,
         "consecutive_identical_actions": new_consecutive,
+        **vision_update,
     }
 
 

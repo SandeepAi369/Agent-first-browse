@@ -153,6 +153,11 @@ class BrainState(BaseModel):
     action_outcome: str = ""  # "→ OK" | "→ FAILED: ..." | etc.
     retry_count: int = 0
 
+    # ── V21 Vision-on-demand (a11y DOM is default; vision is a per-step toggle) ──
+    vision_consults: int = 0       # per-task budget counter
+    force_vision: bool = False     # set by the ladder's vision rung; consumed next step
+    ineffective_streak: int = 0    # consecutive ineffective click/type on same target
+
     # ── Session Results ──
     mission_success: bool = False
     session_checkpoint_id: str | None = None

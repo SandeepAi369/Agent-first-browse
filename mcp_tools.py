@@ -304,6 +304,30 @@ async def mcp_snapshot() -> dict:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+#  Tool: Screenshot (for on-demand vision consults)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def mcp_screenshot(full_page: bool = False) -> dict:
+    """Capture a base64-encoded viewport screenshot.
+
+    Used ONLY when the agent escalates to vision (it cannot resolve the page from
+    the a11y DOM alone). Viewport — not full-page — so the image aligns with the
+    element-map coordinates the vision model reasons over.
+
+    Returns: {"ok": bool, "base64": str, "error": str}
+    """
+    page = _get_page()
+    try:
+        png = await asyncio.wait_for(
+            page.screenshot(full_page=full_page, type="png"), timeout=10.0
+        )
+        return {"ok": True, "base64": base64.b64encode(png).decode("utf-8"), "error": ""}
+    except Exception as e:
+        logger.warning("mcp_screenshot failed: %s", e)
+        return {"ok": False, "base64": "", "error": str(e)[:200]}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 #  Tool: Wait
 # ═══════════════════════════════════════════════════════════════════════════════
 
