@@ -79,6 +79,10 @@ def _escalate(state: dict, reason: str, updates: dict) -> dict:
         updates["correction_context"] = (
             f"\n\n🧗 ADAPTIVE TACTIC [{lad['tactic']}]: {lad['directive']}"
         )
+        # V21: the 'vision' rung now triggers a REAL screenshot consult on the
+        # next worker step (was a no-op text directive before).
+        if lad["tactic"] == "vision":
+            updates["force_vision"] = True
     logger.info("🧗 Escalation [%s] rung→%d confidence=%.2f (%s)",
                 lad["tactic"], lad["rung"], updates["strategy_confidence"], reason)
     return lad
@@ -217,11 +221,16 @@ async def overwatch_node(state: dict[str, Any], page, critic, action_verifier=No
         updates["correction_failures"] = 0
         updates["correction_context"] = ""
         updates["critic_progress"] = state.get("critic_progress", 0) + 1
+        updates["ineffective_streak"] = 0  # V21: progress clears the visual-trigger
         logger.info("✓ Overwatch L3: %s [%.0f%%]", verdict.reason[:100], verdict.confidence * 100)
     else:
         cf = state.get("correction_failures", 0) + 1
         updates["correction_failures"] = cf
         updates["critic_no_progress"] = state.get("critic_no_progress", 0) + 1
+        # V21: a click/type that produced no visible effect — count it so that a
+        # short streak escalates to a vision look (the DOM says act, page doesn't).
+        if verb in ("click", "type"):
+            updates["ineffective_streak"] = state.get("ineffective_streak", 0) + 1
 
         if verdict.circuit_breaker_triggered:
             logger.warning("🛑 Overwatch L3: circuit breaker — %s", verdict.reason[:100])
