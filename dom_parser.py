@@ -51,7 +51,7 @@ _GOD_MODE_JS = r"""
        cull, and give them a strong score bonus so they survive the element
        budget. They still resolve to fresh, scrolled-into-view coordinates at
        action time via the V19 window.__aid registry. */
-    const ACTION_RE = /add to (cart|bag|basket)|buy\s?it\s?now|buy\s?now|place order|order now|go to (cart|checkout)|view cart|proceed( to (checkout|pay(ment)?|buy))?|checkout|pay now|make payment|notify me|sold out|out of stock|coming soon|add to wishlist|subscribe/i;
+    const ACTION_RE = /add to (cart|bag|basket)|buy\s?it\s?now|buy\s?now|buy\s?at\b|place order|order now|go to (cart|checkout)|view cart|proceed( to (checkout|pay(ment)?|buy))?|checkout|pay now|make payment|notify me|sold out|out of stock|coming soon|add to wishlist|subscribe/i;
 
     /* ━━━ 1. COLLECT CANDIDATES ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
     const seen = new WeakSet();
@@ -118,9 +118,41 @@ _GOD_MODE_JS = r"""
         }
     } catch(_) {}
 
+    /* ── V19.1 Guaranteed primary-action sweep ──
+       Flipkart / Amazon render "Add to cart" / "Buy now" / "Buy at ₹…" as styled
+       <DIV> elements (NOT <button>) in a fixed action bar — and the behavioral
+       cursor:pointer pass above can miss them (600-candidate cap, or no pointer
+       cursor at scan time). That single miss is THE Flipkart "Add to Cart not
+       found" failure. Here we force-collect any LEAF-ish element whose text is
+       exactly a commerce action, bypassing both the cap and the pointer check.
+       Anchored + length-capped + children≤3 so we match the real button and not
+       a wrapper or promo copy. */
+    try {
+        for (const el of document.querySelectorAll('button, a, [role="button"], div, span, li')) {
+            if (seen.has(el)) continue;
+            if (el.children && el.children.length > 3) continue;   /* actions are leaf-ish */
+            let t;
+            try { t = (el.textContent || '').replace(/\s+/g, ' ').trim(); } catch(_) { continue; }
+            if (!t || t.length > 28 || !ACTION_RE.test(t)) continue;
+            /* Prefer the INNERMOST action element: if a child already holds the
+               action text, collect that child instead of this wrapper. This both
+               avoids wrappers spanning several buttons ("Add to cartBuy now") and
+               collapses Flipkart's nested-div clones down to the real target. */
+            let childHasAction = false;
+            for (const ch of el.children) {
+                let ct = '';
+                try { ct = (ch.textContent || '').replace(/\s+/g, ' ').trim(); } catch(_) {}
+                if (ct && ct.length <= 28 && ACTION_RE.test(ct)) { childHasAction = true; break; }
+            }
+            if (childHasAction) continue;
+            seen.add(el); candidates.push(el);
+        }
+    } catch(_) {}
+
     /* ━━━ 2. FILTER + SCORE ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
     const vcx = vw / 2, vcy = vh / 2;
     const scored = [];
+    const actionCenters = [];  /* V19.1: collapse nested duplicates of one action button */
     const SEMANTIC_CONTAINERS = new Set([
         'MAIN','HEADER','FOOTER','NAV','FORM','DIALOG',
         'ARTICLE','SECTION','ASIDE','FIELDSET',
@@ -175,6 +207,11 @@ _GOD_MODE_JS = r"""
         text = text.replace(/\s+/g, ' ').slice(0, 120);
         if (!text && tag !== 'INPUT' && tag !== 'TEXTAREA' && tag !== 'SELECT') continue;
 
+        /* V19.1: a SHORT element whose text is exactly a commerce action is a
+           primary "goal" button even when rendered as a <div> (Flipkart/Amazon).
+           This drives both kind classification and the score bonus below. */
+        const isActionText = (text.length <= 28 && ACTION_RE.test(text));
+
         /* ── Kind classification ── */
         const role = (el.getAttribute('role') || '').toLowerCase();
         let kind = 'other';
@@ -186,6 +223,7 @@ _GOD_MODE_JS = r"""
                  || el.getAttribute('contenteditable') === 'true'
                  || el.getAttribute('contenteditable') === 'plaintext-only')       kind = 'input';
         else if (role === 'checkbox' || role === 'radio')                         kind = 'button';
+        else if (isActionText)                                                    kind = 'button';
 
         /* ── Coordinates ── */
         const cx = Math.round(rect.left + rect.width / 2);
@@ -196,9 +234,10 @@ _GOD_MODE_JS = r"""
         const inViewport = rect.top >= 0 && rect.bottom <= vh && rect.left >= 0 && rect.right <= vw;
         if (!inViewport) score += 10000;
 
-        /* V19.1: guarantee rescued primary-action buttons survive the budget
-           cut even when far off-screen (this bonus beats the +10000 penalty). */
-        if (isAction) score -= 16000;
+        /* V19.1: guarantee primary-action buttons survive the budget cut —
+           whether off-screen (isAction rescue) or a div-rendered action bar
+           (isActionText). This bonus beats the +10000 off-viewport penalty. */
+        if (isAction || isActionText) score -= 16000;
 
         /* ── V15.0 F1: Fixed/sticky elements are ALWAYS visible (W3C getComputedStyle) ── */
         const cssPos = cs.position;
@@ -268,6 +307,19 @@ _GOD_MODE_JS = r"""
                 rc = rc.parentElement; hops++;
             }
             if (ctx) hint = hint ? (hint + ' · ' + ctx) : ('in: ' + ctx);
+        }
+
+        /* V19.1: collapse nested duplicates of the SAME action button — Flipkart
+           wraps "Add to cart" in several nested <div>s that all match the sweep.
+           Keep one entry per physical location so the budget isn't eaten by
+           clones (distinct product cards sit at distinct centers → still kept). */
+        if (isActionText) {
+            let dup = false;
+            for (const c of actionCenters) {
+                if (Math.abs(c.x - cx) <= 22 && Math.abs(c.y - cy) <= 22) { dup = true; break; }
+            }
+            if (dup) continue;
+            actionCenters.push({ x: cx, y: cy });
         }
 
         scored.push({ el, text, kind, cx, cy, score, tag, inputState, container, hint });
