@@ -1,0 +1,4 @@
+#!/bin/bash
+cd "/home/sandeep/agent first IDE"
+source .venv/bin/activate
+python3 advanced_agent.py run 'Navigate to https://www.amazon.in. Your task is to find a "Ryzen 7 9700X" processor and add it to the cart. Constraints: 1. If any Login or Promotional popup appears, close it immediately. Do not attempt to log in. 2. Search for "Ryzen 7 9700X". 3. Look at the search results. You must ignore "Sponsored" products and ignore products that are "Out of Stock". 4. Find the cheapest valid option from the first page and click on it. 5. Once on the product page, click the "Add to Cart" button. 6. Verify that the item was successfully added to the cart (look for a cart confirmation message or cart counter update) and then declare the task done.' > amazon_ucrf.log 2>&1

@@ -42,7 +42,11 @@ from brain_state import BrainState
 from moe_router import route_to_worker, verdict_router
 import mcp_tools
 
-logger = logging.getLogger("brain_graph")
+try:
+    from app.logger import get_logger
+    logger = get_logger("brain_graph")
+except ImportError:
+    logger = logging.getLogger("brain_graph")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -90,34 +94,43 @@ async def goal_compiler_node(state: BrainState) -> dict:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 async def planner_node(state: BrainState) -> dict:
-    """Decompose objective into sequential checkpoints using LLM."""
+    """Strategic planner — forms an APPROACH + finish-line + steps in one call.
+
+    V18: instead of just a list of checkpoints, the planner now produces a
+    StrategicPlan{strategy, success_criteria, assumptions, steps}. The strategy
+    and assumptions seed the agent's persistent cognition (so it reasons WITH a
+    theory rather than re-deriving one every step), and success_criteria gives
+    the agent an explicit finish line (anti done-confusion).
+    """
+    from langchain_core.messages import SystemMessage, HumanMessage
+    from cognition import StrategicPlan, merge_beliefs
+
     objective = state.objective
 
-    prompt = (
-        "Break this browser automation objective into 3-5 short sequential checkpoints. "
-        "Each checkpoint is ONE specific browser action (navigate, click, type, verify). "
-        "Return ONLY a JSON array of strings. No markdown, no explanation.\n\n"
-        f"Objective: {objective}"
-    )
+    sys_msg = SystemMessage(content=(
+        "You are a senior web-automation strategist. Given an objective, produce: "
+        "(1) a short overall STRATEGY/approach, (2) the SUCCESS CRITERIA describing "
+        "exactly what the page shows when the task is done, (3) 2-4 testable "
+        "ASSUMPTIONS, and (4) 3-5 sequential STEPS (each one browser action)."
+    ))
+    user_msg = HumanMessage(content=f"Objective: {objective}")
 
-    from langchain_core.messages import HumanMessage
+    strategy = ""
+    success_criteria = ""
+    assumptions: list[str] = []
+    checkpoints: list[str] = []
     try:
-        response, _ = await _INVOKE_FN(
-            _FAILOVER_CHAIN,
-            [HumanMessage(content=prompt)],
-            None, _BREAKER, health_tracker=_HEALTH_TRACKER,
+        plan, _ = await _INVOKE_FN(
+            _FAILOVER_CHAIN, [sys_msg, user_msg], StrategicPlan,
+            _BREAKER, health_tracker=_HEALTH_TRACKER,
         )
-        text = response.content if hasattr(response, "content") else str(response)
-        text = text.strip()
-        if "```" in text:
-            text = text.split("```")[1].split("```")[0].strip()
-            if text.startswith("json"):
-                text = text[4:].strip()
-        checkpoints = json.loads(text)
-        if not isinstance(checkpoints, list):
-            checkpoints = [objective]
+        strategy = (getattr(plan, "strategy", "") or "").strip()
+        success_criteria = (getattr(plan, "success_criteria", "") or "").strip()
+        assumptions = [a.strip() for a in (getattr(plan, "assumptions", []) or []) if a.strip()]
+        checkpoints = [s.strip() for s in (getattr(plan, "steps", []) or []) if s.strip()]
     except Exception as e:
-        logger.warning("Planner failed: %s — using objective as single step", e)
+        logger.warning("Strategic planner failed: %s — using objective as single step", e)
+    if not checkpoints:
         checkpoints = [objective]
 
     # Build plan steps
@@ -128,6 +141,13 @@ async def planner_node(state: BrainState) -> dict:
             "desc": desc.strip(),
             "status": "active" if i == 0 else "pending",
         })
+
+    # Seed cognition: strategy + bounded initial beliefs (from assumptions)
+    beliefs = merge_beliefs([], assumptions)
+    if strategy:
+        logger.info("🧭 Strategy: %s", strategy[:160])
+    if success_criteria:
+        logger.info("🏁 Done when: %s", success_criteria[:120])
 
     # Generate PRM checklist
     prm_checklist = []
@@ -161,6 +181,17 @@ async def planner_node(state: BrainState) -> dict:
         "plan_progress_pct": 0,
         "prm_checklist": prm_checklist,
         "skill_context": skill_context,
+        # ── Cognition seed ──
+        "strategy": strategy,
+        "success_criteria": success_criteria,
+        "beliefs": beliefs,
+        "strategy_confidence": 1.0,
+        "current_obstacle": "",
+        "ladder_rung": 0,
+        "tried_tactics": [],
+        "goal_score_window": [],
+        "restrategize_count": 0,
+        "goal_complete_hint": "",
     }
 
 
@@ -320,8 +351,53 @@ async def done_check_node(state: BrainState) -> dict:
 #  NODE: Commit — Checkpoint + Advance Plan
 # ═══════════════════════════════════════════════════════════════════════════════
 
+async def _run_prm_audit(state: BrainState) -> tuple[float, list[dict], list[str]]:
+    """Revived PRM goal-audit: score the live page against the checklist.
+
+    Reconstructs ChecklistItem objects from the persisted dicts, scores them
+    (PRMCritic mutates statuses in place), and writes the statuses back.
+    Returns (goal_score 0..1, updated_checklist_dicts, newly_completed_descs).
+    """
+    from prm_critic import ChecklistItem
+
+    items = [
+        ChecklistItem(
+            id=i,
+            description=d.get("desc", ""),
+            status=d.get("status", "pending"),
+            confidence=float(d.get("confidence", 0.0)),
+            step_completed=int(d.get("step_completed", -1)),
+        )
+        for i, d in enumerate(state.prm_checklist)
+    ]
+    step_score = await _PRM_CRITIC.score_step(
+        checklist=items,
+        dom_markdown=state.dom_markdown,
+        current_url=state.current_url,
+        step_number=state.step_number + 1,
+    )
+    updated = [
+        {"desc": it.description, "status": it.status,
+         "confidence": it.confidence, "step_completed": it.step_completed}
+        for it in items
+    ]
+    return step_score.total_score, updated, step_score.newly_completed
+
+
 async def commit_node(state: BrainState) -> dict:
-    """Commit after Overwatch passes. Advance plan, extend budget if needed."""
+    """Commit after Overwatch passes. Advance plan, extend budget if needed.
+
+    V18: a committed step is a VERIFIED-PROGRESS step, so it reinforces strategy
+    confidence and clears the transient 'stuck' state (the obstacle is resolved —
+    no stale escalation directive may bleed forward). A throttled PRM goal-audit
+    gives a goal-aware progress signal, detects stalls, and nudges the agent to
+    finish once the goal looks achieved (anti done-confusion).
+    """
+    from cognition import (
+        update_confidence, prm_should_audit, push_goal_score, detect_stall,
+        clear_transient, DONE_CEILING,
+    )
+
     updates = {
         "page_fsm": "READY",
         "step_number": state.step_number + 1,
@@ -331,6 +407,10 @@ async def commit_node(state: BrainState) -> dict:
         "proposed_action": None,
         "overwatch_verdict": "",
     }
+
+    # Reinforce confidence (verified progress) + clear transient stuck state.
+    updates["strategy_confidence"] = update_confidence(state.strategy_confidence, progress=True)
+    updates.update(clear_transient())
 
     # Check mission success
     if state.mission_success:
@@ -371,6 +451,35 @@ async def commit_node(state: BrainState) -> dict:
             logger.info("📊 Budget extended to %d (progress=%d%%)",
                         updates["max_steps"], progress_pct)
 
+    # ── Throttled PRM goal-audit (revived): goal-aware progress + stall + done-nudge ──
+    if _PRM_CRITIC and state.prm_checklist and prm_should_audit(state.step_number, True):
+        try:
+            goal_score, updated_checklist, newly = await _run_prm_audit(state)
+            updates["prm_checklist"] = updated_checklist
+            window = push_goal_score(state.goal_score_window, goal_score)
+            updates["goal_score_window"] = window
+
+            # Done-ceiling nudge — reduce post-completion wandering.
+            # CoVe (Overwatch L4) still guards against a PREMATURE done.
+            if goal_score >= DONE_CEILING:
+                updates["goal_complete_hint"] = (
+                    "\n\n✅ GOAL APPEARS COMPLETE (checklist ~satisfied). Verify your "
+                    "DONE WHEN criteria on screen and output action_type='done' unless "
+                    "something is clearly still missing. Do NOT keep acting once done."
+                )
+            else:
+                updates["goal_complete_hint"] = ""
+
+            # Stall: DOM keeps changing (we committed) but goal-score is flat →
+            # busy-but-not-progressing → penalize confidence to provoke a revision.
+            if detect_stall(window):
+                penalized = update_confidence(updates["strategy_confidence"], progress=False)
+                logger.info("📉 Goal-progress STALL (score window flat) — confidence %.2f→%.2f",
+                            updates["strategy_confidence"], penalized)
+                updates["strategy_confidence"] = penalized
+        except Exception as e:
+            logger.debug("PRM audit error (non-fatal): %s", e)
+
     return updates
 
 
@@ -391,54 +500,73 @@ async def retry_node(state: BrainState) -> dict:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 async def rollback_node(state: BrainState) -> dict:
-    """Rollback forces a replan via the planner node.
+    """Hard-stuck handler. The escalation ladder (in Overwatch) has already tried
+    the cheap tactics; rollback decides whether to RE-STRATEGIZE.
 
-    Adds a reflexion note explaining why the rollback occurred.
+    V18: instead of a full replan (which wiped progress), rollback either
+      (a) RE-STRATEGIZES — one LLM call for a genuinely different approach,
+          updating `strategy` + adding the lesson as a belief, resetting the
+          ladder, then continuing (→ perceive); or
+      (b) lets the ladder's current directive stand and continues (→ perceive).
+    Bounded by MAX_RESTRATEGIZE; the existing error_count→recovery→finalize path
+    still guarantees termination.
     """
-    reflection = (
-        f"Step {state.step_number} failed (verdict={state.overwatch_verdict}). "
-        f"Outcome: {state.action_outcome or 'unknown'}. "
-        "Need a completely different approach."
+    from cognition import (
+        restrategize, needs_restrategy, merge_beliefs,
+        RESTRATEGIZE_TACTIC, LADDER,
     )
 
-    logger.warning("🔄 ROLLBACK: %s", reflection[:100])
-
-    # Call Recovery Advisor for guidance
-    recovery_advice = ""
-    try:
-        from langchain_core.messages import HumanMessage, SystemMessage
-        prompt = (
-            "You are a browser automation RECOVERY CONSULTANT. The agent is STUCK. "
-            "Analyze the situation and give ONE specific actionable instruction.\n\n"
-            f"OBJECTIVE: {state.objective}\nURL: {state.current_url}\n"
-            f"LAST FAILURE: {state.action_outcome}\n\n"
-            "Respond in 1-2 sentences ONLY."
-        )
-        response, _ = await _INVOKE_FN(
-            _FAILOVER_CHAIN,
-            [HumanMessage(content=prompt)],
-            None, _BREAKER, health_tracker=_HEALTH_TRACKER,
-        )
-        content_val = response.content if hasattr(response, "content") else ""
-        if isinstance(content_val, list):
-            texts = [b.get("text", "") for b in content_val if isinstance(b, dict) and b.get("type") == "text"]
-            content_val = " ".join(texts)
-        elif not isinstance(content_val, str):
-            content_val = str(content_val)
-        recovery_advice = content_val[:200]
-        logger.info("🛠️ Recovery advice: %s", recovery_advice[:150])
-    except Exception as e:
-        logger.warning("Recovery advisor failed: %s", e)
-        recovery_advice = "Try scrolling down or dismissing any visible popups."
-
-    return {
-        "reflections": [reflection],
+    updates: dict = {
         "error_count": state.error_count + 1,
         "page_fsm": "READY",
         "proposed_action": None,
         "retry_count": 0,
-        "recovery_advice": recovery_advice,
+        "next_node": "perceive",  # continue — no destructive full replan
     }
+
+    ladder_exhausted = (
+        RESTRATEGIZE_TACTIC in state.tried_tactics
+        or state.ladder_rung >= len(LADDER)
+    )
+    do_restrategy = ladder_exhausted or needs_restrategy(
+        state.strategy_confidence, state.restrategize_count
+    )
+
+    if do_restrategy:
+        logger.warning("🔄 ROLLBACK → RE-STRATEGIZE (#%d, confidence=%.2f)",
+                       state.restrategize_count + 1, state.strategy_confidence)
+        new_strategy, lesson = await restrategize(
+            _INVOKE_FN, _FAILOVER_CHAIN, _BREAKER, _HEALTH_TRACKER,
+            objective=state.objective,
+            current_strategy=state.strategy,
+            beliefs=state.beliefs,
+            current_url=state.current_url,
+            recent_failure=state.action_outcome,
+            plan_render=state.get_plan_render(),
+        )
+        if new_strategy:
+            updates["strategy"] = new_strategy
+            updates["strategy_confidence"] = 0.6  # fresh hypothesis — moderate prior
+            updates["restrategize_count"] = state.restrategize_count + 1
+            if lesson:
+                updates["beliefs"] = merge_beliefs(state.beliefs, [lesson])
+                updates["reflections"] = [f"Re-strategized: {lesson[:120]}"]
+        # Reset the ladder for the new strategy + clear stale directives
+        updates["current_obstacle"] = ""
+        updates["ladder_rung"] = 0
+        updates["tried_tactics"] = []
+        updates["correction_context"] = ""
+        updates["recovery_advice"] = ""
+    else:
+        # Ladder still has untried rungs — keep Overwatch's directive, continue.
+        logger.warning("🔄 ROLLBACK at step %d — continuing with next escalation tactic",
+                       state.step_number)
+        updates["reflections"] = [
+            f"Step {state.step_number} stuck (verdict={state.overwatch_verdict}); "
+            "escalating tactic."
+        ]
+
+    return updates
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -497,7 +625,19 @@ async def finalize_node(state: BrainState) -> dict:
     else:
         logger.info("⚠️ Agent shutting down (mission incomplete)")
 
-    return {}
+    # ── Clean handoff: reset stateful singletons so a fresh task starts clean ──
+    # (BrainState is per-task already; these objects are reused if the process is.)
+    try:
+        if _CRITIC and hasattr(_CRITIC, "reset_for_task"):
+            _CRITIC.reset_for_task()
+        if _PRM_CRITIC is not None:
+            _PRM_CRITIC._prev_score = 0.0
+    except Exception as e:
+        logger.debug("Cognitive reset on finalize failed (non-fatal): %s", e)
+
+    # Clear cognitive state in the returned state for a tidy final snapshot.
+    from cognition import clear_all
+    return clear_all()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -579,8 +719,12 @@ def build_brain_graph() -> StateGraph:
     # ── Retry → perceive (re-perceive and re-route) ──
     g.add_edge("retry", "perceive")
 
-    # ── Rollback → planner (replan) ──
-    g.add_edge("rollback", "planner")
+    # ── Rollback → perceive (V18: continue with the re-strategy / next tactic;
+    #    no destructive full replan that wipes plan progress) ──
+    g.add_conditional_edges("rollback", lambda s: s.next_node or "perceive", {
+        "perceive": "perceive",
+        "finalize": "finalize",
+    })
 
     # ── Recovery → perceive ──
     g.add_edge("recovery", "perceive")
@@ -627,6 +771,13 @@ async def run_brain(objective: str, headless: bool = False):
     registry = ModelRegistry.get_instance()
     _BREAKER = registry.breaker
     _HEALTH_TRACKER = registry.health
+
+    # V17.0: Probe once — prune dead models (404/401), seed latency estimates.
+    # Must run BEFORE ReasoningAgent() snapshots the chain.
+    try:
+        await registry.probe_and_prune()
+    except Exception as e:
+        logger.warning("Model probe failed (non-fatal): %s", e)
 
     reasoning_agent = ReasoningAgent()
     _FAILOVER_CHAIN = reasoning_agent.get_failover_chain()
@@ -697,20 +848,18 @@ async def run_brain(objective: str, headless: bool = False):
         initial_state = BrainState(objective=objective)
 
         try:
-            final_state = None
+            # Latch mission_success across the stream: each event is ONE node's
+            # partial output (finalize returns {}), so reading only the last
+            # event misses the success flag set earlier by overwatch/commit.
+            mission_success = False
             async for event in brain.astream(initial_state, config):
                 # Log each node execution
                 for node_name, node_output in event.items():
                     if node_name != "__end__":
                         logger.debug("Node '%s' → %d updates",
                                     node_name, len(node_output) if isinstance(node_output, dict) else 0)
-                    if isinstance(node_output, dict):
-                        final_state = node_output
-
-            # ── Final Report ──
-            mission_success = False
-            if final_state:
-                mission_success = final_state.get("mission_success", False)
+                    if isinstance(node_output, dict) and node_output.get("mission_success"):
+                        mission_success = True
 
             if mission_success:
                 print("\n" + "═" * 60)

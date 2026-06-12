@@ -1,0 +1,7 @@
+Navigate to https://www.flipkart.com (or its mobile equivalent if forced, but prefer desktop).
+If a login popup appears blocking the screen, close it using the '✕' or 'Close' button.
+Enter "Ryzen 7 9700X" in the site's search bar and submit the search.
+From the first page of results, ignore "Sponsored" or "Ad" listings.
+Click the first valid, in-stock "Ryzen 7 9700X" processor to open its product details page.
+Click the "Add to Cart" button on the product details page.
+Verify that a cart confirmation message or the cart page is displayed showing the product was successfully added.

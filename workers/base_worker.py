@@ -21,7 +21,11 @@ from typing import Any
 from pydantic import BaseModel, Field
 from langchain_core.messages import SystemMessage, HumanMessage
 
-logger = logging.getLogger("workers")
+try:
+    from app.logger import get_logger
+    logger = get_logger("workers")
+except ImportError:
+    logger = logging.getLogger("workers")
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  Shared Action Schema (Pydantic structured output)
@@ -103,6 +107,16 @@ async def invoke_worker(
     history_compressed = state.get("history_compressed", "")
     skill_context = state.get("skill_context", "")
 
+    # ── V18 Cognition: the agent reasons WITH its persistent strategy + beliefs ──
+    from cognition import render_strategy_block
+    strategy_block = render_strategy_block(
+        strategy=state.get("strategy", ""),
+        confidence=state.get("strategy_confidence", 1.0),
+        beliefs=state.get("beliefs", []) or [],
+        success_criteria=state.get("success_criteria", ""),
+        goal_complete_hint=state.get("goal_complete_hint", ""),
+    )
+
     # Login hint
     login_hint = ""
     if login_detected:
@@ -132,7 +146,11 @@ async def invoke_worker(
         f"{objective}\n\n"
         f"NOTE: The above describes the user's INTENT. Any numbered steps are guidance, not strict commands. "
         f"YOU decide the actual actions based on what you see on screen.\n\n"
-        f"═══ CURRENT CONTEXT ═══\n"
+        + (f"{strategy_block}\n"
+           "Follow your strategy, but ADAPT it to what you actually see. When your "
+           "DONE WHEN criteria are met, output action_type='done' — do not keep acting "
+           "after the goal is achieved.\n\n" if strategy_block else "")
+        + f"═══ CURRENT CONTEXT ═══\n"
         f"URL: {current_url}\n"
         f"Step: {step_number+1}/{max_steps} ({max_steps - step_number - 1} remaining)"
         f"{login_hint}"

@@ -1,16 +1,34 @@
-"""ModelRegistry — Model-Agnostic Provider Layer for Agent First IDE v2.0.
+"""ModelRegistry — Model-Agnostic Provider Layer for Agent First IDE v17.0.
 
 Enforces STRICT separation between Text and Vision API pipelines.
 No graph node should ever construct an LLM client directly.
 All model access goes through this registry.
 
 Reads ALL API keys from .env — NVIDIA, Groq, Google Gemini, DeepSeek.
+
+V17.0 — Resilient Reasoning Foundation:
+  - MODEL-FIRST failover: the chain is sorted by (model quality tier,
+    expected cost) so ALL instances of the best model — every API key,
+    every provider hosting it — are exhausted before any weaker model.
+    A 429 on Groq key 0 jumps to the SAME model on Groq key 1, then the
+    same model on NVIDIA. Never to a lower-tier model while a same-model
+    instance remains.
+  - Startup probe: dead models (404/401) are pruned for the session;
+    survivors get a measured latency seed.
+  - EWMA health: per-instance latency and failure-probability estimates
+    drive ordering (E[cost] = (1−p)·latency + p·timeout) and adaptive
+    per-call timeouts (clamp(3·latency, 6s, 20s)).
+  - Per-instance 429 cooldown (jittered) instead of provider-wide skip.
+  - JSON-mode fallback when a provider rejects a structured-output schema.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import os
+import random
+import re
 import time
 import logging
 from collections import deque
@@ -47,6 +65,55 @@ def _collect_keys(*env_vars: str) -> list[str]:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+#  Model Quality Tiers — V17.0 model-first failover
+#
+#  The failover chain is sorted by (tier, expected_cost): all instances of the
+#  best model group at the front regardless of which provider/key hosts them.
+#  Lower tier number = higher quality = tried first.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+DEFAULT_MODEL_TIERS: dict[str, int] = {
+    # Tier 0 — proven excellent for tactical browser decisions
+    "gpt-oss-120b": 0,
+    # Tier 1 — strong general models
+    "gemma-4-31b-it": 1,
+    "gemma-4-32b-it": 1,
+    # Tier 2 — capable but unproven for this workload
+    "qwen-3-235b-a22b": 2,
+    "glm-5.1": 2,
+}
+UNKNOWN_MODEL_TIER = 3
+
+
+def normalize_model_id(model_id: str) -> str:
+    """'openai/gpt-oss-120b' → 'gpt-oss-120b'; 'google/gemma-4-31b-it' → 'gemma-4-31b-it'."""
+    return model_id.rsplit("/", 1)[-1].strip().lower()
+
+
+def _load_tier_overrides() -> dict[str, int]:
+    """Parse MODEL_TIER_OVERRIDE='gpt-oss-120b=0,some-model=2' from .env."""
+    overrides: dict[str, int] = {}
+    raw = os.getenv("MODEL_TIER_OVERRIDE", "").strip()
+    for part in raw.split(","):
+        if "=" in part:
+            mid, _, rank = part.partition("=")
+            try:
+                overrides[normalize_model_id(mid)] = int(rank)
+            except ValueError:
+                pass
+    return overrides
+
+
+MODEL_TIERS: dict[str, int] = {**DEFAULT_MODEL_TIERS, **_load_tier_overrides()}
+
+
+def get_model_tier(instance_name: str) -> int:
+    """Quality tier for an instance name like 'groq:openai/gpt-oss-120b:0'."""
+    base = ProviderHealthTracker._base_model_name(instance_name)
+    return MODEL_TIERS.get(normalize_model_id(base), UNKNOWN_MODEL_TIER)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 #  Provider Health Tracker
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -65,9 +132,14 @@ class ProviderHealthTracker:
         separately so a model that fails on one schema can still serve others
     """
 
+    # EWMA smoothing factor for latency / failure-probability estimates
+    EWMA_ALPHA = 0.3
+    # Assumed latency (s) for an instance we have never measured
+    DEFAULT_LATENCY = 8.0
+
     def __init__(self):
         self._health: dict[str, dict] = {}
-        self._schema_blacklist: dict[str, set[str]] = {}  # base_model → {schema_names}
+        self._schema_blacklist: dict[str, set[str]] = {}  # "provider|base_model" → {schema_names}
 
     @staticmethod
     def _base_model_name(instance_name: str) -> str:
@@ -84,6 +156,18 @@ class ProviderHealthTracker:
             return ":".join(parts[1:-1])
         return instance_name
 
+    @staticmethod
+    def _blacklist_key(instance_name: str) -> str:
+        """Blacklist key scoped to (provider, base_model).
+
+        V17.0: schema support is a property of the provider+model combo, not
+        the model name globally — gpt-oss may reject a schema on Groq while
+        serving it fine on NVIDIA. Never bench a good model globally.
+        """
+        provider = instance_name.split(":", 1)[0]
+        base = ProviderHealthTracker._base_model_name(instance_name)
+        return f"{provider}|{base}"
+
     def _get(self, name: str) -> dict:
         if name not in self._health:
             self._health[name] = {
@@ -92,17 +176,80 @@ class ProviderHealthTracker:
                 "total_calls": 0,
                 "total_failures": 0,
                 "last_call_time": 0.0,
+                # V17.0 — EWMA health + cooldown
+                "latency_ewma": None,   # seconds; None = never measured
+                "p_fail": 0.0,          # smoothed failure probability
+                "cooldown_until": 0.0,  # 429 cooldown deadline (monotonic)
             }
         return self._health[name]
 
+    # ── V17.0: EWMA + cooldown API ─────────────────────────────────────────
+
+    def observe_latency(self, name: str, seconds: float) -> None:
+        """Fold an observed call latency into the EWMA estimate."""
+        s = self._get(name)
+        if s["latency_ewma"] is None:
+            s["latency_ewma"] = seconds
+        else:
+            s["latency_ewma"] = (
+                self.EWMA_ALPHA * seconds + (1 - self.EWMA_ALPHA) * s["latency_ewma"]
+            )
+
+    def seed_latency(self, name: str, seconds: float) -> None:
+        """Seed the latency estimate (from the startup probe) without overriding live data."""
+        s = self._get(name)
+        if s["latency_ewma"] is None:
+            s["latency_ewma"] = seconds
+
+    def _update_p_fail(self, name: str, failed: bool) -> None:
+        s = self._get(name)
+        s["p_fail"] = (
+            self.EWMA_ALPHA * (1.0 if failed else 0.0)
+            + (1 - self.EWMA_ALPHA) * s["p_fail"]
+        )
+
+    def start_cooldown(self, name: str, seconds: float) -> None:
+        """Put one instance (provider+key+model) on a rate-limit cooldown.
+
+        Per-instance, NOT per-provider: Groq limits are per key/org, so a 429
+        on key 0 says nothing about key 1 — the same model on the next key is
+        tried immediately.
+        """
+        s = self._get(name)
+        s["cooldown_until"] = time.monotonic() + seconds
+        logger.info("⏸️ '%s' on 429 cooldown for %.0fs (same model continues on other keys)",
+                    name, seconds)
+
+    def in_cooldown(self, name: str) -> bool:
+        return time.monotonic() < self._get(name)["cooldown_until"]
+
+    def expected_cost(self, name: str, default_timeout: float = 20.0) -> float:
+        """E[time-to-answer] = (1−p_fail)·latency + p_fail·timeout.
+
+        Sorting instances ascending by this value minimizes expected
+        time-to-first-success (greedy ordered-search optimality).
+        """
+        s = self._get(name)
+        lat = s["latency_ewma"] if s["latency_ewma"] is not None else self.DEFAULT_LATENCY
+        p = s["p_fail"]
+        return (1.0 - p) * lat + p * default_timeout
+
+    def adaptive_timeout(self, name: str, k: float = 3.0,
+                         floor: float = 6.0, cap: float = 20.0) -> float:
+        """Per-instance timeout: clamp(k·latency_ewma, floor, cap).
+
+        Unknown models get the full cap; a chronically slow model is
+        abandoned at the cap instead of a fixed 30s.
+        """
+        s = self._get(name)
+        if s["latency_ewma"] is None:
+            return cap
+        return max(floor, min(cap, k * s["latency_ewma"]))
+
     def is_available(self, name: str, schema_name: str = "") -> bool:
-        # V15.1: Check schema blacklist by BASE model name
-        if schema_name:
-            base = self._base_model_name(name)
-            if base in self._schema_blacklist:
-                bl = self._schema_blacklist[base]
-                if schema_name in bl or "__structured_output__" in bl:
-                    return False
+        # V17.0: Check schema blacklist by (provider, base_model)
+        if schema_name and self.is_schema_blacklisted(name, schema_name):
+            return False
 
         s = self._get(name)
         # V15.0: Cold-start reset — if model idle 5+ min, treat as fresh
@@ -112,40 +259,38 @@ class ProviderHealthTracker:
 
         return time.monotonic() >= s["quarantine_until"]
 
-    def record_success(self, name: str) -> None:
+    def record_success(self, name: str, latency: float | None = None) -> None:
         s = self._get(name)
         s["consecutive_failures"] = 0
         s["quarantine_until"] = 0.0
         s["total_calls"] += 1
         s["last_call_time"] = time.monotonic()
+        self._update_p_fail(name, failed=False)
+        if latency is not None:
+            self.observe_latency(name, latency)
 
-    def record_failure(self, name: str, is_rate_limit: bool = False, error_msg: str = "") -> None:
+    def record_failure(self, name: str, is_rate_limit: bool = False,
+                       error_msg: str = "", latency: float | None = None) -> None:
         s = self._get(name)
         s["consecutive_failures"] += 1
         s["total_calls"] += 1
         s["total_failures"] += 1
         s["last_call_time"] = time.monotonic()
+        self._update_p_fail(name, failed=True)
+        if latency is not None:
+            # A timeout means "at least this slow" — fold it into the estimate
+            self.observe_latency(name, latency)
 
-        # V15.0: Cap quarantine at 16s (was min(120, 2^n))
-        backoff = min(16.0, 2.0 ** s["consecutive_failures"])
-        if is_rate_limit:
-            backoff = min(16.0, backoff * 2)
-        s["quarantine_until"] = time.monotonic() + backoff
-        logger.warning(
-            "🔒 '%s' quarantined %.1fs (streak=%d)", name, backoff, s["consecutive_failures"],
-        )
-
-        # V15.1 Patch A+C: Schema blacklist by BASE model name + per-schema keys
+        # V17.0: Schema blacklist keyed by (provider, base_model) — a model that
+        # rejects a schema on Groq may serve it fine on NVIDIA.
         if error_msg and ("400" in error_msg or "Bad Request" in error_msg):
             if "additionalProperties" in error_msg or "schema" in error_msg.lower():
-                base = self._base_model_name(name)
-                if base not in self._schema_blacklist:
-                    self._schema_blacklist[base] = set()
+                bl_key = self._blacklist_key(name)
+                if bl_key not in self._schema_blacklist:
+                    self._schema_blacklist[bl_key] = set()
 
-                # Patch C: Extract specific schema name from error message
+                # Extract specific schema name from error message
                 # Error format: "response_format: 'ChecklistEvaluation': /properties/..."
-                # We target the schema name after 'response_format:' specifically
-                import re
                 schema_match = re.search(r"response_format:\s*'(\w+)'", error_msg)
                 if not schema_match:
                     # Fallback: look for CamelCase class names (Pydantic schema pattern)
@@ -153,29 +298,25 @@ class ProviderHealthTracker:
                 specific_schema = schema_match.group(1) if schema_match else None
 
                 if specific_schema:
-                    self._schema_blacklist[base].add(specific_schema)
+                    self._schema_blacklist[bl_key].add(specific_schema)
                     logger.warning(
-                        "🚫 Base model '%s' blacklisted for schema '%s' "
-                        "(all %s instances will be skipped)",
-                        base, specific_schema, name.split(":")[0],
+                        "🚫 '%s' blacklisted for schema '%s' — will use JSON-mode fallback",
+                        bl_key, specific_schema,
                     )
                 else:
                     # Catch-all: blacklist for all structured output
-                    self._schema_blacklist[base].add("__structured_output__")
+                    self._schema_blacklist[bl_key].add("__structured_output__")
                     logger.warning(
-                        "🚫 Base model '%s' blacklisted for ALL structured output",
-                        base,
+                        "🚫 '%s' blacklisted for ALL structured output — JSON-mode fallback",
+                        bl_key,
                     )
 
     def is_schema_blacklisted(self, name: str, schema_name: str = "__structured_output__") -> bool:
-        """Check if a model is permanently blacklisted for a specific schema.
-
-        V15.1: Uses base model name so all key-variants are covered.
-        """
-        base = self._base_model_name(name)
-        if base not in self._schema_blacklist:
+        """Check if a (provider, model) combo is blacklisted for a specific schema."""
+        bl_key = self._blacklist_key(name)
+        if bl_key not in self._schema_blacklist:
             return False
-        bl = self._schema_blacklist[base]
+        bl = self._schema_blacklist[bl_key]
         return schema_name in bl or "__structured_output__" in bl
 
     def all_quarantined(self, names: list[str]) -> bool:
@@ -375,18 +516,25 @@ def _build_text_pipeline() -> list[ModelClient]:
         logger.info("TEXT ── Groq (PRIMARY): %d keys loaded (%s)", len(groq_keys), model)
 
     # ── NVIDIA NIM — SECONDARY (multiple models, same key) ──
-    # V16.3: The user specifically requested openai/gpt-oss-120b as the ONLY text model
-    # for NVIDIA, completely replacing the nemotron, qwen, and mistral models.
+    # V17.0: Register the SAME top-tier model (gpt-oss-120b) here too, so the
+    # model-first failover can continue with the identical model on NVIDIA when
+    # all Groq keys are rate-limited. If the catalog ID is invalid on NVIDIA,
+    # the startup probe prunes it automatically — zero per-step cost.
+    # Override via NVIDIA_TEXT_MODELS="model1,model2" in .env.
     nvidia_keys = _collect_keys("NVIDIA_NIM_API_KEY", "NVIDIA_NIM_API_KEYS")
     base = os.getenv("NVIDIA_NIM_BASE_URL", "https://integrate.api.nvidia.com/v1")
+    _nvidia_models_raw = os.getenv(
+        "NVIDIA_TEXT_MODELS", "openai/gpt-oss-120b,google/gemma-4-31b-it"
+    )
     nvidia_text_models = [
-        ("google/gemma-4-31b-it", 30),
-        # ("nvidia/nemotron-3-super-120b-a12b", 25),   # Fast MoE, 1M context, tool calling
-        # ("nvidia/nemotron-3-nano-30b-a3b", 20),      # Ultra-fast, 1M context
-        # ("qwen/qwen3-235b-a22b", 25),                # Strong reasoning + coding
-        # ("mistralai/mistral-medium-3.5-128b", 25),   # 256K context, reliable
-        # ("nvidia/nemotron-3-ultra-550b-a55b", 35),   # Heavyweight fallback
+        (m.strip(), 30) for m in _nvidia_models_raw.split(",") if m.strip()
     ]
+    # Historical candidates (probe-prunable, re-enable via NVIDIA_TEXT_MODELS):
+    #   nvidia/nemotron-3-super-120b-a12b   — Fast MoE, 1M context, tool calling
+    #   nvidia/nemotron-3-nano-30b-a3b      — Ultra-fast, 1M context
+    #   qwen/qwen3-235b-a22b                — Strong reasoning + coding
+    #   mistralai/mistral-medium-3.5-128b   — 256K context, reliable
+    #   nvidia/nemotron-3-ultra-550b-a55b   — Heavyweight fallback
     for key_idx, key in enumerate(nvidia_keys):
         for model_name, timeout_s in nvidia_text_models:
             clients.append(ModelClient(
@@ -553,6 +701,7 @@ class ModelRegistry:
     def __init__(self):
         self._text_pipeline: list[ModelClient] = _build_text_pipeline()
         self._vision_pipeline: list[ModelClient] = _build_vision_pipeline()
+        self._probed = False
         self.health = ProviderHealthTracker()
         # UCRF: Higher tolerance — LLM failovers are expected, not critical failures
         # With 9-model chain, 3-4 timeouts per call is normal before success
@@ -609,92 +758,357 @@ class ModelRegistry:
         v = " → ".join(self.get_vision_chain_names()) or "(none)"
         return f"TEXT chain ({len(self._text_pipeline)}): {t}\nVISION chain ({len(self._vision_pipeline)}): {v}"
 
+    # ── V17.0: Startup probe — prune dead models, seed latency ──────────────
+
+    async def probe_and_prune(self, timeout: float = 8.0) -> None:
+        """Probe one instance per (provider, base_model, pipeline) concurrently.
+
+        - 404 / not-found / invalid-key → ALL instances of that combo are
+          removed from the chain for this session (no per-step 404 tax).
+        - Success → measured latency seeds the EWMA for every sibling instance.
+        - Timeout → kept (may be transient) but seeded with a high latency so
+          it sorts to the back of its tier.
+        - 429 → model exists; kept, no penalty.
+
+        Idempotent: runs once per process. Total wall cost ≈ one round-trip.
+        """
+        if self._probed:
+            return
+        self._probed = True
+
+        from langchain_core.messages import HumanMessage
+
+        # One representative instance per (provider, base_model, pipeline)
+        reps: dict[tuple[str, str, str], ModelClient] = {}
+        for mc in self._text_pipeline + self._vision_pipeline:
+            key = (mc.provider, normalize_model_id(
+                ProviderHealthTracker._base_model_name(mc.name)), mc.pipeline)
+            reps.setdefault(key, mc)
+
+        if not reps:
+            return
+
+        probe_msg = [HumanMessage(content="Reply with the single word: pong")]
+
+        async def _probe(combo_key, mc: ModelClient):
+            t0 = time.monotonic()
+            try:
+                await asyncio.wait_for(mc.client.ainvoke(probe_msg), timeout=timeout)
+                return combo_key, time.monotonic() - t0, None
+            except Exception as exc:  # noqa: BLE001 — classify below
+                return combo_key, time.monotonic() - t0, exc
+
+        logger.info("🔬 Probing %d (provider, model) combos (≤%.0fs)...", len(reps), timeout)
+        results = await asyncio.gather(
+            *[_probe(k, mc) for k, mc in reps.items()]
+        )
+
+        dead_combos: set[tuple[str, str, str]] = set()
+        for combo_key, elapsed, err in results:
+            provider, base, pipeline = combo_key
+            if err is None:
+                logger.info("✅ Probe OK: %s/%s (%s) — %.1fs", provider, base, pipeline, elapsed)
+                # Seed latency for every sibling instance of this combo
+                for mc in self._text_pipeline + self._vision_pipeline:
+                    mk = (mc.provider, normalize_model_id(
+                        ProviderHealthTracker._base_model_name(mc.name)), mc.pipeline)
+                    if mk == combo_key:
+                        self.health.seed_latency(mc.name, elapsed)
+                continue
+
+            err_s = str(err)
+            err_l = err_s.lower()
+            is_dead = (
+                "404" in err_s or "not_found" in err_l or "does not exist" in err_l
+                or "model_not_found" in err_l or "401" in err_s
+                or "invalid api key" in err_l or "invalid_api_key" in err_l
+                or "unauthorized" in err_l or "decommissioned" in err_l
+            )
+            if is_dead:
+                dead_combos.add(combo_key)
+                logger.warning("💀 Probe PRUNE: %s/%s (%s) — %s",
+                               provider, base, pipeline, err_s[:120])
+            elif isinstance(err, asyncio.TimeoutError):
+                logger.warning("🐢 Probe slow: %s/%s (%s) — timed out at %.0fs, kept with high latency seed",
+                               provider, base, pipeline, timeout)
+                for mc in self._text_pipeline + self._vision_pipeline:
+                    mk = (mc.provider, normalize_model_id(
+                        ProviderHealthTracker._base_model_name(mc.name)), mc.pipeline)
+                    if mk == combo_key:
+                        self.health.seed_latency(mc.name, timeout)
+            else:
+                # 429 / transient — model exists, keep without penalty
+                logger.info("ℹ️ Probe transient error (kept): %s/%s — %s",
+                            provider, base, err_s[:100])
+
+        if dead_combos:
+            def _alive(mc: ModelClient) -> bool:
+                mk = (mc.provider, normalize_model_id(
+                    ProviderHealthTracker._base_model_name(mc.name)), mc.pipeline)
+                return mk not in dead_combos
+
+            before_t, before_v = len(self._text_pipeline), len(self._vision_pipeline)
+            self._text_pipeline = [mc for mc in self._text_pipeline if _alive(mc)]
+            self._vision_pipeline = [mc for mc in self._vision_pipeline if _alive(mc)]
+            logger.info(
+                "🔬 Probe pruned %d dead combos — TEXT %d→%d, VISION %d→%d",
+                len(dead_combos), before_t, len(self._text_pipeline),
+                before_v, len(self._vision_pipeline),
+            )
+        else:
+            logger.info("🔬 Probe complete — all %d combos alive", len(reps))
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  Failover Invocation
+#  Failover Invocation — V17.0 model-first ordering
 # ═══════════════════════════════════════════════════════════════════════════════
+
+def _as_model_clients(chain: list) -> list[ModelClient]:
+    """Normalize chain entries to ModelClient (accepts raw LLM clients too)."""
+    entries: list[ModelClient] = []
+    for item in chain:
+        if isinstance(item, ModelClient):
+            entries.append(item)
+        else:
+            name = getattr(item, "model_name", getattr(item, "model", str(item)))
+            entries.append(ModelClient(name=str(name), client=item,
+                                       provider="unknown", pipeline="text"))
+    return entries
+
+
+def order_failover_chain(
+    entries: list[ModelClient],
+    health: ProviderHealthTracker | None,
+) -> list[ModelClient]:
+    """Sort by (model quality tier, expected cost).
+
+    All instances of the best model group at the front — every key, every
+    provider hosting it — so failover rotates keys/providers for the SAME
+    model before ever falling to a weaker one. Within a tier, instances are
+    ordered by E[time-to-answer]; sort stability preserves build order
+    (Groq keys before NVIDIA) for fresh instances.
+    """
+    def sort_key(mc: ModelClient):
+        tier = get_model_tier(mc.name)
+        cost = health.expected_cost(mc.name) if health else 0.0
+        return (tier, cost)
+
+    return sorted(entries, key=sort_key)
+
+
+def _extract_text(raw_response: Any) -> str:
+    """Normalize provider response objects into plain text."""
+    content = getattr(raw_response, "content", raw_response)
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict) and isinstance(item.get("text"), str):
+                parts.append(item["text"])
+        return "\n".join(parts)
+    return str(content)
+
+
+def _extract_json_payload(text: str) -> dict:
+    """Extract the first JSON object from model output (handles ``` fences)."""
+    candidate = text.strip()
+    if "```json" in candidate:
+        candidate = candidate.split("```json", 1)[1].split("```", 1)[0]
+    elif "```" in candidate:
+        candidate = candidate.split("```", 1)[1].split("```", 1)[0]
+    candidate = candidate.strip()
+    try:
+        return json.loads(candidate)
+    except json.JSONDecodeError:
+        start = candidate.find("{")
+        end = candidate.rfind("}")
+        if start == -1 or end <= start:
+            raise
+        return json.loads(candidate[start:end + 1])
+
+
+async def _invoke_json_mode(llm, messages: list, schema: type, timeout: float) -> Any:
+    """Plain JSON-mode fallback for providers that reject the strict schema.
+
+    Appends the JSON Schema as an instruction, parses the raw reply, and
+    validates it into the Pydantic model — so a top-tier model that fails
+    structured output still serves instead of being benched.
+    """
+    from langchain_core.messages import HumanMessage
+
+    schema_json = json.dumps(schema.model_json_schema(), ensure_ascii=False)
+    instruction = HumanMessage(content=(
+        "Respond ONLY with a single JSON object that matches this JSON Schema. "
+        "No markdown fences, no commentary, no extra keys.\n"
+        f"SCHEMA: {schema_json}"
+    ))
+    raw = await asyncio.wait_for(
+        llm.ainvoke(list(messages) + [instruction]), timeout=timeout,
+    )
+    payload = _extract_json_payload(_extract_text(raw))
+    return schema.model_validate(payload)
+
 
 async def invoke_with_failover(
-    chain: list[ModelClient],
+    chain: list,
     messages: list,
     schema: type | None = None,
     *,
     breaker: CircuitBreaker | None = None,
     health: ProviderHealthTracker | None = None,
-    timeout_seconds: float = 30.0,
+    timeout_seconds: float = 20.0,
     health_tracker: "ProviderHealthTracker | None" = None,
+    base64_image: str | None = None,
 ) -> tuple[Any, str]:
-    """V16.1 — Try each model in sequence. No per-model quarantine.
+    """V17.0 — Model-first failover with adaptive timeouts.
 
-    Old logic quarantined individual models for 2-16s on failure. This was
-    catastrophic when multiple models shared one API key (e.g., NVIDIA NIM)
-    because quarantining model A also effectively blocked models B-E on the
-    same key — the quarantine timer would expire and immediately re-trigger.
+    Ordering: (model quality tier, E[cost]) — ALL instances of the best model
+    (across every API key and provider) are exhausted before any weaker model.
 
-    New logic:
-      1. Walk the chain sequentially, try every model.
-      2. Only skip models that are schema-blacklisted (400/Bad Request on
-         structured output — a permanent, not transient, issue).
-      3. On rate-limit (429), wait 2s then continue to next model.
-      4. No exponential backoff per model. Just try the next one.
+    Per-instance behavior:
+      - 429 → jittered cooldown on THAT instance only; the very next attempt
+        is the SAME model on the next key/provider (no provider-wide skip,
+        no sleep — Groq limits are per key/org).
+      - Timeout → adaptive: clamp(3·latency_ewma, 6s, 20s); unknown models
+        get the full cap. Failures update the EWMA so slow models sink.
+      - Schema 400 → blacklist the (provider, model, schema) combo AND rescue
+        the call immediately via JSON-mode on the same model.
+      - Blacklisted combos are not skipped — they run in JSON mode, so a
+        top-tier model never gets benched over a schema quirk.
     """
-    import asyncio
-
     # Accept either kwarg name for backward compatibility
     _health = health or health_tracker
 
     if breaker and breaker.tripped:
         raise RuntimeError(f"Circuit breaker tripped: {breaker.reason}")
 
+    entries = _as_model_clients(chain)
+    ordered = order_failover_chain(entries, _health)
+
+    # Pass 1: instances not on 429 cooldown. Pass 2 (only if pass 1 fails):
+    # cooled-down instances as a last resort — slow success beats none.
+    if _health:
+        hot = [mc for mc in ordered if not _health.in_cooldown(mc.name)]
+        cooled = [mc for mc in ordered if _health.in_cooldown(mc.name)]
+    else:
+        hot, cooled = ordered, []
+    passes = [p for p in (hot, cooled) if p]
+
+    schema_name = getattr(schema, "__name__", "__structured_output__") if schema is not None else ""
     last_error: str = ""
-    attempts = 0
+    attempt_no = 0
+    total = len(entries)
 
-    for idx, mc in enumerate(chain):
-        name = mc.name
+    for pass_entries in passes:
+        for mc in pass_entries:
+            name, provider, llm = mc.name, mc.provider, mc.client
+            attempt_no += 1
 
-        # Only skip: schema blacklist (permanent 400 errors on structured output)
-        if _health and schema is not None:
-            schema_name = schema.__name__ if hasattr(schema, '__name__') else "__structured_output__"
-            if _health.is_schema_blacklisted(name, schema_name):
-                logger.debug("Skipping '%s' — blacklisted for schema '%s'", name, schema_name)
-                continue
+            timeout = (
+                _health.adaptive_timeout(name) if _health else timeout_seconds
+            )
 
-        attempts += 1
-        try:
-            llm = mc.client
-            if schema is not None:
-                llm = llm.with_structured_output(schema)
+            # Vision payload injection for multimodal-capable models
+            current_messages = messages
+            if base64_image and messages:
+                supports_vision = any(x in name.lower() for x in [
+                    "gpt-4o", "claude-3-5", "gemini", "glm-4v", "vision", "pixtral", "gemma",
+                ])
+                from langchain_core.messages import HumanMessage
+                last_msg = messages[-1]
+                if supports_vision and isinstance(last_msg, HumanMessage):
+                    multimodal_content = [
+                        {"type": "text", "text": str(last_msg.content)},
+                        {"type": "image_url",
+                         "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}},
+                    ]
+                    current_messages = messages[:-1] + [HumanMessage(content=multimodal_content)]
 
-            response = await asyncio.wait_for(llm.ainvoke(messages), timeout=timeout_seconds)
+            # Blacklisted (provider, model, schema) combos go straight to JSON mode
+            use_json_mode = bool(
+                schema is not None and _health
+                and _health.is_schema_blacklisted(name, schema_name)
+            )
 
-            if _health:
-                _health.record_success(name)
-            if breaker:
-                breaker.record_success()
-            return response, name
+            t0 = time.monotonic()
+            try:
+                if schema is None:
+                    response = await asyncio.wait_for(
+                        llm.ainvoke(current_messages), timeout=timeout)
+                elif use_json_mode:
+                    response = await _invoke_json_mode(
+                        llm, current_messages, schema, timeout)
+                else:
+                    structured = llm.with_structured_output(schema)
+                    response = await asyncio.wait_for(
+                        structured.ainvoke(current_messages), timeout=timeout)
 
-        except asyncio.TimeoutError:
-            last_error = f"{name} timed out — waiting 5.0s"
-            if breaker:
-                breaker.record_failure()
-            logger.warning("⚠️  FAILOVER [%d/%d]: %s TIMED OUT (>%ds)", idx + 1, len(chain), name, timeout_seconds)
+                elapsed = time.monotonic() - t0
+                if _health:
+                    _health.record_success(name, latency=elapsed)
+                if breaker:
+                    breaker.record_success()
+                return response, name
 
-        except Exception as exc:
-            err = str(exc)
-            last_error = f"{name} — {err[:150]}"
-            is_rl = "429" in err or "rate" in err.lower()
-            is_schema_err = "400" in err and ("additionalProperties" in err or "schema" in err.lower())
+            except asyncio.TimeoutError:
+                last_error = f"{name} timed out (>{timeout:.0f}s)"
+                if _health:
+                    _health.record_failure(name, latency=timeout)
+                if breaker:
+                    breaker.record_failure()
+                logger.warning("⚠️  FAILOVER [%d/%d]: %s TIMED OUT (>%.0fs adaptive)",
+                               attempt_no, total, name, timeout)
 
-            # Only record schema blacklist (permanent issue)
-            if _health and is_schema_err:
-                _health.record_failure(name, is_rate_limit=False, error_msg=err)
+            except Exception as exc:
+                err = str(exc)
+                last_error = f"{name} — {err[:150]}"
+                err_l = err.lower()
+                is_rl = "429" in err or "rate_limit" in err_l or "rate limit" in err_l
+                is_schema_err = (
+                    ("400" in err or "bad request" in err_l)
+                    and ("additionalproperties" in err_l or "schema" in err_l
+                         or "response_format" in err_l)
+                )
 
-            if breaker:
-                breaker.record_failure()
-            logger.warning("⚠️  FAILOVER [%d/%d]: %s — %s", idx + 1, len(chain), name, err[:200])
+                if is_rl:
+                    # Per-instance cooldown — the next loop iteration is the
+                    # SAME model on the next key/provider. No sleep needed.
+                    if _health:
+                        _health.start_cooldown(name, 20.0 + random.uniform(0, 10.0))
+                    logger.warning("⚠️  FAILOVER [%d/%d]: %s rate-limited → same model, next key",
+                                   attempt_no, total, name)
+                    continue
 
-            # On rate limit, short 2s pause then move to next model immediately
-            if is_rl:
-                await asyncio.sleep(2.0)
+                if breaker:
+                    breaker.record_failure()
 
-    raise RuntimeError(f"ALL {len(chain)} models failed. Last: {last_error}")
+                if is_schema_err and schema is not None:
+                    # Register blacklist, then rescue THIS model via JSON mode
+                    if _health:
+                        _health.record_failure(name, error_msg=err)
+                    logger.warning("⚠️  FAILOVER [%d/%d]: %s schema 400 → JSON-mode rescue",
+                                   attempt_no, total, name)
+                    try:
+                        t1 = time.monotonic()
+                        response = await _invoke_json_mode(
+                            llm, current_messages, schema, timeout)
+                        if _health:
+                            _health.record_success(name, latency=time.monotonic() - t1)
+                        if breaker:
+                            breaker.record_success()
+                        return response, name
+                    except Exception as json_exc:  # noqa: BLE001
+                        last_error = f"{name} JSON-mode — {str(json_exc)[:120]}"
+                        logger.warning("⚠️  JSON-mode rescue failed for %s: %s",
+                                       name, str(json_exc)[:150])
+                        continue
+
+                if _health:
+                    _health.record_failure(name)
+                logger.warning("⚠️  FAILOVER [%d/%d]: %s — %s",
+                               attempt_no, total, name, err[:200])
+
+    raise RuntimeError(f"ALL {total} models failed. Last: {last_error}")

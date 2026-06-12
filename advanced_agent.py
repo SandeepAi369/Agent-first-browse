@@ -496,85 +496,27 @@ async def _invoke_with_failover(
     base64_image: str | None = None,
     health_tracker=None,
 ) -> tuple:
-    """V16.2 — Provider-aware failover with 429 skip.
+    """V17.0 — Model-first failover (delegates to model_registry).
 
-    When a provider (e.g., Groq) hits a 429 rate limit, ALL remaining
-    models from that provider are skipped instantly. The loop jumps
-    directly to the next provider (e.g., NVIDIA).
+    The chain is re-ordered by (model quality tier, expected cost) so ALL
+    instances of the best model — every API key, every provider hosting it —
+    are exhausted before any weaker model is tried. A 429 on one key jumps
+    to the SAME model on the next key (per-instance cooldown, no
+    provider-wide skip). Adaptive per-model timeouts replace the fixed 30s,
+    and schema-400 errors are rescued via JSON mode on the same model.
 
-    Accepts either ModelClient objects or raw LLM clients for backward compat.
+    Signature preserved for all callers (prm_critic, web_dreamer, workers,
+    brain_graph, content_critic, github_engagement).
     """
-    if circuit_breaker and circuit_breaker.tripped:
-        raise RuntimeError(f"🔌 CIRCUIT BREAKER TRIPPED: {circuit_breaker.reason}")
-
-    last_error = None
-    rate_limited_providers: set[str] = set()  # Providers that hit 429
-
-    # Support both ModelClient objects and raw LLM clients
-    from model_registry import ModelClient
-    entries: list[tuple[str, str, object]] = []  # (name, provider, llm_client)
-    for item in failover_chain:
-        if isinstance(item, ModelClient):
-            entries.append((item.name, item.provider, item.client))
-        else:
-            # Raw LLM client (backward compat)
-            name = getattr(item, 'model_name', getattr(item, 'model', str(item)))
-            entries.append((name, "unknown", item))
-
-    for idx, (model_name, provider, llm) in enumerate(entries):
-        # Skip ALL models from rate-limited providers
-        if provider in rate_limited_providers:
-            logger.debug("⏭️ SKIP [%d/%d]: %s (provider '%s' rate-limited)",
-                         idx + 1, len(entries), model_name, provider)
-            continue
-
-        # Dynamic Vision Payload Support
-        supports_vision = any(x in model_name.lower() for x in [
-            "gpt-4o", "claude-3-5", "gemini", "glm-4v", "vision", "pixtral", "gemma"
-        ])
-        current_messages = messages
-        if supports_vision and base64_image and len(messages) > 0:
-            last_msg = messages[-1]
-            if isinstance(last_msg, HumanMessage):
-                multimodal_content = [
-                    {"type": "text", "text": str(last_msg.content)},
-                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}}
-                ]
-                current_messages = messages[:-1] + [HumanMessage(content=multimodal_content)]
-
-        try:
-            if schema is not None:
-                structured = llm.with_structured_output(schema)
-            else:
-                structured = llm
-            decision = await asyncio.wait_for(
-                structured.ainvoke(current_messages),
-                timeout=30.0,
-            )
-            if circuit_breaker:
-                circuit_breaker.record_success()
-            if health_tracker:
-                health_tracker.record_success(model_name)
-            return decision, model_name
-        except asyncio.TimeoutError:
-            if circuit_breaker:
-                circuit_breaker.record_failure()
-            logger.warning("⚠️  FAILOVER [%d/%d]: %s TIMED OUT (>30s)", idx + 1, len(entries), model_name)
-            last_error = TimeoutError(f"{model_name} timed out")
-        except Exception as e:
-            if circuit_breaker:
-                circuit_breaker.record_failure()
-            error_str = str(e)
-            is_rate_limit = "429" in error_str or "rate_limit" in error_str.lower()
-            logger.warning("⚠️  FAILOVER [%d/%d]: %s — %s", idx + 1, len(entries), model_name, error_str[:150])
-            if is_rate_limit:
-                # Mark entire provider as rate-limited — skip all remaining models from it
-                rate_limited_providers.add(provider)
-                logger.info("⏭️ Provider '%s' rate-limited — skipping all remaining %s models",
-                            provider, provider)
-            last_error = e
-
-    raise RuntimeError(f"ALL {len(entries)} models failed. Last: {last_error}")
+    from model_registry import invoke_with_failover
+    return await invoke_with_failover(
+        failover_chain,
+        messages,
+        schema,
+        breaker=circuit_breaker,
+        health_tracker=health_tracker,
+        base64_image=base64_image,
+    )
 
 
 async def run_agent(objective: str):
@@ -599,6 +541,13 @@ async def run_agent(objective: str):
     memory = CampaignMemory()  # Neutral task history recorder
     breaker = registry.breaker  # Shared circuit breaker
     health_tracker = registry.health  # Shared health tracker
+
+    # V17.0: Probe once — prune dead models (404/401), seed latency estimates.
+    # Must run BEFORE VisionAgent/ReasoningAgent snapshot the chains.
+    try:
+        await registry.probe_and_prune()
+    except Exception as probe_err:
+        logger.warning("Model probe failed (non-fatal): %s", probe_err)
 
     # v14.0: Auto-allow domains mentioned in the objective
     auto_allow_from_objective(objective)
