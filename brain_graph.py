@@ -56,6 +56,7 @@ except ImportError:
 _PAGE = None
 _CONTEXT = None
 _FAILOVER_CHAIN = []
+_VISION_CHAIN = []
 _BREAKER = None
 _HEALTH_TRACKER = None
 _INVOKE_FN = None
@@ -294,6 +295,7 @@ async def navigator_worker(state: BrainState) -> dict:
     return await invoke_worker(
         state.model_dump(), prompt,
         _FAILOVER_CHAIN, _BREAKER, _HEALTH_TRACKER, _INVOKE_FN,
+        vision_chain=_VISION_CHAIN,
     )
 
 
@@ -309,6 +311,7 @@ async def interactor_worker(state: BrainState) -> dict:
     return await invoke_worker(
         state.model_dump(), prompt,
         _FAILOVER_CHAIN, _BREAKER, _HEALTH_TRACKER, _INVOKE_FN,
+        vision_chain=_VISION_CHAIN,
     )
 
 
@@ -324,6 +327,7 @@ async def extractor_worker(state: BrainState) -> dict:
     return await invoke_worker(
         state.model_dump(), prompt,
         _FAILOVER_CHAIN, _BREAKER, _HEALTH_TRACKER, _INVOKE_FN,
+        vision_chain=_VISION_CHAIN,
     )
 
 
@@ -767,7 +771,7 @@ def build_brain_graph() -> StateGraph:
 
 async def run_brain(objective: str, headless: bool = False):
     """Initialize all modules and execute the brain graph."""
-    global _PAGE, _CONTEXT, _FAILOVER_CHAIN, _BREAKER, _HEALTH_TRACKER
+    global _PAGE, _CONTEXT, _FAILOVER_CHAIN, _VISION_CHAIN, _BREAKER, _HEALTH_TRACKER
     global _INVOKE_FN, _CRITIC, _DREAMER, _PRM_CRITIC, _SKILL_MEM
 
     # ── Import existing modules ──
@@ -818,6 +822,18 @@ async def run_brain(objective: str, headless: bool = False):
 
     logger.info("LLM Failover Chain (%d models): %s",
                 len(_FAILOVER_CHAIN), " → ".join(chain_names))
+
+    # ── V21 Vision chain (for on-demand consults; a11y DOM stays the default) ──
+    try:
+        _VISION_CHAIN = registry.get_vision_chain()
+        if _VISION_CHAIN:
+            logger.info("👁️ Vision chain ready for on-demand consults (%d models): %s",
+                        len(_VISION_CHAIN), " → ".join(registry.get_vision_chain_names()))
+        else:
+            logger.info("👁️ No vision models configured — agent runs a11y-DOM only")
+    except Exception as e:
+        _VISION_CHAIN = []
+        logger.warning("Vision chain unavailable (a11y-DOM only): %s", e)
 
     # ── MCP Tools ──
     mcp_tools.set_page(_PAGE)
