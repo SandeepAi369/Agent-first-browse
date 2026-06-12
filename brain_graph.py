@@ -786,8 +786,21 @@ async def run_brain(objective: str, headless: bool = False):
     from web_dreamer import WebDreamer
     from skill_memory import SkillMemory
 
+    # ── Display mode: prefer a REAL headed browser under a (virtual) display —
+    #    far less bot-detectable than --headless (no "HeadlessChrome" UA, real
+    #    window/compositor). Falls back to --headless if Xvfb isn't available.
+    #    Pass --headless to force true headless. ──
+    from virtual_display import start_virtual_display
+    launch_headless = headless
+    if not headless:
+        if start_virtual_display(1920, 1080):
+            launch_headless = False
+        else:
+            launch_headless = True  # no display available → headless fallback
+    logger.info("🌐 Browser mode: %s", "HEADLESS" if launch_headless else "HEADED (stealth)")
+
     # ── Launch Browser ──
-    _CONTEXT, _PAGE = await launch_browser(headless=headless)
+    _CONTEXT, _PAGE = await launch_browser(headless=launch_headless)
     guard = SessionGuard.get()
 
     # ── Warmup ──
@@ -933,3 +946,8 @@ async def run_brain(objective: str, headless: bool = False):
             except Exception as e:
                 logger.warning("Browser close failed: %s", e)
             guard.detach()
+            try:
+                from virtual_display import stop_virtual_display
+                stop_virtual_display()
+            except Exception:
+                pass
