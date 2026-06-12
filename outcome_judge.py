@@ -1,0 +1,242 @@
+"""Outcome Judge — evidence-grounded verification of task completion (V20).
+
+THE problem this solves
+═══════════════════════
+The old done-gate (`cove_pre_done_check`) verified the PROCESS TRAIL, never the
+OUTCOME: plan-step counters (advanced by a trivial '"OK" in outcome' heuristic),
+a progress percentage, a URL-not-login check, and keyword presence in history.
+It never once looked at what the page actually shows, and the explicit
+`success_criteria` ("Done when: …") computed by the strategic planner was never
+given to it. Consequences observed in live runs:
+  • FALSE BLOCK — the task was truly complete but the counters said otherwise →
+    'done' rejected repeatedly with non-actionable reasons → done-spam / wandering
+    (HN run: done ×5 blocked; Flipkart: Buy-Now loop after the cart add succeeded).
+  • FALSE PASS — heuristics trivially satisfied mid-task → mission "success"
+    without ever checking the outcome → the agent shuts down unverified.
+
+What this module does instead (browser-use judge + "Are We Done Yet?" pattern):
+a single SKEPTICAL LLM verdict over the FRESH page state — objective + planner
+success-criteria + fresh DOM evidence + action trail + the agent's claim — with
+a BINARY achieved/not-achieved answer (binary beats rubric scores in practice),
+concrete cited evidence, and, on rejection, actionable feedback the worker can
+use on its very next step.
+
+Design constraints:
+  • Typed, strict-safe schema (Plan-1 model layer) via the existing failover chain.
+  • Judge unavailable (no LLM / call fails) → caller falls back to the legacy
+    heuristic gate — strict superset, no regression.
+  • Pure decision helpers, unit-testable without a browser or LLM.
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import Any
+
+from pydantic import BaseModel, Field
+
+try:
+    from app.logger import get_logger
+    logger = get_logger("outcome_judge")
+except ImportError:
+    logger = logging.getLogger("outcome_judge")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Verdict schema (flat + strict-safe)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class DoneVerdict(BaseModel):
+    """Binary, evidence-cited verdict on whether the objective is achieved."""
+
+    achieved: bool = Field(
+        description="True ONLY if the page evidence proves the objective is met."
+    )
+    confidence: float = Field(
+        description="0.0-1.0 — how strong the cited evidence is."
+    )
+    evidence: str = Field(
+        description=(
+            "The CONCRETE on-page proof for your verdict: quote the exact element "
+            "label / page text / URL fragment that shows success (or its absence)."
+        )
+    )
+    missing: str = Field(
+        default="",
+        description=(
+            "If not achieved: exactly what proof is absent from the page "
+            "(e.g. 'cart page does not list the product'). Empty when achieved."
+        )
+    )
+    next_hint: str = Field(
+        default="",
+        description=(
+            "If not achieved: ONE concrete browser action that would surface the "
+            "missing proof (e.g. 'open the cart page and check the item is listed'). "
+            "Empty when achieved."
+        )
+    )
+
+
+# How many times a 'done' may be rejected before we stop looping and finalize
+# honestly (mission_success=False). Termination guarantee — the old counter was
+# incremented but never read, so block-loops could spin forever.
+MAX_DONE_BLOCKS = 4
+
+# Minimum judge confidence to accept an 'achieved' verdict.
+MIN_ACCEPT_CONFIDENCE = 0.6
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Judge prompt
+# ═══════════════════════════════════════════════════════════════════════════════
+
+JUDGE_SYSTEM_PROMPT = """You are a SKEPTICAL, INDEPENDENT task-completion verifier for a browser agent.
+The agent claims its task is finished. Your job is to decide — from PAGE EVIDENCE
+ONLY — whether the objective is truly achieved. The agent's own claims are NOT
+evidence; agents routinely believe they are done when they are not.
+
+VERIFICATION RULES
+1. THINK SITUATIONALLY FIRST: before looking at the page, reason about what
+   proof THIS PARTICULAR task would leave behind when truly complete. Every kind
+   of task has its own natural evidence — derive it from the objective, do not
+   apply a fixed checklist. Examples of the reasoning (not an exhaustive list):
+   • "add X to cart"      → cart badge/count increased, "Go to cart" state, or
+                            the cart page listing X
+   • "post/publish X"     → the published post/comment visible on the page or feed
+   • "find/report a fact" → the fact itself visible in the page text
+   • "fill/submit a form" → a submission confirmation, NOT the filled form
+   • "download/upload"    → the completed-state indicator the site shows
+   Then check whether THAT proof is present in the evidence below.
+2. Base your verdict ONLY on the FRESH PAGE STATE provided (URL + interactive
+   element map + visible page text). The VISIBLE PAGE TEXT is real rendered
+   content — proof found there counts fully (e.g. a confirmation message, a
+   fact the task asked to find, an item listed in a cart).
+3. Cite concrete proof: quote the exact element label, page text, or URL fragment
+   that demonstrates success. If you cannot point at proof, the answer is NOT achieved.
+4. Know the classic traps — these are NOT success:
+   • a filled form is not a SUBMITTED form
+   • a product page is not an item IN THE CART
+   • a compose box with text is not a PUBLISHED post/comment
+   • a search results page is not an OPENED result
+   • an intermediate confirmation dialog is not a COMPLETED flow
+5. Distinguish the goal action from look-alikes (e.g. "Buy Now" / checkout flows
+   are NOT "add to cart"; a login wall means the goal was NOT reached).
+6. If the proof you derived in rule 1 is genuinely not visible on the CURRENT
+   page but would be visible somewhere else (e.g. the cart page), answer NOT
+   achieved and set next_hint to the navigation that would surface it — that is
+   how the agent verifies-by-checking instead of assuming.
+7. Be decisive and binary. No partial credit. When proof is present, say achieved
+   with the citation; when it is not, say not achieved with what is missing.
+"""
+
+
+def build_judge_messages(
+    *,
+    objective: str,
+    success_criteria: str,
+    url: str,
+    dom_markdown: str,
+    history_tail: str,
+    claim: str,
+    page_text: str = "",
+) -> list[dict]:
+    """Build the judge conversation (pure — unit-testable).
+
+    page_text is the rendered body text — essential evidence the interactive
+    element map cannot carry (confirmation toasts, facts the task asked to find,
+    cart line-items). Without it the judge is blind to every non-clickable proof.
+    """
+    user = (
+        f"═══ OBJECTIVE ═══\n{objective}\n\n"
+        + (f"═══ PLANNED SUCCESS CRITERIA (done when) ═══\n{success_criteria}\n\n"
+           if success_criteria else "")
+        + f"═══ AGENT'S CLAIM (NOT evidence) ═══\n{claim or '(none)'}\n\n"
+        f"═══ RECENT ACTION TRAIL ═══\n{history_tail or '(none)'}\n\n"
+        f"═══ FRESH PAGE STATE (the ONLY evidence) ═══\n"
+        f"URL: {url}\n\n"
+        f"── Interactive elements ──\n{dom_markdown[:5000]}\n\n"
+        + (f"── Visible page text ──\n{page_text[:4500]}\n\n" if page_text else "")
+        + "Verdict: is the objective ACHIEVED, based strictly on the page state above?"
+    )
+    return [
+        {"role": "system", "content": JUDGE_SYSTEM_PROMPT},
+        {"role": "user", "content": user},
+    ]
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Judge invocation (uses the Plan-1 failover layer; never raises)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def judge_done(
+    invoke_fn,
+    failover_chain: list,
+    breaker,
+    health_tracker,
+    *,
+    objective: str,
+    success_criteria: str = "",
+    url: str = "",
+    dom_markdown: str = "",
+    history_tail: str = "",
+    claim: str = "",
+    page_text: str = "",
+) -> DoneVerdict | None:
+    """Run the outcome judge. Returns None when no verdict could be obtained
+    (caller falls back to the legacy heuristic gate)."""
+    if invoke_fn is None or not failover_chain:
+        return None
+
+    from langchain_core.messages import HumanMessage, SystemMessage
+    raw = build_judge_messages(
+        objective=objective, success_criteria=success_criteria, url=url,
+        dom_markdown=dom_markdown, history_tail=history_tail, claim=claim,
+        page_text=page_text,
+    )
+    messages = [SystemMessage(content=raw[0]["content"]),
+                HumanMessage(content=raw[1]["content"])]
+
+    try:
+        verdict, used_model = await invoke_fn(
+            failover_chain, messages, DoneVerdict,
+            breaker, health_tracker=health_tracker,
+        )
+        if verdict is None:
+            return None
+        logger.info(
+            "⚖️ Outcome judge (%s): achieved=%s conf=%.2f — %s",
+            used_model, verdict.achieved, verdict.confidence,
+            (verdict.evidence or verdict.missing)[:100],
+        )
+        return verdict
+    except Exception as e:
+        logger.warning("Outcome judge unavailable (%s) — falling back to heuristics",
+                       str(e)[:120])
+        return None
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Pure decision helpers
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def should_accept(verdict: DoneVerdict, min_confidence: float = MIN_ACCEPT_CONFIDENCE) -> bool:
+    """Accept 'done' only on a confident, evidence-backed achieved verdict."""
+    return bool(verdict.achieved) and float(verdict.confidence) >= min_confidence
+
+
+def rejection_feedback(verdict: DoneVerdict) -> str:
+    """Actionable correction injected into the worker's next prompt.
+
+    The old gate rejected 'done' with process-trail reasons the worker could not
+    act on ("Plan incomplete: 3 steps remaining") — so it just re-emitted 'done'.
+    This gives it the judge's page-grounded gap + one concrete next move.
+    """
+    missing = (verdict.missing or "the page does not show proof of completion").strip()
+    hint = (verdict.next_hint or "surface the proof on screen, then declare done").strip()
+    return (
+        "\n\n🛡️ DONE REJECTED — outcome verification failed.\n"
+        f"MISSING PROOF: {missing}\n"
+        f"DO THIS NOW: {hint}\n"
+        "Only output 'done' again once the missing proof is VISIBLE on the page."
+    )
