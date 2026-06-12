@@ -41,6 +41,18 @@ _GOD_MODE_JS = r"""
     const vw = window.innerWidth  || document.documentElement.clientWidth  || 1920;
     const vh = window.innerHeight || document.documentElement.clientHeight || 1080;
 
+    /* ── V19.1 Primary-action recall ──────────────────────────────────────
+       Commerce / checkout "goal" buttons (Add to Cart, Buy Now, Place Order,
+       Notify Me, …) are routinely scrolled OUT of the viewport on dense product
+       pages (Flipkart / Amazon). The off-screen cull below would discard them
+       before scoring, so the LLM never sees the one button the task depends on
+       — the observed Flipkart "Add to Cart not found → scroll forever" stall.
+       We detect these by their short label, EXEMPT them from the off-screen
+       cull, and give them a strong score bonus so they survive the element
+       budget. They still resolve to fresh, scrolled-into-view coordinates at
+       action time via the V19 window.__aid registry. */
+    const ACTION_RE = /add to (cart|bag|basket)|buy\s?it\s?now|buy\s?now|place order|order now|go to (cart|checkout)|view cart|proceed( to (checkout|pay(ment)?|buy))?|checkout|pay now|make payment|notify me|sold out|out of stock|coming soon|add to wishlist|subscribe/i;
+
     /* ━━━ 1. COLLECT CANDIDATES ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
     const seen = new WeakSet();
     const candidates = [];
@@ -119,8 +131,26 @@ _GOD_MODE_JS = r"""
         try { rect = el.getBoundingClientRect(); } catch(_) { continue; }
 
         if (rect.width < MIN_DIM || rect.height < MIN_DIM) continue;
-        if (rect.bottom < -50 || rect.top > vh * 2) continue;
-        if (rect.right < -50 || rect.left > vw + 50) continue;
+
+        /* Off-screen cull — but RESCUE primary-action buttons (ACTION_RE).
+           The label read is paid ONLY for off-screen candidates, so on-screen
+           elements keep their zero-extra-cost fast path. The tag/role + length
+           gate prevents false positives from product titles / promo copy that
+           merely contain words like "buy now" (those are long <a> links). */
+        let isAction = false;
+        const offViewport = (rect.bottom < -50 || rect.top > vh * 2
+                             || rect.right < -50 || rect.left > vw + 50);
+        if (offViewport) {
+            let qn = '';
+            try { qn = (el.getAttribute('aria-label') || el.textContent || '').replace(/\s+/g, ' ').trim(); } catch(_) {}
+            if (qn && qn.length <= 48 && ACTION_RE.test(qn)) {
+                const tagU = (el.tagName || '').toUpperCase();
+                let roleU = '';
+                try { roleU = (el.getAttribute('role') || '').toLowerCase(); } catch(_) {}
+                isAction = (tagU === 'BUTTON' || tagU === 'INPUT' || roleU === 'button' || qn.length <= 24);
+            }
+            if (!isAction) continue;
+        }
 
         let cs;
         try { cs = window.getComputedStyle(el); } catch(_) { continue; }
@@ -166,6 +196,10 @@ _GOD_MODE_JS = r"""
         const inViewport = rect.top >= 0 && rect.bottom <= vh && rect.left >= 0 && rect.right <= vw;
         if (!inViewport) score += 10000;
 
+        /* V19.1: guarantee rescued primary-action buttons survive the budget
+           cut even when far off-screen (this bonus beats the +10000 penalty). */
+        if (isAction) score -= 16000;
+
         /* ── V15.0 F1: Fixed/sticky elements are ALWAYS visible (W3C getComputedStyle) ── */
         const cssPos = cs.position;
         if (cssPos === 'fixed' || cssPos === 'sticky') {
@@ -203,7 +237,40 @@ _GOD_MODE_JS = r"""
         }
         if (!container) container = 'page';
 
-        scored.push({ el, text, kind, cx, cy, score, tag, inputState, container });
+        /* ── V19 Disambiguation hint: href + nearest row/item context ──
+           Repeated controls ("comments", "Add to cart") share a label; this
+           gives the LLM a cheap way to tell them apart and pick the RIGHT one. */
+        let hint = '';
+        /* href is the strongest disambiguator for repeated link labels (free) */
+        if (tag === 'A') {
+            let href = el.getAttribute('href') || '';
+            if (href && !href.startsWith('javascript') && href !== '#') {
+                href = href.replace(/^https?:\/\/[^/]+/, '');  /* strip origin */
+                if (href.length > 45) href = href.slice(0, 45) + '…';
+                hint = href;
+            }
+        }
+        /* For SHORT/ambiguous labels, add a snippet of the enclosing row/item.
+           Gated to short labels so we only pay innerText cost where it helps. */
+        if ((text || '').length < 18) {
+            let rc = el.parentElement, hops = 0, ctx = '';
+            while (rc && hops < 6) {
+                const rt = (rc.tagName || '').toUpperCase();
+                const rr = (rc.getAttribute && rc.getAttribute('role')) || '';
+                if (rt === 'TR' || rt === 'LI' || rt === 'ARTICLE'
+                    || rr === 'row' || rr === 'listitem' || rr === 'article') {
+                    let full = (rc.innerText || '').replace(/\s+/g, ' ').trim();
+                    const own = (text || '').trim();
+                    if (own && full.startsWith(own)) full = full.slice(own.length).trim();
+                    ctx = full.slice(0, 50);
+                    break;
+                }
+                rc = rc.parentElement; hops++;
+            }
+            if (ctx) hint = hint ? (hint + ' · ' + ctx) : ('in: ' + ctx);
+        }
+
+        scored.push({ el, text, kind, cx, cy, score, tag, inputState, container, hint });
     }
 
     scored.sort((a, b) => a.score - b.score);
@@ -221,17 +288,24 @@ _GOD_MODE_JS = r"""
 
     /* ━━━ 3. BUILD OUTPUTS ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
 
-    /* 3a. Structured elements array (for coordinates) */
+    /* 3a. Structured elements array (for coordinates) + stable handle registry.
+       V19: window.__aid maps each eN to its LIVE DOM node so actions resolve to
+       the EXACT element (fresh coords, no coordinate drift). Rebuilt fresh each
+       extraction; auto-cleared on navigation. This is a window var, NOT a
+       DOM-tree mutation — the "zero DOM mutation" principle is preserved. */
     const elements = [];
+    window.__aid = {};
     for (let i = 0; i < top.length; i++) {
         const { text, kind, cx, cy, inputState } = top[i];
+        const eid = 'e' + (i + 1);
         let label = text || top[i].tag.toLowerCase();
         if (inputState) {
             label += inputState.filled
                 ? ` [filled: "${inputState.preview}"${inputState.length > 250 ? ' ...(' + inputState.length + ' total)' : ''} ${inputState.length}ch]`
                 : ' [empty]';
         }
-        elements.push({ id: 'e' + (i+1), kind, text: label, x: cx, y: cy });
+        try { window.__aid[eid] = top[i].el; } catch(_) {}
+        elements.push({ id: eid, kind, text: label, x: cx, y: cy, hint: top[i].hint || '' });
     }
 
     /* 3b. Semantic Markdown (Crawl4AI-inspired compression) */
@@ -248,7 +322,8 @@ _GOD_MODE_JS = r"""
         for (const i of indices) {
             const e = elements[i];
             const icon = e.kind === 'input' ? '📝' : e.kind === 'button' ? '🔘' : e.kind === 'link' ? '🔗' : '•';
-            md += `- ${icon} **[${e.id}]** ${e.kind}: ${e.text} → (${e.x},${e.y})\n`;
+            const hintStr = e.hint ? `  ⟨${e.hint}⟩` : '';
+            md += `- ${icon} **[${e.id}]** ${e.kind}: ${e.text}${hintStr} → (${e.x},${e.y})\n`;
         }
         md += '\n';
     }
@@ -397,6 +472,62 @@ def _empty_result() -> dict[str, Any]:
         "element_count": 0,
         "source": "god_mode_v11_fallback",
     }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  V19 — Stable element resolution (drift-proof, identity-verified targeting)
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Resolves an element id (e.g. 'e5') to its LIVE DOM node via the window.__aid
+#  registry built during extract(), scrolls it into view, and returns its CURRENT
+#  center coordinates. Because the coords are re-read from the exact node the LLM
+#  chose — at action time, after scrolling — they can never be stale and can never
+#  "snap" to a neighbouring element. If the registry has no live node for the id
+#  (rare: re-render/navigation), it returns {ok: False} and callers fall back to
+#  the snapshot coordinates (today's behaviour) — a strict superset, no regression.
+
+_RESOLVE_JS = r"""
+(eid) => {
+    const reg = window.__aid || {};
+    const el = reg[eid];
+    if (!el) return { ok: false, reason: 'not_in_registry' };
+    if (!el.isConnected) return { ok: false, reason: 'detached' };
+    try { el.scrollIntoView({ block: 'center', inline: 'center' }); } catch(_) {}
+    let r;
+    try { r = el.getBoundingClientRect(); } catch(_) { return { ok: false, reason: 'no_rect' }; }
+    if (r.width < 1 || r.height < 1) return { ok: false, reason: 'zero_size' };
+    const cx = Math.round(r.left + r.width / 2);
+    const cy = Math.round(r.top + r.height / 2);
+    const vw = window.innerWidth || 0, vh = window.innerHeight || 0;
+    const onscreen = cx >= 0 && cy >= 0 && cx <= vw && cy <= vh;
+    const tag = (el.tagName || '').toUpperCase();
+    let role = '';
+    try { role = el.getAttribute('role') || ''; } catch(_) {}
+    let text = '';
+    try {
+        text = (el.getAttribute('aria-label') || el.textContent || '')
+            .replace(/\s+/g, ' ').trim().slice(0, 40);
+    } catch(_) {}
+    return { ok: true, x: cx, y: cy, tag, role, text, onscreen };
+}
+"""
+
+
+async def resolve_element(page, eid: str, timeout: float = 2.0) -> dict[str, Any]:
+    """Resolve an element id to FRESH, identity-verified center coordinates.
+
+    Returns:
+        {"ok": True, "x", "y", "tag", "role", "text", "onscreen"} on success, or
+        {"ok": False, "reason": ...} when the id is not a live node (caller should
+        fall back to snapshot coordinates).
+    """
+    if not eid:
+        return {"ok": False, "reason": "no_eid"}
+    try:
+        res = await asyncio.wait_for(page.evaluate(_RESOLVE_JS, eid), timeout=timeout)
+        return res or {"ok": False, "reason": "null_result"}
+    except Exception as e:
+        log.debug("resolve_element(%s) failed: %s", eid, e)
+        return {"ok": False, "reason": str(e)[:80]}
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

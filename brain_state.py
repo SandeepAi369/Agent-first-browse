@@ -101,6 +101,21 @@ class BrainState(BaseModel):
     plan_progress_pct: int = 0
     reflections: Annotated[list[str], add] = Field(default_factory=list)
 
+    # ── Cognition Core (V18) — the agent's working theory of the task ──
+    # NOTE: `beliefs` deliberately uses overwrite (not the `add` reducer) so the
+    # updating node can keep it capped/de-duplicated — bounded memory prevents
+    # prompt overload / hallucination. See cognition.merge_beliefs().
+    strategy: str = ""                  # overall approach the agent is testing
+    success_criteria: str = ""          # what "done" looks like (anti done-confusion)
+    strategy_confidence: float = 1.0    # decays on no-progress, reinforces on progress
+    beliefs: list[str] = Field(default_factory=list)   # bounded learned facts
+    current_obstacle: str = ""          # "<url>|<plan_step>" identity for the ladder
+    ladder_rung: int = 0                # escalation position for current obstacle
+    tried_tactics: list[str] = Field(default_factory=list)  # tactics used on it
+    goal_score_window: list[float] = Field(default_factory=list)  # PRM goal-scores
+    restrategize_count: int = 0         # bounded by cognition.MAX_RESTRATEGIZE
+    goal_complete_hint: str = ""        # set when PRM says the goal looks achieved
+
     # ── Working Memory ──
     history: Annotated[list[dict], add] = Field(default_factory=list)
     facts: dict[str, str] = Field(default_factory=dict)
