@@ -109,7 +109,7 @@ STEALTH_LAUNCH_ARGS = [
 
 _PLATFORM_STRING = "Linux x86_64" if _is_linux_env() else "Win32"
 
-STEALTH_INIT_SCRIPT = """
+STEALTH_INIT_SCRIPT = r"""
 (() => {
   // ────────────────────────────────────────────────────────
   // 0. Utility + Session Seed
@@ -178,7 +178,7 @@ STEALTH_INIT_SCRIPT = """
   // 2. Navigator property hardening
   // ────────────────────────────────────────────────────────
   defineSafe(navigator, 'languages', ['en-US', 'en']);
-  defineSafe(navigator, 'platform', '""" + _PLATFORM_STRING + """');
+  defineSafe(navigator, 'platform', '""" + _PLATFORM_STRING + r"""');
   // V-18 fix: per-session hardware profile via canvasSeed (not baked at Python import)
   defineSafe(navigator, 'deviceMemory', [4, 8, 8, 16][canvasSeed % 4]);
   defineSafe(navigator, 'hardwareConcurrency', [8, 10, 12, 16][canvasSeed % 4]);
@@ -319,7 +319,10 @@ STEALTH_INIT_SCRIPT = """
   //    MAX_TEXTURE_SIZE, MAX_VIEWPORT_DIMS, MAX_RENDERBUFFER_SIZE.
   //    Must be a matched set from real hardware.
   // ────────────────────────────────────────────────────────
-  const GPU_PROFILES = [
+  // Direct3D11 renderers (Windows) vs Mesa/OpenGL renderers (Linux). The set
+  // MUST match the spoofed navigator.platform — a Linux UA reporting a D3D11
+  // renderer is an instant inconsistency tell.
+  const _WIN_GPUS = [
     { vendor: 'Google Inc. (Intel)',
       renderer: 'ANGLE (Intel, Intel(R) UHD Graphics 630 Direct3D11 vs_5_0 ps_5_0, D3D11)',
       maxTex: 16384, maxVP: [16384,16384], maxRB: 16384 },
@@ -329,10 +332,19 @@ STEALTH_INIT_SCRIPT = """
     { vendor: 'Google Inc. (AMD)',
       renderer: 'ANGLE (AMD, AMD Radeon RX 580 Direct3D11 vs_5_0 ps_5_0, D3D11)',
       maxTex: 16384, maxVP: [16384,16384], maxRB: 16384 },
+  ];
+  const _LIN_GPUS = [
     { vendor: 'Google Inc. (Intel)',
-      renderer: 'ANGLE (Intel, Intel(R) Iris(R) Xe Graphics Direct3D11 vs_5_0 ps_5_0, D3D11)',
+      renderer: 'ANGLE (Intel, Mesa Intel(R) UHD Graphics 630 (CFL GT2), OpenGL 4.6 (Core Profile) Mesa 23.2.1-1ubuntu3.1)',
+      maxTex: 16384, maxVP: [16384,16384], maxRB: 16384 },
+    { vendor: 'Google Inc. (NVIDIA Corporation)',
+      renderer: 'ANGLE (NVIDIA Corporation, NVIDIA GeForce GTX 1660 SUPER/PCIe/SSE2, OpenGL 4.6.0)',
+      maxTex: 32768, maxVP: [32768,32768], maxRB: 32768 },
+    { vendor: 'Google Inc. (AMD)',
+      renderer: 'ANGLE (AMD, AMD Radeon RX 580 Series (polaris10, LLVM 15.0.7, DRM 3.49, 6.5.0), OpenGL 4.6 (Core Profile) Mesa 23.2.1)',
       maxTex: 16384, maxVP: [16384,16384], maxRB: 16384 },
   ];
+  const GPU_PROFILES = /Linux/.test(navigator.platform || '') ? _LIN_GPUS : _WIN_GPUS;
   const gpu = GPU_PROFILES[canvasSeed % GPU_PROFILES.length];
 
   const patchWebGL = (proto) => {
