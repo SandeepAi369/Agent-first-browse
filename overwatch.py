@@ -277,43 +277,203 @@ async def overwatch_node(state: dict[str, Any], page, critic, action_verifier=No
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  Layer 4: CoVe Action-Trail Verification (for 'done' actions)
+#  Layer 4: Outcome verification (for 'done' actions)
 # ═══════════════════════════════════════════════════════════════════════════════
+#  V20: the gate is now an EVIDENCE-GROUNDED judge over the FRESH page state
+#  (objective + planner success-criteria + live DOM + action trail), not the old
+#  process-trail heuristics. The heuristics remain ONLY as a fallback when no
+#  LLM verdict can be obtained. See outcome_judge.py for the full rationale.
+
+# Judge dependencies — injected once at startup by brain_graph (same pattern as
+# mcp_tools.set_page). Without configuration the gate falls back to heuristics.
+_JUDGE_INVOKE_FN = None
+_JUDGE_CHAIN: list = []
+_JUDGE_BREAKER = None
+_JUDGE_HEALTH = None
+
+
+def configure_outcome_judge(invoke_fn, failover_chain, breaker, health_tracker) -> None:
+    """Wire the Plan-1 model layer into the done-gate (called at brain startup)."""
+    global _JUDGE_INVOKE_FN, _JUDGE_CHAIN, _JUDGE_BREAKER, _JUDGE_HEALTH
+    _JUDGE_INVOKE_FN = invoke_fn
+    _JUDGE_CHAIN = failover_chain or []
+    _JUDGE_BREAKER = breaker
+    _JUDGE_HEALTH = health_tracker
+
+
+def _block_done(state: dict, updates: dict, reason: str,
+                correction: str = "") -> dict:
+    """Reject a 'done', with a TERMINATION GUARANTEE: after MAX_DONE_BLOCKS
+    rejections we stop looping and finalize honestly (mission_success=False).
+    The old counter was incremented but never read — block-loops could spin
+    forever (observed: done ×5 blocked on the HN run)."""
+    from outcome_judge import MAX_DONE_BLOCKS
+    blocked = state.get("done_blocked", 0) + 1
+    updates["done_blocked"] = blocked
+    updates["history"] = [{
+        "step": state.get("step_number", 0) + 1,
+        "action": "done",
+        "outcome": f"BLOCKED: {reason[:80]}",
+    }]
+    if blocked >= MAX_DONE_BLOCKS:
+        logger.warning(
+            "🛑 Overwatch L4: done blocked %d× — finalizing UNVERIFIED (honest failure). "
+            "Last gap: %s", blocked, reason[:120],
+        )
+        updates["overwatch_verdict"] = "escalate"   # routes straight to finalize
+        updates["mission_success"] = False
+        updates["done_evidence"] = f"UNVERIFIED after {blocked} attempts: {reason[:160]}"
+        return updates
+    logger.warning("🛡️ Overwatch L4: done BLOCKED (%d/%d) — %s",
+                   blocked, MAX_DONE_BLOCKS, reason[:120])
+    updates["overwatch_verdict"] = "retry"
+    if correction:
+        updates["correction_context"] = correction
+    return updates
+
+
+async def final_outcome_audit(state: dict, page) -> tuple[bool, str]:
+    """Last-chance outcome verification when the agent shuts down WITHOUT a
+    verified 'done' (budget exhausted, restrategize cap, …).
+
+    The agent failing to *declare* done does not mean the task failed — on
+    sites where the confirmation click misfires, the goal evidence may already
+    be on screen (e.g. Flipkart's button switched to 'Go to cart'). One judge
+    call here converts those false-failures into verified successes, and makes
+    every shutdown report honest: verified-success / verified-failure /
+    unverifiable. Returns (achieved, evidence_or_gap)."""
+    from outcome_judge import judge_done, should_accept
+
+    page_text = ""
+    dom_markdown = state.get("dom_markdown", "")
+    url = state.get("current_url", "")
+    try:
+        url = page.url or url
+        import dom_parser
+        fresh = await dom_parser.extract(page, timeout=4.0)
+        if fresh.get("elements"):
+            dom_markdown = fresh.get("markdown", dom_markdown)
+        page_text = await page.evaluate(
+            "() => (document.body && document.body.innerText || '')"
+            ".replace(/\\s+/g, ' ').slice(0, 4500)"
+        )
+    except Exception as e:
+        logger.debug("final audit perception failed (%s) — using last state", e)
+
+    verdict = await judge_done(
+        _JUDGE_INVOKE_FN, _JUDGE_CHAIN, _JUDGE_BREAKER, _JUDGE_HEALTH,
+        objective=state.get("objective", ""),
+        success_criteria=state.get("success_criteria", ""),
+        url=url,
+        dom_markdown=dom_markdown,
+        history_tail=state.get("history_compressed", ""),
+        claim="(none — the agent shut down without declaring done)",
+        page_text=page_text,
+    )
+    if verdict is None:
+        return False, "unverifiable (judge offline)"
+    if should_accept(verdict):
+        return True, verdict.evidence[:300]
+    return False, (verdict.missing or verdict.evidence)[:300]
+
 
 async def _layer_4_cove_check(state: dict, page, updates: dict) -> dict:
-    """Chain-of-Verification before declaring done."""
+    """Outcome verification before accepting 'done'."""
+    from outcome_judge import judge_done, should_accept, rejection_feedback
+
+    objective = state.get("objective", "")
+
+    # ── Cheap, high-precision pre-block: an auth wall is never success ──
+    try:
+        url = page.url if page else state.get("current_url", "")
+    except Exception:
+        url = state.get("current_url", "")
+    if any(kw in (url or "").lower() for kw in ("login", "signin", "auth", "signup")):
+        return _block_done(
+            state, updates, f"Still on auth page ({url[:60]})",
+            "\n\n🛡️ DONE REJECTED: you are on a login/auth page — the task cannot "
+            "be complete here. Deal with the auth wall or navigate back to the task.",
+        )
+
+    # ── Fresh perception: judge the page AS IT IS NOW (a confirmation toast /
+    #    cart badge may have appeared after the last snapshot) ──
+    dom_markdown = state.get("dom_markdown", "")
+    try:
+        import dom_parser
+        fresh = await dom_parser.extract(page, timeout=4.0)
+        if fresh.get("elements"):
+            dom_markdown = fresh.get("markdown", dom_markdown)
+    except Exception as e:
+        logger.debug("L4 fresh snapshot failed (%s) — using last snapshot", e)
+
+    # Visible page text — proof routinely lives in NON-interactive content
+    # (confirmation messages, a fact the task asked to find, cart line-items).
+    # The element map alone made the judge blind to all of it.
+    page_text = ""
+    try:
+        page_text = await page.evaluate(
+            "() => (document.body && document.body.innerText || '')"
+            ".replace(/\\s+/g, ' ').slice(0, 4500)"
+        )
+    except Exception as e:
+        logger.debug("L4 page-text read failed (%s)", e)
+
+    proposed = state.get("proposed_action") or {}
+    claim = " | ".join(
+        s for s in (
+            (proposed.get("screen_state", "") or "").strip(),
+            (proposed.get("goal_progress", "") or "").strip(),
+            (proposed.get("reasoning", "") or "").strip(),
+        ) if s
+    )
+
+    verdict = await judge_done(
+        _JUDGE_INVOKE_FN, _JUDGE_CHAIN, _JUDGE_BREAKER, _JUDGE_HEALTH,
+        objective=objective,
+        success_criteria=state.get("success_criteria", ""),
+        url=url,
+        dom_markdown=dom_markdown,
+        history_tail=state.get("history_compressed", ""),
+        claim=claim,
+        page_text=page_text,
+    )
+
+    if verdict is not None:
+        if should_accept(verdict):
+            logger.info("✅ Overwatch L4: outcome VERIFIED — %s", verdict.evidence[:140])
+            updates["overwatch_verdict"] = "pass"
+            updates["mission_success"] = True
+            updates["done_evidence"] = verdict.evidence[:300]
+            return updates
+        return _block_done(
+            state, updates,
+            verdict.missing or "no on-page proof of completion",
+            rejection_feedback(verdict),
+        )
+
+    # ── Fallback (judge unavailable): legacy heuristic trail-check ──
     from execution_safety import cove_pre_done_check
     from cognitive_core import PlanState, WorkingMemory
 
-    # Reconstruct PlanState and WorkingMemory from BrainState
     plan = PlanState(
-        mission=state.get("objective", ""),
+        mission=objective,
         steps=state.get("plan_steps", []),
         current_step_id=state.get("plan_cursor", 0),
     )
-
     working_mem = WorkingMemory()
-    # Populate working_mem.history from state for action-trail check
     for h in state.get("history", []):
         working_mem.episodic.append(h)
 
-    objective = state.get("objective", "")
     cove_ok, cove_reason = await cove_pre_done_check(page, plan, working_mem, objective)
 
     if not cove_ok:
-        logger.warning("🛡️ Overwatch L4: CoVe BLOCKED premature done — %s", cove_reason)
-        updates["overwatch_verdict"] = "retry"
-        updates["done_blocked"] = state.get("done_blocked", 0) + 1
-        updates["history"] = [{
-            "step": state.get("step_number", 0) + 1,
-            "action": "done",
-            "outcome": f"BLOCKED: {cove_reason[:60]}",
-        }]
-        return updates
+        return _block_done(state, updates, f"(heuristic) {cove_reason}")
 
-    logger.info("✅ Overwatch L4: CoVe verified done — %s", cove_reason[:60])
+    logger.info("✅ Overwatch L4: heuristic-verified done (judge offline) — %s",
+                cove_reason[:60])
     updates["overwatch_verdict"] = "pass"
     updates["mission_success"] = True
+    updates["done_evidence"] = f"(heuristic only) {cove_reason[:200]}"
     return updates
 
 

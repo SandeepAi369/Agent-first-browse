@@ -172,6 +172,9 @@ class BrainState(BaseModel):
     critic_no_progress: int = 0
     reflexion_triggers: int = 0
     done_blocked: int = 0
+    # V20: the outcome judge's cited on-page proof (or the honest gap on an
+    # unverified shutdown) — surfaced in the finalize report.
+    done_evidence: str = ""
 
     # ── Budget extension tracking ──
     budget_extended: bool = False
