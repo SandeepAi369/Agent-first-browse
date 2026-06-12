@@ -474,3 +474,17 @@ class CriticV12:
         """Reset the circuit breaker after a successful replan."""
         self._no_progress_streak = 0
         logger.info("Circuit breaker reset after replan")
+
+    def reset_for_task(self) -> None:
+        """Full reset of per-task state (V18 clean handoff).
+
+        Called at task finalize so a reused CriticV12 instance never carries a
+        previous task's progress streak, action history, or snapshot into a new
+        one.
+        """
+        self._prev_state = None
+        self._no_progress_streak = 0
+        self._action_history.clear()
+        self._total_actions = 0
+        self._total_progress = 0
+        logger.info("CriticV12 reset for new task")

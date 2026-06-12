@@ -37,7 +37,11 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-logger = logging.getLogger("moe_router")
+try:
+    from app.logger import get_logger
+    logger = get_logger("moe_router")
+except ImportError:
+    logger = logging.getLogger("moe_router")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

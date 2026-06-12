@@ -47,6 +47,7 @@ test-results/
 *.log
 *.bak
 *.tmp
+*.pid
 
 # ─── Windows venv ─────────────────────────────────────────
 .venv-windows/

@@ -23,7 +23,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from langchain_core.messages import SystemMessage, HumanMessage
 
 try:
@@ -84,6 +84,8 @@ class TrajectoryScore:
 
 class ChecklistGeneration(BaseModel):
     """LLM output: checklist of verifiable sub-goals."""
+    model_config = ConfigDict(extra="forbid")
+
     items: list[str] = Field(
         description=(
             "A list of 4-8 verifiable sub-goals that must be completed to achieve "
@@ -97,13 +99,28 @@ class ChecklistGeneration(BaseModel):
     )
 
 
+class EvaluationItem(BaseModel):
+    """One checklist item's evaluation against the current page state.
+
+    V17.0: typed nested model (was a free-form dict) — strict-mode providers
+    like Groq require `additionalProperties: false` on every nested object,
+    which Pydantic emits via extra='forbid'. The untyped dict caused 400s.
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    id: int = Field(description="The checklist item's 0-indexed id.")
+    status: str = Field(description="One of: 'done', 'in_progress', 'pending'.")
+    confidence: float = Field(description="Confidence in this status, 0.0 to 1.0.")
+    evidence: str = Field(description="Brief reason for the status, 1 sentence.")
+
+
 class ChecklistEvaluation(BaseModel):
     """LLM output: evaluation of checklist items against current state."""
-    evaluations: list[dict] = Field(
+    model_config = ConfigDict(extra="forbid")
+
+    evaluations: list[EvaluationItem] = Field(
         description=(
             "For each checklist item, evaluate its status based on the current page state. "
-            "Each dict must have: 'id' (int, 0-indexed), 'status' ('done', 'in_progress', or 'pending'), "
-            "'confidence' (float 0.0-1.0), 'evidence' (brief reason, 1 sentence). "
             "Base your evaluation ONLY on what you can see in the current page state."
         )
     )
@@ -111,6 +128,8 @@ class ChecklistEvaluation(BaseModel):
 
 class TrajectoryEvaluation(BaseModel):
     """LLM output: evaluation of a predicted future state against checklist."""
+    model_config = ConfigDict(extra="forbid")
+
     items_likely_done: int = Field(
         description="How many checklist items would be completed in the predicted state."
     )
@@ -258,11 +277,11 @@ class PRMCritic:
             newly_completed = []
             
             for eval_item in evaluations:
-                item_id = eval_item.get("id", -1)
+                item_id = eval_item.id
                 if 0 <= item_id < len(checklist):
                     item = checklist[item_id]
-                    new_status = eval_item.get("status", "pending")
-                    new_confidence = float(eval_item.get("confidence", 0.0))
+                    new_status = eval_item.status or "pending"
+                    new_confidence = float(eval_item.confidence)
                     
                     # Track newly completed items
                     if new_status == "done" and item.status != "done":

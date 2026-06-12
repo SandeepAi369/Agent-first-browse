@@ -25,7 +25,11 @@ import json
 import logging
 from typing import Any
 
-logger = logging.getLogger("mcp_tools")
+try:
+    from app.logger import get_logger
+    logger = get_logger("mcp_tools")
+except ImportError:
+    logger = logging.getLogger("mcp_tools")
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  Tool Registry — holds the live page reference
@@ -97,16 +101,21 @@ async def mcp_click(
     page = _get_page()
 
     try:
-        # V15.2: Scroll element into viewport center before action
+        # V19: Resolve the chosen element to FRESH, identity-verified coords from
+        # the exact node the LLM picked (drift-proof). Falls back to snapshot
+        # coords if the registry has no live node for this id.
         if element_id:
-            try:
-                await page.evaluate("""(eid) => {
-                    const el = document.querySelector(`[data-eid="${eid}"]`);
-                    if (el) el.scrollIntoView({behavior: 'smooth', block: 'center'});
-                }""", element_id)
-                await asyncio.sleep(0.5)
-            except Exception:
-                pass
+            import dom_parser
+            r = await dom_parser.resolve_element(page, element_id)
+            if r.get("ok"):
+                x, y = float(r["x"]), float(r["y"])
+                logger.info("🎯 Resolved %s → fresh (%d,%d) [%s '%s']",
+                            element_id, int(x), int(y), r.get("tag", ""),
+                            (r.get("text", "") or "")[:25])
+                await asyncio.sleep(0.2)  # let scroll settle
+            else:
+                logger.debug("resolve %s miss (%s) — using snapshot coords",
+                             element_id, r.get("reason"))
 
         # Step 1: Overlay penetration
         from overlay_detector import smart_click_with_penetration
@@ -170,16 +179,19 @@ async def mcp_type(
     page = _get_page()
 
     try:
-        # V15.2: Scroll into view
+        # V19: Resolve to fresh, identity-verified coords from the chosen node.
         if element_id:
-            try:
-                await page.evaluate("""(eid) => {
-                    const el = document.querySelector(`[data-eid="${eid}"]`);
-                    if (el) el.scrollIntoView({behavior: 'smooth', block: 'center'});
-                }""", element_id)
-                await asyncio.sleep(0.5)
-            except Exception:
-                pass
+            import dom_parser
+            r = await dom_parser.resolve_element(page, element_id)
+            if r.get("ok"):
+                x, y = float(r["x"]), float(r["y"])
+                logger.info("🎯 Resolved %s → fresh (%d,%d) [%s '%s']",
+                            element_id, int(x), int(y), r.get("tag", ""),
+                            (r.get("text", "") or "")[:25])
+                await asyncio.sleep(0.2)  # let scroll settle
+            else:
+                logger.debug("resolve %s miss (%s) — using snapshot coords",
+                             element_id, r.get("reason"))
 
         from cdp_input import resilient_type
         type_result = await asyncio.wait_for(
@@ -371,6 +383,17 @@ async def mcp_ground_action(
     """
     page = _get_page()
     smap = selector_map or _SELECTOR_MAP
+
+    # Layer 0 (V19): Live registry resolution — the EXACT node the LLM chose, with
+    # fresh coordinates. Supersedes the "snap to nearest within 60px" heuristic
+    # that could land on the wrong neighbour on dense pages.
+    if element_id is not None:
+        import dom_parser
+        r = await dom_parser.resolve_element(page, element_id)
+        if r.get("ok"):
+            return {"grounded": True, "x": float(r["x"]), "y": float(r["y"]),
+                    "element": {"ref": element_id, "name": r.get("text", "")},
+                    "reason": "registry resolved (fresh coords)"}
 
     # Layer 1: Element ID resolution
     if element_id is not None:

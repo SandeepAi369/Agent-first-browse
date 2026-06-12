@@ -32,7 +32,56 @@ import logging
 import time
 from typing import Any
 
-logger = logging.getLogger("overwatch")
+try:
+    from app.logger import get_logger
+    logger = get_logger("overwatch")
+except ImportError:
+    logger = logging.getLogger("overwatch")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  V18 Cognition — escalation ladder driver
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _escalate(state: dict, reason: str, updates: dict) -> dict:
+    """Advance the deterministic escalation ladder for a stuck state.
+
+    Writes the next DISTINCT tactic's directive into `correction_context`
+    (reusing the existing worker-prompt injection slot), advances the ladder,
+    and decays strategy confidence. When the ladder is exhausted it sets the
+    verdict to 'rollback' so the rollback node re-strategizes. Returns the
+    ladder dict so the caller can see whether a re-strategy was requested.
+    """
+    from cognition import advance_ladder, update_confidence, obstacle_key
+
+    plan_steps = state.get("plan_steps", [])
+    active = next((s for s in plan_steps
+                   if s.get("status") in ("active", "in_progress")), None)
+    plan_step_desc = active.get("desc", "") if active else ""
+    obk = obstacle_key(state.get("current_url", ""), plan_step_desc)
+
+    lad = advance_ladder(
+        state.get("current_obstacle", ""), obk,
+        state.get("ladder_rung", 0), state.get("tried_tactics", []),
+    )
+    updates["current_obstacle"] = lad["obstacle"]
+    updates["ladder_rung"] = lad["rung"]
+    updates["tried_tactics"] = lad["tried"]
+    updates["strategy_confidence"] = update_confidence(
+        state.get("strategy_confidence", 1.0), progress=False)
+
+    if lad["restrategize"]:
+        updates["correction_context"] = (
+            f"\n\n⚠️ {reason} Prior tactics did not work — forming a NEW strategy."
+        )
+        updates["overwatch_verdict"] = "rollback"
+    else:
+        updates["correction_context"] = (
+            f"\n\n🧗 ADAPTIVE TACTIC [{lad['tactic']}]: {lad['directive']}"
+        )
+    logger.info("🧗 Escalation [%s] rung→%d confidence=%.2f (%s)",
+                lad["tactic"], lad["rung"], updates["strategy_confidence"], reason)
+    return lad
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -116,11 +165,18 @@ async def overwatch_node(state: dict[str, Any], page, critic, action_verifier=No
     #  Layer 3: Execute + DOM Ground-Truth Check (CriticV12)
     # ═══════════════════════════════════════════════════════════════════
 
-    # Pre-action snapshot
+    # Pre-action snapshot — V19: REUSE the perceive snapshot already in state
+    # instead of re-extracting. This (a) saves one full DOM extraction per step,
+    # and (b) crucially keeps window.__aid (the element-handle registry) exactly
+    # as the LLM saw it, so the action resolves the SAME node the LLM chose
+    # (a re-extract here would rebuild the registry right before the click).
     try:
         from cognitive_core import dom_data_to_a11y_format
-        import dom_parser
-        pre_dom = await dom_parser.extract(page, timeout=3.0)
+        pre_dom = {
+            "elements": state.get("elements_list", []),
+            "element_count": state.get("element_count", 0),
+            "markdown": state.get("dom_markdown", ""),
+        }
         pre_a11y = dom_data_to_a11y_format(pre_dom)
         await critic.snapshot_before(pre_a11y)
     except Exception as snap_err:
@@ -169,22 +225,22 @@ async def overwatch_node(state: dict[str, Any], page, critic, action_verifier=No
 
         if verdict.circuit_breaker_triggered:
             logger.warning("🛑 Overwatch L3: circuit breaker — %s", verdict.reason[:100])
+            _escalate(state, "Critic circuit breaker.", updates)
             updates["overwatch_verdict"] = "rollback"
-            updates["correction_context"] = (
-                f"\n\n🛑 CRITIC CIRCUIT BREAKER: {verdict.reason} "
-                "You MUST try a COMPLETELY DIFFERENT approach."
-            )
+            updates["reflexion_triggers"] = state.get("reflexion_triggers", 0) + 1
             return updates
 
         if cf >= 2:
-            updates["correction_context"] = (
-                f"\n\n⚠️ SELF-CORRECTION: Last {cf} actions had NO visible effect. "
-                "Try a COMPLETELY DIFFERENT approach: scroll, dismiss overlays, or wait."
-            )
-            # Trigger reflexion
+            # Escalate through the ladder (distinct tactic each time; never repeats).
+            _escalate(state, f"Last {cf} actions had no visible effect.", updates)
             updates["reflexion_triggers"] = state.get("reflexion_triggers", 0) + 1
+            # Honor a ladder-forced rollback; otherwise retry until cf exhausts.
+            if updates.get("overwatch_verdict") != "rollback":
+                updates["overwatch_verdict"] = "retry" if cf < 3 else "rollback"
+            return updates
 
-        updates["overwatch_verdict"] = "retry" if cf < 3 else "rollback"
+        # cf == 1: one free re-decision before we start escalating.
+        updates["overwatch_verdict"] = "retry"
         return updates
 
     # ═══════════════════════════════════════════════════════════════════
@@ -197,6 +253,7 @@ async def overwatch_node(state: dict[str, Any], page, critic, action_verifier=No
 
     if sig_count >= 3:
         logger.warning("🔄 Overwatch L5: loop detected — sig '%s' x%d", sig[:60], sig_count)
+        _escalate(state, "Loop detected (same action repeating).", updates)
         updates["overwatch_verdict"] = "rollback"
         updates["loop_signatures"] = [sig]
         return updates

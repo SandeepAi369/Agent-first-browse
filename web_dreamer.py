@@ -33,7 +33,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from langchain_core.messages import SystemMessage, HumanMessage
 
 try:
@@ -106,22 +106,48 @@ class DreamerResult:
 #  Pydantic Schemas for Structured LLM Output
 # ═══════════════════════════════════════════════════════════════════════════════
 
+class Candidate(BaseModel):
+    """One candidate action proposed by the planner.
+
+    V17.0: typed nested model (was a free-form dict) — strict-mode providers
+    like Groq require `additionalProperties: false` on every nested object,
+    which Pydantic emits via extra='forbid'. The untyped dict caused 400s.
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    action_type: str = Field(
+        description="One of: goto, click, type, scroll, press_enter, wait, done."
+    )
+    element_id: str | None = Field(
+        default=None, description="The element ID from the page structure (e.g., 'e5')."
+    )
+    text: str | None = Field(
+        default=None, description="The full text to type (for type actions)."
+    )
+    url: str | None = Field(
+        default=None, description="URL to navigate to (for goto actions)."
+    )
+    reasoning: str = Field(
+        default="", description="Why this action might work, 1 sentence."
+    )
+
+
 class CandidateSet(BaseModel):
     """LLM output: k candidate actions for the current state."""
-    candidates: list[dict] = Field(
+    model_config = ConfigDict(extra="forbid")
+
+    candidates: list[Candidate] = Field(
         description=(
-            "A list of 3 distinct candidate actions. Each candidate is a dict with keys: "
-            "'action_type' (goto/click/type/scroll/press_enter/wait/done), "
-            "'element_id' (e.g., 'e5', optional), "
-            "'text' (for type actions, optional), "
-            "'url' (for goto actions, optional), "
-            "'reasoning' (why this action might work, 1 sentence)."
+            "A list of 3 distinct candidate actions. "
+            "Make candidates genuinely DIFFERENT strategies, not variations of one."
         )
     )
 
 
 class WorldModelPrediction(BaseModel):
     """LLM output: predicted state changes after an action."""
+    model_config = ConfigDict(extra="forbid")
+
     predicted_changes: str = Field(
         description=(
             "Describe what will change on the webpage after this action. "
@@ -142,6 +168,8 @@ class WorldModelPrediction(BaseModel):
 
 class ValueJudgment(BaseModel):
     """LLM output: score for a simulated outcome."""
+    model_config = ConfigDict(extra="forbid")
+
     verdict: str = Field(
         description=(
             "Rate whether the predicted state after the action moves toward the goal. "
@@ -281,11 +309,11 @@ class WebDreamer:
             
             for c in raw_candidates[:self._k]:
                 candidates.append(CandidateAction(
-                    action_type=c.get("action_type", "wait"),
-                    element_id=c.get("element_id"),
-                    text=c.get("text"),
-                    url=c.get("url"),
-                    reasoning=c.get("reasoning", ""),
+                    action_type=c.action_type or "wait",
+                    element_id=c.element_id,
+                    text=c.text,
+                    url=c.url,
+                    reasoning=c.reasoning or "",
                 ))
             
             if not candidates:
