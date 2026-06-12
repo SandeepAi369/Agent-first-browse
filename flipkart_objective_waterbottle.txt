@@ -1,0 +1,7 @@
+Navigate to https://www.flipkart.com.
+If a login/sign-in popup appears blocking the screen, close it using the '✕' or 'Close' button.
+Enter "water bottle" in the search bar and submit the search.
+From the first page of results, ignore any "Sponsored" or "Ad" listings.
+Find and open the first valid, in-stock water bottle whose price is under ₹300.
+On the product details page, click the "Add to Cart" button.
+Verify that a cart confirmation message or the cart page shows the product was successfully added.

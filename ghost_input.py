@@ -326,14 +326,70 @@ async def ghost_type(page: Page, text: str) -> None:
 #  Ghost Scroll — Chunked scrolling with entropy
 # ═══════════════════════════════════════════════════════════════════════════════
 
+# Read the current vertical scroll offset (window, or the document scrolling element).
+_SCROLL_Y_JS = """
+() => {
+  const se = document.scrollingElement || document.documentElement || document.body;
+  return Math.round(window.scrollY || (se && se.scrollTop) || 0);
+}
+"""
+
+# Deterministic fallback when the wheel is swallowed: scroll the window, and if
+# the window itself does not move (content lives in a nested scroll container, or
+# a sticky region ate the wheel), scroll the largest scrollable container instead.
+_FORCE_SCROLL_JS = """
+(dy) => {
+  const se = document.scrollingElement || document.documentElement || document.body;
+  const before = window.scrollY || (se && se.scrollTop) || 0;
+  window.scrollBy(0, dy);
+  const after = window.scrollY || (se && se.scrollTop) || 0;
+  if (Math.abs(after - before) >= 5) return after - before;
+  // Window did not budge — find the dominant scrollable element and scroll it.
+  let best = null, bestArea = 0;
+  for (const el of document.querySelectorAll('div, main, section, ul, article, [style*=overflow]')) {
+    if (el.scrollHeight - el.clientHeight <= 20) continue;
+    const oy = getComputedStyle(el).overflowY;
+    if (oy !== 'auto' && oy !== 'scroll') continue;
+    const r = el.getBoundingClientRect();
+    const area = r.width * r.height;
+    if (area > bestArea) { bestArea = area; best = el; }
+  }
+  if (best) { const b = best.scrollTop; best.scrollBy(0, dy); return best.scrollTop - b; }
+  return 0;
+}
+"""
+
+
 async def ghost_scroll(page: Page, delta_y: int = 600) -> None:
-    """Scroll in human-like incremental chunks instead of one instant jump.
-    
+    """Scroll in human-like chunks, then GUARANTEE the viewport actually moved.
+
+    page.mouse.wheel() dispatches at the current cursor position, so after a
+    click (cursor left hovering a product tile or a sticky column) the wheel can
+    be swallowed and the viewport never moves — the action "succeeds" yet the
+    screen is unchanged. That is the #1 reason the agent never reaches off-screen
+    controls like "Add to Cart" and just re-scrolls forever. We park the cursor
+    over the main content first, perform the humanized wheel, then verify the
+    scroll offset changed and fall back to a deterministic programmatic scroll if
+    it did not.
+
     Replaces: await page.mouse.wheel(0, delta)
     """
     remaining = abs(delta_y)
     direction = 1 if delta_y > 0 else -1
     chunks = random.randint(2, 4)
+
+    # Park the cursor over the centre of the viewport so the wheel targets the
+    # main scroller, not whatever element the previous click left it hovering.
+    try:
+        vp = page.viewport_size or {"width": 1280, "height": 800}
+        await page.mouse.move(vp["width"] // 2, vp["height"] // 2)
+    except Exception:
+        pass
+
+    try:
+        before = await page.evaluate(_SCROLL_Y_JS)
+    except Exception:
+        before = 0
 
     for i in range(chunks):
         if remaining <= 0:
@@ -353,4 +409,20 @@ async def ghost_scroll(page: Page, delta_y: int = 600) -> None:
 
     # Small settling pause after scrolling
     await asyncio.sleep(random.uniform(0.3, 0.7))
-    logger.info("Ghost scrolled %dpx in %d chunks", abs(delta_y), chunks)
+
+    # Verify the wheel actually moved the page; if not, force it deterministically
+    # so "scroll" always changes what perception sees.
+    try:
+        after = await page.evaluate(_SCROLL_Y_JS)
+    except Exception:
+        after = before
+
+    if abs(after - before) < max(20, int(abs(delta_y) * 0.25)):
+        try:
+            moved = await page.evaluate(_FORCE_SCROLL_JS, delta_y)
+            logger.info("Ghost scroll: wheel ineffective (Δ%dpx) → forced scroll Δ%dpx",
+                        after - before, moved)
+        except Exception as e:
+            logger.warning("Ghost scroll force-fallback failed: %s", e)
+    else:
+        logger.info("Ghost scrolled %dpx in %d chunks (Δ%dpx)", abs(delta_y), chunks, after - before)
