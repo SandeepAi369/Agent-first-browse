@@ -25,6 +25,7 @@ import pytest
 sys.path.append(str(Path(__file__).parent / "python-orchestrator"))
 
 import dom_parser
+import ghost_input
 import mcp_tools
 
 
@@ -189,6 +190,45 @@ def test_offscreen_action_buttons_are_rescued():
     asyncio.run(run())
 
 
+def test_div_rendered_action_bar_is_captured_and_deduped():
+    """The real Flipkart case: 'Add to cart' / 'Buy at ₹…' are styled <DIV>s in a
+    fixed bar (NOT <button>), wrapped in several nested divs. They must be
+    surfaced as clickable buttons, and the nested clones collapsed to ~one entry
+    per physical button so the element budget isn't flooded."""
+    async def run():
+        from playwright.async_api import async_playwright
+        pw = await async_playwright().start()
+        browser = await pw.chromium.launch(headless=True)
+        page = await browser.new_page(viewport={"width": 1440, "height": 1080})
+        try:
+            await page.set_content(
+                '<body style="margin:0;height:1080px">'
+                '<div style="height:900px">product images, price, highlights</div>'
+                '<div style="position:fixed;bottom:0;left:0;width:100%;height:56px;display:flex">'
+                '  <div style="flex:1"><div><span>Add to cart</span></div></div>'
+                '  <div style="flex:1"><div><span>Buy at ₹180</span></div></div>'
+                '</div></body>',
+                wait_until="domcontentloaded",
+            )
+            data = await dom_parser.extract(page)
+            atc = [e for e in data["elements"]
+                   if (e["text"] or "").strip().lower().startswith("add to cart")]
+            buy = [e for e in data["elements"] if "buy at" in (e["text"] or "").lower()]
+            # Surfaced at all (this is what was failing on live Flipkart) ...
+            assert atc, [e["text"] for e in data["elements"]]
+            assert buy, [e["text"] for e in data["elements"]]
+            # ... as clickable buttons ...
+            assert atc[0]["kind"] == "button", atc
+            # ... and deduped: nested clones of one button collapse (not ~7 copies).
+            assert len(atc) <= 3, [(e["id"], e["x"], e["y"]) for e in atc]
+            # The chosen button resolves via the V19 registry.
+            r = await dom_parser.resolve_element(page, atc[0]["id"])
+            assert r["ok"] is True, r
+        finally:
+            await browser.close(); await pw.stop()
+    asyncio.run(run())
+
+
 def test_long_promo_text_not_treated_as_action():
     """A long <a> whose text merely contains 'buy now' must NOT be rescued when
     off-screen (only short, button-like primary actions are)."""
@@ -207,6 +247,45 @@ def test_long_promo_text_not_treated_as_action():
             await page.evaluate("window.scrollTo(0, 1500)")  # link is far above
             data = await dom_parser.extract(page)
             assert not any("Limited time offer" in (e["text"] or "") for e in data["elements"])
+        finally:
+            await browser.close(); await pw.stop()
+    asyncio.run(run())
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  V19.2 — Scroll actually moves the viewport (the Flipkart "scroll forever" fix)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# A Flipkart-shaped layout: a FIXED left column with its own overflow scroller
+# (the product image/buttons panel) over a tall main body. If the cursor sits on
+# the left column — where a prior click leaves it — a raw mouse-wheel is swallowed
+# by that column and the window never moves, so perception never advances.
+STICKY_COLUMN_HTML = """
+<body style="margin:0;height:5000px">
+  <div id="sticky" style="position:fixed;left:0;top:0;width:300px;height:100%;overflow:auto">
+    <div style="height:4000px">sticky column</div>
+  </div>
+  <div style="margin-left:320px;height:5000px">main body content</div>
+</body>
+"""
+
+
+def test_ghost_scroll_moves_viewport_despite_wheel_swallow():
+    async def run():
+        from playwright.async_api import async_playwright
+        pw = await async_playwright().start()
+        browser = await pw.chromium.launch(headless=True)
+        page = await browser.new_page(viewport={"width": 1280, "height": 800})
+        try:
+            await page.set_content(STICKY_COLUMN_HTML, wait_until="domcontentloaded")
+            # Cursor parked over the sticky column (the post-click position that
+            # swallows the wheel and caused the "scroll forever" stall).
+            await page.mouse.move(60, 400)
+            assert await page.evaluate("() => window.scrollY") == 0
+            await ghost_input.ghost_scroll(page, 600)
+            moved = await page.evaluate("() => window.scrollY")
+            # The viewport must actually advance, not stay pinned at the top.
+            assert moved >= 400, f"viewport did not move (scrollY={moved})"
         finally:
             await browser.close(); await pw.stop()
     asyncio.run(run())

@@ -295,6 +295,12 @@ selecting options, and interacting with UI elements.
 8. Use 'wait' after clicks that trigger page loads.
 9. When the goal is FULLY achieved, output action_type='done'.
 10. When the user provides specific text to type, type it EXACTLY as given.
+11. E-COMMERCE: "Add to Cart"/"Add to Bag" puts an item in the cart. "Buy Now"/
+    "Buy at ₹…"/"Place Order" start an IMMEDIATE checkout and are NOT the same —
+    do NOT click them when the goal is to add to cart. After a successful add,
+    the button typically becomes "Go to cart" or a cart-count badge appears: that
+    means the item IS in the cart, so treat the goal as ACHIEVED and output 'done'.
+    Never re-click the same add/buy button once the page has already changed.
 
 ═══ CRITICAL COORDINATE RULE ═══
 NEVER guess raw x, y coordinates! You MUST ALWAYS use the element_id (e.g., 'e5')
