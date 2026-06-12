@@ -591,6 +591,24 @@ async def recovery_node(state: BrainState) -> dict:
 async def finalize_node(state: BrainState) -> dict:
     """Clean shutdown — record workflow, close browser."""
     mission_success = state.mission_success
+    done_evidence = state.done_evidence
+
+    # ── V20 last-chance outcome audit: shutting down WITHOUT a verified done
+    #    (budget exhausted etc.) — check the final page once before reporting
+    #    failure. The goal may be achieved even though 'done' was never accepted.
+    if not mission_success and not done_evidence and _PAGE is not None:
+        try:
+            from overwatch import final_outcome_audit
+            achieved, evidence = await final_outcome_audit(state.model_dump(), _PAGE)
+            done_evidence = evidence
+            if achieved:
+                mission_success = True
+                logger.info("⚖️ Final audit: goal evidence found on shutdown — %s",
+                            evidence[:160])
+            else:
+                logger.info("⚖️ Final audit: goal NOT confirmed — %s", evidence[:160])
+        except Exception as e:
+            logger.debug("Final outcome audit failed (non-fatal): %s", e)
 
     # Record in SkillMemory
     if _SKILL_MEM and state.history:
@@ -622,8 +640,12 @@ async def finalize_node(state: BrainState) -> dict:
 
     if mission_success:
         logger.info("✅ MISSION COMPLETE — Task finished successfully!")
+        if done_evidence:
+            logger.info("⚖️ Verified outcome: %s", done_evidence[:200])
     else:
         logger.info("⚠️ Agent shutting down (mission incomplete)")
+        if done_evidence:
+            logger.info("⚖️ Outcome status: %s", done_evidence[:200])
 
     # ── Clean handoff: reset stateful singletons so a fresh task starts clean ──
     # (BrainState is per-task already; these objects are reused if the process is.)
@@ -637,7 +659,11 @@ async def finalize_node(state: BrainState) -> dict:
 
     # Clear cognitive state in the returned state for a tidy final snapshot.
     from cognition import clear_all
-    return clear_all()
+    # Persist the (possibly audit-corrected) outcome into the final state so the
+    # runner's summary reports the verified result, not the pre-audit one.
+    return {**clear_all(),
+            "mission_success": mission_success,
+            "done_evidence": done_evidence}
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -820,6 +846,14 @@ async def run_brain(objective: str, headless: bool = False):
         logger.info("📊 PRMCritic initialized")
     except Exception as e:
         logger.warning("PRMCritic init failed: %s", e)
+
+    # ── V20 Outcome Judge (evidence-grounded done-gate) ──
+    try:
+        from overwatch import configure_outcome_judge
+        configure_outcome_judge(_INVOKE_FN, _FAILOVER_CHAIN, _BREAKER, _HEALTH_TRACKER)
+        logger.info("⚖️ Outcome judge wired into the done-gate")
+    except Exception as e:
+        logger.warning("Outcome judge config failed (heuristic fallback): %s", e)
 
     # ── SkillMemory ──
     try:
