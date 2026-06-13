@@ -598,59 +598,65 @@ def _extract_context(result: Any) -> BrowserContext | None:
 #  Visual Cursor Script
 # ═══════════════════════════════════════════════════════════════════════════════
 
-VISUAL_CURSOR_INIT_SCRIPT = """
+VISUAL_CURSOR_INIT_SCRIPT = r"""
 (() => {
-    // Inject only once
+    // Inject only once per document.
     if (window.__visualCursorInitialized) return;
     window.__visualCursorInitialized = true;
 
-    const box = document.createElement('div');
-    box.id = 'playwright-visual-cursor';
-    box.style.width = '40px';
-    box.style.height = '40px';
-    box.style.position = 'absolute';
-    box.style.top = '0';
-    box.style.left = '0';
-    box.style.zIndex = '2147483647';
-    box.style.pointerEvents = 'none';
-    box.style.borderRadius = '50%';
-    box.style.backgroundColor = 'rgba(255, 0, 0, 0.4)';
-    box.style.border = '3px solid red';
-    box.style.transition = 'background-color 0.1s, transform 0.1s';
-    box.style.transform = 'translate(-50%, -50%)';
-    box.style.boxShadow = '0 0 8px rgba(0,0,0,0.5)';
+    // ── Realistic native arrow cursor (white fill + black outline, like the OS
+    //    pointer) — NOT the old red blob. The hotspot is the TOP-LEFT tip, so the
+    //    arrow tip sits exactly on the (x,y) we position it at. ──
+    const SVG = 'data:image/svg+xml;utf8,' + encodeURIComponent(
+        '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="30" viewBox="0 0 24 30">' +
+        '<path d="M3 2 L3 23 L9 17.5 L12.7 25.5 L16 24 L12.3 16 L20 16 Z" ' +
+        'fill="#ffffff" stroke="#1a1a1a" stroke-width="1.6" stroke-linejoin="round"/></svg>'
+    );
 
-    // Wait for body to be ready
-    const initCursor = () => {
-        if (!document.body) {
-            setTimeout(initCursor, 50);
-            return;
-        }
-        document.body.appendChild(box);
+    const cur = document.createElement('div');
+    cur.id = 'agent-visual-cursor';
+    Object.assign(cur.style, {
+        position: 'fixed',          // viewport-relative → correct regardless of scroll
+        top: '0px', left: '0px',
+        width: '24px', height: '30px',
+        zIndex: '2147483647',
+        pointerEvents: 'none',
+        backgroundImage: 'url("' + SVG + '")',
+        backgroundRepeat: 'no-repeat',
+        transformOrigin: '3px 2px', // the arrow tip
+        transform: 'scale(1)',
+        transition: 'transform 0.05s ease-out',
+        opacity: '0',               // HIDDEN until we know a real position (no (0,0) flash)
+        filter: 'drop-shadow(0 1px 1px rgba(0,0,0,0.45))',
+    });
+
+    const attach = () => {
+        if (document.body) document.body.appendChild(cur);
+        else setTimeout(attach, 30);
     };
-    
-    if (document.readyState === 'loading') {
-        document.addEventListener('DOMContentLoaded', initCursor);
-    } else {
-        initCursor();
-    }
+    if (document.readyState === 'loading')
+        document.addEventListener('DOMContentLoaded', attach);
+    else attach();
 
-    document.addEventListener('mousemove', event => {
-        box.style.left = event.pageX + 'px';
-        box.style.top = event.pageY + 'px';
-    }, true);
+    // Single source of truth for where the visual cursor is, on this page.
+    window.__cursorPos = window.__cursorPos || { x: -1, y: -1 };
+    const place = (x, y) => {
+        if (x == null || y == null || x < 0 || y < 0) return;
+        window.__cursorPos = { x: x, y: y };
+        cur.style.left = x + 'px';
+        cur.style.top = y + 'px';
+        cur.style.opacity = '1';    // reveal only once positioned
+    };
 
-    document.addEventListener('mousedown', event => {
-        box.style.backgroundColor = 'rgba(0, 255, 0, 0.7)';
-        box.style.transform = 'translate(-50%, -50%) scale(0.8)';
-        box.style.border = '2px solid #0f0';
-    }, true);
+    // Programmatic positioning — used to RE-SYNC the cursor after a navigation
+    // (a fresh page would otherwise leave it hidden / at the corner).
+    window.__setCursorPos = (x, y) => place(x, y);
 
-    document.addEventListener('mouseup', event => {
-        box.style.backgroundColor = 'rgba(255, 0, 0, 0.5)';
-        box.style.transform = 'translate(-50%, -50%) scale(1)';
-        box.style.border = '2px solid red';
-    }, true);
+    // Track real movement. clientX/clientY (viewport coords) pair with position:
+    // fixed so the on-screen arrow always matches the click coordinates we use.
+    document.addEventListener('mousemove', e => place(e.clientX, e.clientY), true);
+    document.addEventListener('mousedown', () => { cur.style.transform = 'scale(0.82)'; }, true);
+    document.addEventListener('mouseup',   () => { cur.style.transform = 'scale(1)'; }, true);
 })();
 """
 

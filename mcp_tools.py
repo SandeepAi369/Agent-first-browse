@@ -75,6 +75,14 @@ async def mcp_navigate(url: str) -> dict:
             return {"success": False, "url": page.url, "error": f"Domain blocked: {url[:80]}"}
 
         await page.goto(url, wait_until="domcontentloaded", timeout=15000)
+        # A fresh page resets the real mouse to (0,0) and the visual cursor is
+        # hidden — re-place the arrow at the tracked position so it never flashes
+        # at the top-left corner (which would mislead a vision screenshot).
+        try:
+            from ghost_input import resync_visual_cursor
+            await resync_visual_cursor(page)
+        except Exception:
+            pass
         return {"success": True, "url": page.url, "error": ""}
     except Exception as e:
         logger.warning("mcp_navigate failed: %s", e)
@@ -318,13 +326,20 @@ async def mcp_screenshot(full_page: bool = False) -> dict:
     """
     page = _get_page()
     try:
+        # page.screenshot captures ONLY the browser viewport (the web content
+        # area) — never the browser chrome or the OS desktop. So vision is
+        # inherently confined to the page; we also pass the exact bounds on so the
+        # model knows the coordinate frame (0,0 .. width,height).
         png = await asyncio.wait_for(
             page.screenshot(full_page=full_page, type="png"), timeout=10.0
         )
-        return {"ok": True, "base64": base64.b64encode(png).decode("utf-8"), "error": ""}
+        vp = page.viewport_size or {"width": 0, "height": 0}
+        return {"ok": True, "base64": base64.b64encode(png).decode("utf-8"),
+                "width": int(vp.get("width", 0)), "height": int(vp.get("height", 0)),
+                "error": ""}
     except Exception as e:
         logger.warning("mcp_screenshot failed: %s", e)
-        return {"ok": False, "base64": "", "error": str(e)[:200]}
+        return {"ok": False, "base64": "", "width": 0, "height": 0, "error": str(e)[:200]}
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
