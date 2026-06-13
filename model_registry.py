@@ -720,14 +720,23 @@ def _build_vision_pipeline() -> list[ModelClient]:
         from langchain_openai import ChatOpenAI
         base = os.getenv("NVIDIA_VISION_BASE_URL", "https://integrate.api.nvidia.com/v1")
 
-        # Probed 2026-06: only these NVIDIA NIM vision models actually respond
-        # (gemma-4-32b-it=404, phi-4-multimodal=400, phi-3.5-vision=404,
-        # gemma-3-27b=410). All below answer in <1s.
+        # OPTIONAL + env-configurable via NVIDIA_VISION_MODELS (comma-separated),
+        # mirroring NVIDIA_TEXT_MODELS. Default leads with Llama 4 Maverick (the
+        # chosen vision model); the rest are optional fallbacks. All probed
+        # 2026-06 to respond <1s; the startup capability gate drops any that 404
+        # or can't structure. To use ONLY Maverick, set
+        # NVIDIA_VISION_MODELS="meta/llama-4-maverick-17b-128e-instruct".
+        _nv_vision_raw = os.getenv(
+            "NVIDIA_VISION_MODELS",
+            "meta/llama-4-maverick-17b-128e-instruct,"      # Llama 4 Maverick — primary
+            "meta/llama-3.2-11b-vision-instruct,"           # fast, lightweight fallback
+            "nvidia/llama-3.1-nemotron-nano-vl-8b-v1,"      # fast nano VL fallback
+            "meta/llama-3.2-90b-vision-instruct",           # strong 90B fallback
+        )
+        _nv_vision_timeout = int(os.getenv("NVIDIA_VISION_TIMEOUT", "30"))
         nvidia_vision_models = [
-            ("meta/llama-3.2-11b-vision-instruct", 20),       # fast, lightweight — first NVIDIA try
-            ("nvidia/llama-3.1-nemotron-nano-vl-8b-v1", 20),  # fast nano VL
-            ("meta/llama-4-maverick-17b-128e-instruct", 30),  # 1M context, strong native vision
-            ("meta/llama-3.2-90b-vision-instruct", 40),       # strong 90B fallback
+            (m.strip(), _nv_vision_timeout)
+            for m in _nv_vision_raw.split(",") if m.strip()
         ]
         for key_idx, key in enumerate(nvidia_vision_keys):
             for model_name, timeout_s in nvidia_vision_models:
