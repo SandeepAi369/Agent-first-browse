@@ -55,7 +55,8 @@ except ImportError:
 
 _PAGE = None
 _CONTEXT = None
-_FAILOVER_CHAIN = []
+_FAILOVER_CHAIN = []   # full text chain — auxiliary calls (planner, PRM, judge)
+_WORKER_CHAIN = []     # V24 role separation — worker action decisions (top tier only)
 _VISION_CHAIN = []
 _BREAKER = None
 _HEALTH_TRACKER = None
@@ -294,7 +295,7 @@ async def navigator_worker(state: BrainState) -> dict:
     )
     return await invoke_worker(
         state.model_dump(), prompt,
-        _FAILOVER_CHAIN, _BREAKER, _HEALTH_TRACKER, _INVOKE_FN,
+        _WORKER_CHAIN or _FAILOVER_CHAIN, _BREAKER, _HEALTH_TRACKER, _INVOKE_FN,
         vision_chain=_VISION_CHAIN,
     )
 
@@ -310,7 +311,7 @@ async def interactor_worker(state: BrainState) -> dict:
     )
     return await invoke_worker(
         state.model_dump(), prompt,
-        _FAILOVER_CHAIN, _BREAKER, _HEALTH_TRACKER, _INVOKE_FN,
+        _WORKER_CHAIN or _FAILOVER_CHAIN, _BREAKER, _HEALTH_TRACKER, _INVOKE_FN,
         vision_chain=_VISION_CHAIN,
     )
 
@@ -326,7 +327,7 @@ async def extractor_worker(state: BrainState) -> dict:
     )
     return await invoke_worker(
         state.model_dump(), prompt,
-        _FAILOVER_CHAIN, _BREAKER, _HEALTH_TRACKER, _INVOKE_FN,
+        _WORKER_CHAIN or _FAILOVER_CHAIN, _BREAKER, _HEALTH_TRACKER, _INVOKE_FN,
         vision_chain=_VISION_CHAIN,
     )
 
@@ -771,7 +772,7 @@ def build_brain_graph() -> StateGraph:
 
 async def run_brain(objective: str, headless: bool = False):
     """Initialize all modules and execute the brain graph."""
-    global _PAGE, _CONTEXT, _FAILOVER_CHAIN, _VISION_CHAIN, _BREAKER, _HEALTH_TRACKER
+    global _PAGE, _CONTEXT, _FAILOVER_CHAIN, _WORKER_CHAIN, _VISION_CHAIN, _BREAKER, _HEALTH_TRACKER
     global _INVOKE_FN, _CRITIC, _DREAMER, _PRM_CRITIC, _SKILL_MEM
 
     # ── Import existing modules ──
@@ -835,6 +836,13 @@ async def run_brain(objective: str, headless: bool = False):
 
     logger.info("LLM Failover Chain (%d models): %s",
                 len(_FAILOVER_CHAIN), " → ".join(chain_names))
+
+    # ── V24 role separation: the worker (action decisions, the critical path)
+    #    uses only the top-tier capable models; auxiliary calls use the full chain.
+    _WORKER_CHAIN = registry.get_worker_chain()
+    logger.info("🎯 [%s mode] Worker chain (%d top models): %s",
+                registry.mode, len(_WORKER_CHAIN),
+                " → ".join(registry.get_worker_chain_names()))
 
     # ── V21 Vision chain (for on-demand consults; a11y DOM stays the default) ──
     try:
