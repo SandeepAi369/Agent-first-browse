@@ -4,7 +4,7 @@ Enforces STRICT separation between Text and Vision API pipelines.
 No graph node should ever construct an LLM client directly.
 All model access goes through this registry.
 
-Reads ALL API keys from .env — NVIDIA, Groq, Google Gemini, DeepSeek.
+Reads ALL API keys from .env — Groq, NVIDIA NIM, Cerebras, Google Gemini.
 
 V17.0 — Resilient Reasoning Foundation:
   - MODEL-FIRST failover: the chain is sorted by (model quality tier,
@@ -78,9 +78,6 @@ DEFAULT_MODEL_TIERS: dict[str, int] = {
     # Tier 1 — strong general models
     "gemma-4-31b-it": 1,
     "gemma-4-32b-it": 1,
-    # Tier 2 — capable but unproven for this workload
-    "qwen-3-235b-a22b": 2,
-    "glm-5.1": 2,
     # ── Vision-only models (NEVER used by the text chain — tiering them here is
     #    safe and does not touch text ordering). Without this, the proven-fast
     #    groq vision model fell to UNKNOWN tier and sorted BEHIND the slow
@@ -130,14 +127,12 @@ def get_model_tier(instance_name: str) -> int:
 # structured output. Shipped default + SAFETY FLOOR for the capability gate
 # (if gating would empty a pipeline, these alive models are restored).
 AGENTIC_TEXT_ALLOWLIST: set[str] = {
-    "gpt-oss-120b",                        # Groq + NVIDIA — gold standard
+    "gpt-oss-120b",                        # Groq + NVIDIA + Cerebras — gold standard
     "gpt-oss-20b",                         # NVIDIA — fast (1.1s), reliable
     "gemma-4-31b-it",                      # via Gemini (fails on NVIDIA → probe drops that combo)
     "gemma-4-32b-it",
     "llama-3.3-70b-instruct",              # NVIDIA — works, slower
     "llama-3.3-nemotron-super-49b-v1.5",   # NVIDIA — works, medium
-    "qwen-3-235b-a22b",                    # Cerebras — works
-    "glm-5.1",
 }
 
 # Role separation: the worker (action decisions) only uses models at or below
@@ -591,12 +586,9 @@ def _build_text_pipeline() -> list[ModelClient]:
     nvidia_text_models = [
         (m.strip(), 30) for m in _nvidia_models_raw.split(",") if m.strip()
     ]
-    # Historical candidates (probe-prunable, re-enable via NVIDIA_TEXT_MODELS):
-    #   nvidia/nemotron-3-super-120b-a12b   — Fast MoE, 1M context, tool calling
-    #   nvidia/nemotron-3-nano-30b-a3b      — Ultra-fast, 1M context
-    #   qwen/qwen3-235b-a22b                — Strong reasoning + coding
-    #   mistralai/mistral-medium-3.5-128b   — 256K context, reliable
-    #   nvidia/nemotron-3-ultra-550b-a55b   — Heavyweight fallback
+    # To add more NVIDIA text models, set NVIDIA_TEXT_MODELS in .env. The startup
+    # capability gate auto-drops any that 404 or can't do structured output, so
+    # only proven-agentic models ever reach the chain (see STRATEGY.md).
     for key_idx, key in enumerate(nvidia_keys):
         for model_name, timeout_s in nvidia_text_models:
             clients.append(ModelClient(
@@ -618,7 +610,9 @@ def _build_text_pipeline() -> list[ModelClient]:
     # ── Cerebras — TERTIARY ──
     cerebras_keys = _collect_keys("CEREBRAS_API_KEY", "CEREBRAS_API_KEYS")
     if cerebras_keys:
-        cerebras_model = os.getenv("CEREBRAS_MODEL", "qwen-3-235b-a22b")
+        # Cerebras dropped qwen-3-235b-a22b (404) but serves gpt-oss-120b — the
+        # same proven agentic model, very fast on Cerebras. Override: CEREBRAS_MODEL.
+        cerebras_model = os.getenv("CEREBRAS_MODEL", "gpt-oss-120b")
         cerebras_base = os.getenv("CEREBRAS_BASE_URL", "https://api.cerebras.ai/v1")
         for idx, key in enumerate(cerebras_keys):
             clients.append(ModelClient(
