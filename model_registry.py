@@ -123,6 +123,59 @@ def get_model_tier(instance_name: str) -> int:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+#  V24 — Agentic Capability Gate + dual-mode (free / premium). See STRATEGY.md.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Normalized base model names PROVEN (live probe, 2026-06) to do agentic
+# structured output. Shipped default + SAFETY FLOOR for the capability gate
+# (if gating would empty a pipeline, these alive models are restored).
+AGENTIC_TEXT_ALLOWLIST: set[str] = {
+    "gpt-oss-120b",                        # Groq + NVIDIA — gold standard
+    "gpt-oss-20b",                         # NVIDIA — fast (1.1s), reliable
+    "gemma-4-31b-it",                      # via Gemini (fails on NVIDIA → probe drops that combo)
+    "gemma-4-32b-it",
+    "llama-3.3-70b-instruct",              # NVIDIA — works, slower
+    "llama-3.3-nemotron-super-49b-v1.5",   # NVIDIA — works, medium
+    "qwen-3-235b-a22b",                    # Cerebras — works
+    "glm-5.1",
+}
+
+# Role separation: the worker (action decisions) only uses models at or below
+# this tier. Auxiliary calls (planner, PRM, judge) use the full chain.
+WORKER_MAX_TIER = 1
+
+
+def get_agent_mode() -> str:
+    """'premium' | 'free'. AGENT_MODE=auto (default) → premium iff a PREMIUM_API_KEY
+    is set; 'premium'/'free' force the respective path."""
+    mode = os.getenv("AGENT_MODE", "auto").strip().lower()
+    if mode == "premium":
+        return "premium"
+    if mode == "free":
+        return "free"
+    return "premium" if os.getenv("PREMIUM_API_KEY", "").strip() else "free"
+
+
+def _premium_config() -> dict:
+    """Premium single-key/model config — one paid key that does text + vision."""
+    return {
+        "keys": _collect_keys("PREMIUM_API_KEY", "PREMIUM_API_KEYS"),
+        "model": os.getenv("PREMIUM_MODEL", "").strip(),
+        "vision_model": os.getenv("PREMIUM_VISION_MODEL", "").strip(),
+        "base_url": os.getenv("PREMIUM_BASE_URL", "https://api.openai.com/v1").strip(),
+        "provider": os.getenv("PREMIUM_PROVIDER", "openai").strip().lower(),
+        "timeout": int(os.getenv("PREMIUM_TIMEOUT", "60")),
+    }
+
+
+def _combo_of(mc: "ModelClient") -> tuple[str, str, str]:
+    """(provider, normalized_base_model, pipeline) — the probe/gate identity key."""
+    return (mc.provider,
+            normalize_model_id(ProviderHealthTracker._base_model_name(mc.name)),
+            mc.pipeline)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 #  Provider Health Tracker
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -702,6 +755,46 @@ def _build_vision_pipeline() -> list[ModelClient]:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+#  PREMIUM Pipeline — one paid key/model serves BOTH text and vision (V24)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _build_premium_pipeline() -> tuple[list["ModelClient"], list["ModelClient"]]:
+    """Premium mode: a single top-tier multimodal model drives everything.
+
+    Trusted by definition — no probe, no capability gate, no free-tier fallback
+    juggling. OpenAI-compatible by default (covers OpenAI / OpenRouter / Together
+    / Fireworks / any gateway); PREMIUM_PROVIDER=google uses the Gemini client.
+    Returns (text_clients, vision_clients); both point at the premium model
+    (vision uses PREMIUM_VISION_MODEL if set, else the same multimodal model).
+    """
+    cfg = _premium_config()
+    keys, model = cfg["keys"], cfg["model"]
+    if not keys or not model:
+        logger.error("PREMIUM mode needs PREMIUM_API_KEY and PREMIUM_MODEL — none/partial set.")
+        return [], []
+
+    def _mk(m: str, key: str, idx: int, pipeline: str) -> "ModelClient":
+        if cfg["provider"] == "google":
+            from langchain_google_genai import ChatGoogleGenerativeAI
+            client = ChatGoogleGenerativeAI(
+                model=m, google_api_key=key, temperature=0.0, timeout=cfg["timeout"])
+        else:
+            from langchain_openai import ChatOpenAI
+            client = ChatOpenAI(
+                model=m, api_key=key, base_url=cfg["base_url"],
+                temperature=0.0, timeout=cfg["timeout"])
+        return ModelClient(name=f"premium-{pipeline}:{m}:{idx}", client=client,
+                           provider="premium", pipeline=pipeline)
+
+    text = [_mk(model, k, i, "text") for i, k in enumerate(keys)]
+    vmodel = cfg["vision_model"] or model
+    vision = [_mk(vmodel, k, i, "vision") for i, k in enumerate(keys)]
+    logger.info("⭐ PREMIUM mode: text='%s', vision='%s' on %d key(s) — no probe, no gate",
+                model, vmodel, len(keys))
+    return text, vision
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 #  ModelRegistry Singleton
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -711,9 +804,20 @@ class ModelRegistry:
     _instance: "ModelRegistry | None" = None
 
     def __init__(self):
-        self._text_pipeline: list[ModelClient] = _build_text_pipeline()
-        self._vision_pipeline: list[ModelClient] = _build_vision_pipeline()
-        self._probed = False
+        # V24 dual-mode: premium (one trusted paid key) vs free (juggle + gate).
+        self.mode = get_agent_mode()
+        if self.mode == "premium":
+            self._text_pipeline, self._vision_pipeline = _build_premium_pipeline()
+            self._probed = True  # premium is trusted — never probe or capability-gate
+            if not self._text_pipeline:
+                logger.warning("⭐ PREMIUM misconfigured (need PREMIUM_API_KEY + "
+                               "PREMIUM_MODEL) — falling back to FREE tier.")
+                self.mode = "free"
+                self._probed = False
+        if self.mode == "free":
+            self._text_pipeline = _build_text_pipeline()
+            self._vision_pipeline = _build_vision_pipeline()
+            self._probed = False
         self.health = ProviderHealthTracker()
         # UCRF: Higher tolerance — LLM failovers are expected, not critical failures
         # With 9-model chain, 3-4 timeouts per call is normal before success
@@ -733,8 +837,8 @@ class ModelRegistry:
             raise RuntimeError(f"Pipeline overlap: {overlap}")
 
         logger.info(
-            "ModelRegistry — TEXT: %d models, VISION: %d models",
-            len(self._text_pipeline), len(self._vision_pipeline),
+            "ModelRegistry [%s mode] — TEXT: %d models, VISION: %d models",
+            self.mode, len(self._text_pipeline), len(self._vision_pipeline),
         )
 
     @classmethod
@@ -764,6 +868,43 @@ class ModelRegistry:
 
     def has_vision_models(self) -> bool:
         return len(self._vision_pipeline) > 0
+
+    def get_worker_chain(self) -> list[ModelClient]:
+        """V24 role separation — the WORKER (action decisions, the critical path)
+        draws only from the most capable models. Premium → the single premium
+        model. Free → tier ≤ WORKER_MAX_TIER. Never returns empty (falls back to
+        the full text chain), so the worker always has a model."""
+        if self.mode == "premium":
+            return list(self._text_pipeline)
+        top = [mc for mc in self._text_pipeline
+               if get_model_tier(mc.name) <= WORKER_MAX_TIER]
+        return top or list(self._text_pipeline)
+
+    def get_worker_chain_names(self) -> list[str]:
+        return [mc.name for mc in self.get_worker_chain()]
+
+    def _apply_capability_gate(
+        self, pipeline: list[ModelClient],
+        dead: set, incapable: set, label: str,
+    ) -> list[ModelClient]:
+        """Remove dead + incapable combos. SAFETY: if that empties the pipeline,
+        restore the alive (non-dead) combos — preferring allowlisted ones — so a
+        pipeline is NEVER empty (invariant #2)."""
+        kept = [mc for mc in pipeline
+                if _combo_of(mc) not in dead and _combo_of(mc) not in incapable]
+        if kept:
+            if len(kept) != len(pipeline):
+                logger.info("🔬 Capability gate [%s]: %d → %d models",
+                            label, len(pipeline), len(kept))
+            return kept
+        alive = [mc for mc in pipeline if _combo_of(mc) not in dead]
+        allow = [mc for mc in alive
+                 if normalize_model_id(ProviderHealthTracker._base_model_name(mc.name))
+                 in AGENTIC_TEXT_ALLOWLIST]
+        floor = allow or alive or pipeline
+        logger.warning("🛟 Capability gate would EMPTY %s — restoring %d floor model(s)",
+                       label, len(floor))
+        return floor
 
     def summary(self) -> str:
         t = " → ".join(self.get_text_chain_names()) or "(none)"
@@ -800,75 +941,107 @@ class ModelRegistry:
         if not reps:
             return
 
-        probe_msg = [HumanMessage(content="Reply with the single word: pong")]
+        # V24 CAPABILITY probe (not just liveness): each model must produce a
+        # valid structured object for a tiny agentic task. Alive-but-can't-
+        # structure models (e.g. gemma-4-31b-it on NVIDIA) are EXCLUDED — that's
+        # the agentic capability gate. See STRATEGY.md §2.
+        from pydantic import BaseModel as _BM, Field as _F
+        from langchain_core.messages import SystemMessage
+
+        class _CapProbe(_BM):
+            action: str = _F(description="one of: click, type, scroll, done")
+            element_id: str = _F(description="an element id like e5")
+            confidence: float = _F(description="0..1")
+
+        cap_messages = [
+            SystemMessage(content="You are a browser agent. Choose the next action and "
+                                  "reply with the structured fields."),
+            HumanMessage(content="Page elements: [e3] search box (empty), [e7] Submit "
+                                 "button. Goal: type 'running shoes' into the search box. "
+                                 "Give your next action."),
+        ]
+
+        _DEAD = ("404", "401", "410")
+        _DEAD_L = ("not_found", "does not exist", "model_not_found", "invalid api key",
+                   "invalid_api_key", "unauthorized", "decommissioned", "gone")
+
+        def _kind(exc) -> str:
+            s = str(exc); sl = s.lower()
+            if any(d in s for d in _DEAD) or any(d in sl for d in _DEAD_L):
+                return "dead"
+            if "429" in s or "rate limit" in sl or "rate_limit" in sl:
+                return "transient"
+            return "other"
 
         async def _probe(combo_key, mc: ModelClient):
             t0 = time.monotonic()
-            try:
-                await asyncio.wait_for(mc.client.ainvoke(probe_msg), timeout=timeout)
-                return combo_key, time.monotonic() - t0, None
-            except Exception as exc:  # noqa: BLE001 — classify below
-                return combo_key, time.monotonic() - t0, exc
+            try:  # 1) strict structured output — success ⇒ the model CAN structure
+                await asyncio.wait_for(
+                    mc.client.with_structured_output(_CapProbe).ainvoke(cap_messages),
+                    timeout=timeout)
+                return combo_key, time.monotonic() - t0, "capable", "strict"
+            except asyncio.TimeoutError:
+                return combo_key, time.monotonic() - t0, "timeout", None
+            except Exception as exc:
+                k = _kind(exc)
+                if k == "dead":
+                    return combo_key, time.monotonic() - t0, "dead", str(exc)[:120]
+                if k == "transient":
+                    return combo_key, time.monotonic() - t0, "transient", str(exc)[:100]
+                try:  # 2) strict rejected the schema — does JSON-mode rescue work?
+                    await asyncio.wait_for(
+                        _invoke_json_mode(mc.client, cap_messages, _CapProbe, timeout),
+                        timeout=timeout)
+                    return combo_key, time.monotonic() - t0, "capable", "json-mode"
+                except asyncio.TimeoutError:
+                    return combo_key, time.monotonic() - t0, "timeout", None
+                except Exception as e2:
+                    if _kind(e2) == "transient":
+                        return combo_key, time.monotonic() - t0, "transient", str(e2)[:100]
+                    # Responded but cannot structure via EITHER path → INCAPABLE.
+                    return combo_key, time.monotonic() - t0, "incapable", str(e2)[:100]
 
-        logger.info("🔬 Probing %d (provider, model) combos (≤%.0fs)...", len(reps), timeout)
-        results = await asyncio.gather(
-            *[_probe(k, mc) for k, mc in reps.items()]
-        )
+        logger.info("🔬 Capability-probing %d (provider, model) combos (≤%.0fs)...",
+                    len(reps), timeout)
+        results = await asyncio.gather(*[_probe(k, mc) for k, mc in reps.items()])
 
-        dead_combos: set[tuple[str, str, str]] = set()
-        for combo_key, elapsed, err in results:
+        dead_combos: set = set()
+        incapable_combos: set = set()
+        for combo_key, elapsed, status, detail in results:
             provider, base, pipeline = combo_key
-            if err is None:
-                logger.info("✅ Probe OK: %s/%s (%s) — %.1fs", provider, base, pipeline, elapsed)
-                # Seed latency for every sibling instance of this combo
+            if status == "capable":
+                logger.info("✅ Capable: %s/%s (%s) — %.1fs%s", provider, base, pipeline,
+                            elapsed, " [json-mode]" if detail == "json-mode" else "")
                 for mc in self._text_pipeline + self._vision_pipeline:
-                    mk = (mc.provider, normalize_model_id(
-                        ProviderHealthTracker._base_model_name(mc.name)), mc.pipeline)
-                    if mk == combo_key:
+                    if _combo_of(mc) == combo_key:
                         self.health.seed_latency(mc.name, elapsed)
-                continue
-
-            err_s = str(err)
-            err_l = err_s.lower()
-            is_dead = (
-                "404" in err_s or "not_found" in err_l or "does not exist" in err_l
-                or "model_not_found" in err_l or "401" in err_s
-                or "invalid api key" in err_l or "invalid_api_key" in err_l
-                or "unauthorized" in err_l or "decommissioned" in err_l
-            )
-            if is_dead:
+            elif status == "dead":
                 dead_combos.add(combo_key)
-                logger.warning("💀 Probe PRUNE: %s/%s (%s) — %s",
-                               provider, base, pipeline, err_s[:120])
-            elif isinstance(err, asyncio.TimeoutError):
-                logger.warning("🐢 Probe slow: %s/%s (%s) — timed out at %.0fs, kept with high latency seed",
+                logger.warning("💀 Prune DEAD: %s/%s (%s) — %s", provider, base, pipeline, detail)
+            elif status == "incapable":
+                incapable_combos.add(combo_key)
+                logger.warning("🚫 Prune INCAPABLE (can't structure): %s/%s (%s) — %s",
+                               provider, base, pipeline, detail)
+            elif status == "timeout":
+                logger.warning("🐢 Slow: %s/%s (%s) — timed out at %.0fs, kept (high-latency)",
                                provider, base, pipeline, timeout)
                 for mc in self._text_pipeline + self._vision_pipeline:
-                    mk = (mc.provider, normalize_model_id(
-                        ProviderHealthTracker._base_model_name(mc.name)), mc.pipeline)
-                    if mk == combo_key:
+                    if _combo_of(mc) == combo_key:
                         self.health.seed_latency(mc.name, timeout)
-            else:
-                # 429 / transient — model exists, keep without penalty
-                logger.info("ℹ️ Probe transient error (kept): %s/%s — %s",
-                            provider, base, err_s[:100])
+            else:  # transient
+                logger.info("ℹ️ Transient (kept): %s/%s (%s) — %s", provider, base, pipeline, detail)
 
-        if dead_combos:
-            def _alive(mc: ModelClient) -> bool:
-                mk = (mc.provider, normalize_model_id(
-                    ProviderHealthTracker._base_model_name(mc.name)), mc.pipeline)
-                return mk not in dead_combos
-
-            before_t, before_v = len(self._text_pipeline), len(self._vision_pipeline)
-            self._text_pipeline = [mc for mc in self._text_pipeline if _alive(mc)]
-            self._vision_pipeline = [mc for mc in self._vision_pipeline if _alive(mc)]
-            logger.info(
-                "🔬 Probe pruned %d dead combos — TEXT %d→%d, VISION %d→%d",
-                len(dead_combos), before_t, len(self._text_pipeline),
-                before_v, len(self._vision_pipeline),
-            )
+        if dead_combos or incapable_combos:
+            bt, bv = len(self._text_pipeline), len(self._vision_pipeline)
+            self._text_pipeline = self._apply_capability_gate(
+                self._text_pipeline, dead_combos, incapable_combos, "TEXT")
+            self._vision_pipeline = self._apply_capability_gate(
+                self._vision_pipeline, dead_combos, incapable_combos, "VISION")
+            logger.info("🔬 Capability gate — %d dead, %d incapable | TEXT %d→%d, VISION %d→%d",
+                        len(dead_combos), len(incapable_combos),
+                        bt, len(self._text_pipeline), bv, len(self._vision_pipeline))
         else:
-            logger.info("🔬 Probe complete — all %d combos alive", len(reps))
+            logger.info("🔬 Capability probe complete — all %d combos capable", len(reps))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
