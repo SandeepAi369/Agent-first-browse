@@ -81,6 +81,15 @@ DEFAULT_MODEL_TIERS: dict[str, int] = {
     # Tier 2 — capable but unproven for this workload
     "qwen-3-235b-a22b": 2,
     "glm-5.1": 2,
+    # ── Vision-only models (NEVER used by the text chain — tiering them here is
+    #    safe and does not touch text ordering). Without this, the proven-fast
+    #    groq vision model fell to UNKNOWN tier and sorted BEHIND the slow
+    #    gemini-vision (gemma-4-31b-it, tier 1), wasting ~20s/consult. ──
+    "llama-4-scout-17b-16e-instruct": 0,        # groq-vision PRIMARY — proven, fast
+    "llama-3.2-11b-vision-instruct": 1,         # NVIDIA — fast, lightweight (~0.6s)
+    "llama-3.1-nemotron-nano-vl-8b-v1": 1,      # NVIDIA — fast nano VL (~0.7s)
+    "llama-4-maverick-17b-128e-instruct": 1,    # NVIDIA — strong, 1M ctx native vision
+    "llama-3.2-90b-vision-instruct": 2,         # NVIDIA — strong 90B fallback
 }
 UNKNOWN_MODEL_TIER = 3
 
@@ -664,11 +673,14 @@ def _build_vision_pipeline() -> list[ModelClient]:
         from langchain_openai import ChatOpenAI
         base = os.getenv("NVIDIA_VISION_BASE_URL", "https://integrate.api.nvidia.com/v1")
 
+        # Probed 2026-06: only these NVIDIA NIM vision models actually respond
+        # (gemma-4-32b-it=404, phi-4-multimodal=400, phi-3.5-vision=404,
+        # gemma-3-27b=410). All below answer in <1s.
         nvidia_vision_models = [
-            ("google/gemma-4-32b-it", 30),                    # User's preferred — fast, excellent vision
-            ("meta/llama-4-maverick-17b-128e-instruct", 35),  # 1M context, strong native vision
-            ("microsoft/phi-4-multimodal-instruct", 45),      # Lightweight 5.6B, text+image+audio
-            ("meta/llama-3.2-90b-vision-instruct", 50),       # Strong 90B vision fallback
+            ("meta/llama-3.2-11b-vision-instruct", 20),       # fast, lightweight — first NVIDIA try
+            ("nvidia/llama-3.1-nemotron-nano-vl-8b-v1", 20),  # fast nano VL
+            ("meta/llama-4-maverick-17b-128e-instruct", 30),  # 1M context, strong native vision
+            ("meta/llama-3.2-90b-vision-instruct", 40),       # strong 90B fallback
         ]
         for key_idx, key in enumerate(nvidia_vision_keys):
             for model_name, timeout_s in nvidia_vision_models:
