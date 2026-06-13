@@ -275,6 +275,32 @@ def _ensure_dirs():
     PROFILE_DIR.mkdir(parents=True, exist_ok=True)
 
 
+def _mark_profile_clean_exit() -> None:
+    """Tell Chrome the previous session ended cleanly so it never shows the
+    "Restore pages / Chrome didn't shut down correctly" crash bubble.
+
+    We hard-terminate sessions (pkill / Ctrl-C), so Chrome thinks it crashed and
+    renders that bubble top-right — directly overlapping page controls such as
+    GitHub's Star button, which blinds the agent into clicking the wrong spot.
+    Patched before EVERY launch (Chrome is not running yet, so the write sticks);
+    combined with --hide-crash-restore-bubble for belt-and-suspenders.
+    """
+    prefs_path = PROFILE_DIR / "Default" / "Preferences"
+    try:
+        if prefs_path.exists():
+            data = json.loads(prefs_path.read_text(encoding="utf-8"))
+        else:
+            prefs_path.parent.mkdir(parents=True, exist_ok=True)
+            data = {}
+        profile = data.setdefault("profile", {})
+        profile["exit_type"] = "Normal"
+        profile["exited_cleanly"] = True
+        prefs_path.write_text(json.dumps(data), encoding="utf-8")
+        logger.info("Profile marked clean-exit (crash-restore bubble suppressed)")
+    except Exception as e:
+        logger.warning("Could not mark profile clean-exit (non-fatal): %s", e)
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #  Browser Lifecycle Guard
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -345,6 +371,7 @@ async def launch_browser(*, headless: bool = False) -> tuple[BrowserContext, Pag
     by the Chromium engine on disk. No synthetic injection needed.
     """
     _ensure_dirs()
+    _mark_profile_clean_exit()  # suppress the crash-restore bubble (overlaps Star button)
     pw = await async_playwright().start()
 
     logger.info("Launching Playwright Chromium (native profile: %s)", PROFILE_DIR)
