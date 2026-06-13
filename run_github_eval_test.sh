@@ -1,0 +1,3 @@
+#!/bin/bash
+cd "/home/sandeep/agent first IDE"
+.venv/bin/python run_v16.py run "Navigate to GitHub (https://github.com/explore or search for 'AI agents'). Your task is to browse and read the READMEs of 2 to 3 different repositories. For each repository, evaluate its purpose, workflow, and quality. If you think the repository is well-made and valuable, click the 'Star' button to star it, and then mark the task as complete (you only need to star ONE good repository). If you think it is not good enough, navigate to a different repository and evaluate that one instead. Once you have starred a repository, use your final reasoning to explain EXACTLY why you thought that repository was good, then complete the task."
