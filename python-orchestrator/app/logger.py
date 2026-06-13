@@ -10,15 +10,46 @@ with proper leveled logging. All modules should use:
 from __future__ import annotations
 
 import logging
+import os
 import sys
+import time
+from pathlib import Path
+
+_FMT = logging.Formatter(
+    fmt="%(asctime)s │ %(levelname)-7s │ %(name)s │ %(message)s",
+    datefmt="%H:%M:%S",
+)
+
+# One timestamped file per process so every run is saved for later analysis
+# (the run scripts don't redirect, so console output was previously lost).
+# Disabled under pytest to avoid littering log files during tests.
+_FILE_HANDLER: logging.Handler | None | bool = None
+
+
+def _file_handler() -> logging.Handler | None:
+    global _FILE_HANDLER
+    if _FILE_HANDLER is None:
+        if "pytest" in sys.modules or os.getenv("AGENT_NO_FILE_LOG"):
+            _FILE_HANDLER = False
+        else:
+            try:
+                log_dir = Path(os.getenv("AGENT_LOG_DIR", "logs"))
+                log_dir.mkdir(parents=True, exist_ok=True)
+                fh = logging.FileHandler(
+                    log_dir / f"run_{time.strftime('%Y%m%d_%H%M%S')}.log",
+                    encoding="utf-8")
+                fh.setFormatter(_FMT)
+                _FILE_HANDLER = fh
+            except Exception:
+                _FILE_HANDLER = False
+    return _FILE_HANDLER or None
 
 
 def get_logger(name: str, level: int = logging.INFO) -> logging.Logger:
     """Return a consistently configured logger for the given module name.
 
-    Uses a shared StreamHandler to stdout with a compact format including
-    timestamp, level, and module name. Safe to call multiple times for the
-    same name — returns the same logger instance.
+    Streams to stdout AND (for real runs) appends to a per-run file under logs/
+    so sessions can be analyzed afterward. Safe to call multiple times.
     """
     logger = logging.getLogger(name)
 
@@ -26,12 +57,11 @@ def get_logger(name: str, level: int = logging.INFO) -> logging.Logger:
         logger.setLevel(level)
         handler = logging.StreamHandler(sys.stdout)
         handler.setLevel(level)
-        formatter = logging.Formatter(
-            fmt="%(asctime)s │ %(levelname)-7s │ %(name)s │ %(message)s",
-            datefmt="%H:%M:%S",
-        )
-        handler.setFormatter(formatter)
+        handler.setFormatter(_FMT)
         logger.addHandler(handler)
+        fh = _file_handler()
+        if fh is not None:
+            logger.addHandler(fh)
         logger.propagate = False
 
     return logger

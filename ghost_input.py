@@ -132,8 +132,41 @@ def _movement_delay(distance: float) -> float:
 #  Ghost Click — Bézier mouse path + click
 # ═══════════════════════════════════════════════════════════════════════════════
 
-# Track cursor position across calls
+# Track cursor position across calls — the SINGLE source of truth for where the
+# mouse is. Every mouse op (move/click/scroll) keeps this current so the agent
+# always has accurate, continuous awareness of the exact coordinates.
 _last_mouse_pos: tuple[float, float] = (400.0, 300.0)
+
+
+def get_mouse_pos() -> tuple[float, float]:
+    """Current tracked mouse position (the exact coords of the last mouse op)."""
+    return _last_mouse_pos
+
+
+def set_mouse_pos(x: float, y: float) -> None:
+    """Record a new mouse position (used by callers that move the mouse directly,
+    e.g. the CDP click engine, so awareness never drifts)."""
+    global _last_mouse_pos
+    _last_mouse_pos = (float(x), float(y))
+
+
+async def resync_visual_cursor(page: Page, x: float | None = None, y: float | None = None) -> None:
+    """Place the on-screen arrow at the tracked position (or an explicit one).
+
+    A fresh page (after navigation) starts with the real mouse at (0,0) and the
+    visual cursor hidden. Calling this right after a navigation moves the arrow to
+    where the agent believes the cursor is — so it never flashes/jumps to the
+    top-left corner, and any screenshot the vision model takes shows a truthful
+    cursor. Best-effort; never raises.
+    """
+    px, py = (x, y) if x is not None and y is not None else _last_mouse_pos
+    try:
+        await page.evaluate(
+            "([x,y]) => { if (window.__setCursorPos) window.__setCursorPos(x, y); }",
+            [float(px), float(py)],
+        )
+    except Exception:
+        pass
 
 
 async def ghost_click(page: Page, x: float, y: float) -> None:
@@ -382,7 +415,10 @@ async def ghost_scroll(page: Page, delta_y: int = 600) -> None:
     # main scroller, not whatever element the previous click left it hovering.
     try:
         vp = page.viewport_size or {"width": 1280, "height": 800}
-        await page.mouse.move(vp["width"] // 2, vp["height"] // 2)
+        cx, cy = vp["width"] // 2, vp["height"] // 2
+        await page.mouse.move(cx, cy)
+        global _last_mouse_pos
+        _last_mouse_pos = (float(cx), float(cy))  # keep position-awareness in sync
     except Exception:
         pass
 

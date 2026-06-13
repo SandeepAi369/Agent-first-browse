@@ -120,14 +120,25 @@ def should_consult_vision(
     return False, ""
 
 
-def _build_vision_messages(objective, question, a11y_markdown, history_tail, base64_image):
+def _build_vision_messages(objective, question, a11y_markdown, history_tail, base64_image,
+                           vp_w=0, vp_h=0):
     """Build the multimodal message list (image attached via the model layer's
     base64_image path, mirroring advanced_agent's vision call)."""
     from langchain_core.messages import HumanMessage, SystemMessage
+    bounds = (
+        f"═══ VIEWPORT BOUNDS (strict) ═══\n"
+        f"The screenshot IS the browser viewport and NOTHING else — {vp_w}×{vp_h} px. "
+        f"The only valid coordinate frame is x∈[0,{vp_w}], y∈[0,{vp_h}] with (0,0) at "
+        f"the TOP-LEFT of the image. There is no browser chrome, taskbar, or desktop "
+        f"in this image — ignore any such notion. Never reference anything outside "
+        f"these bounds.\n\n"
+        if vp_w and vp_h else ""
+    )
     user = (
         f"═══ OBJECTIVE ═══\n{objective}\n\n"
         f"═══ WHY YOU'RE LOOKING (the ambiguity) ═══\n{question or 'Resolve the current step visually.'}\n\n"
-        f"═══ RECENT ACTIONS ═══\n{history_tail or '(none)'}\n\n"
+        + bounds
+        + f"═══ RECENT ACTIONS ═══\n{history_tail or '(none)'}\n\n"
         f"═══ ACCESSIBILITY ELEMENT MAP (map what you see to these ids) ═══\n"
         f"{a11y_markdown[:4000]}\n\n"
         "Look at the attached screenshot and return the grounded action."
@@ -162,7 +173,8 @@ async def consult_vision(
         return None, ""
 
     messages = _build_vision_messages(
-        objective, question, a11y_markdown, history_tail, shot["base64"]
+        objective, question, a11y_markdown, history_tail, shot["base64"],
+        vp_w=shot.get("width", 0), vp_h=shot.get("height", 0),
     )
     try:
         verdict, used_model = await invoke_fn(
