@@ -372,6 +372,8 @@ async def _run_prm_audit(state: BrainState) -> tuple[float, list[dict], list[str
             status=d.get("status", "pending"),
             confidence=float(d.get("confidence", 0.0)),
             step_completed=int(d.get("step_completed", -1)),
+            verified=bool(d.get("verified", False)),   # V26: persist stickiness
+            evidence=d.get("evidence", ""),
         )
         for i, d in enumerate(state.prm_checklist)
     ]
@@ -383,7 +385,8 @@ async def _run_prm_audit(state: BrainState) -> tuple[float, list[dict], list[str
     )
     updated = [
         {"desc": it.description, "status": it.status,
-         "confidence": it.confidence, "step_completed": it.step_completed}
+         "confidence": it.confidence, "step_completed": it.step_completed,
+         "verified": it.verified, "evidence": it.evidence}
         for it in items
     ]
     return step_score.total_score, updated, step_score.newly_completed
@@ -463,6 +466,16 @@ async def commit_node(state: BrainState) -> dict:
             updates["prm_checklist"] = updated_checklist
             window = push_goal_score(state.goal_score_window, goal_score)
             updates["goal_score_window"] = window
+
+            # V26: make the SUCCESS verification first-class in the logs (was only
+            # the struggle that showed up). Each newly-verified sub-goal is logged
+            # with its captured on-page proof and marked sticky.
+            prev_verified = {d.get("desc") for d in state.prm_checklist if d.get("verified")}
+            for d in updated_checklist:
+                if d.get("verified") and d.get("desc") not in prev_verified:
+                    logger.info("✅ VERIFIED [%s] — %s",
+                                (d.get("desc") or "")[:50],
+                                (d.get("evidence") or "state change confirmed")[:120])
 
             # Done-ceiling nudge — reduce post-completion wandering.
             # CoVe (Overwatch L4) still guards against a PREMATURE done.

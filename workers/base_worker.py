@@ -53,6 +53,18 @@ class WorkerAction(BaseModel):
             "next action is the correct choice."
         )
     )
+    expected_change: str = Field(
+        default="",
+        description=(
+            "FORWARD MODELING — before acting, predict the EXACT observable change "
+            "this action will cause, so the result can be verified against it. Be "
+            "specific to THIS action: which element will change/appear/disappear, "
+            "what state it will switch to, any redirect or confirmation. E.g. 'the "
+            "toggle will switch to its active state and a confirmation appears', or "
+            "'the page will redirect to the item's detail URL'. Empty only for "
+            "passive actions (wait)."
+        ),
+    )
     action_type: str = Field(
         description="One of: 'goto', 'click', 'type', 'scroll', 'press_enter', 'wait', 'done'"
     )
@@ -79,6 +91,55 @@ class WorkerAction(BaseModel):
         default="",
         description="If needs_vision: the specific thing to resolve by looking (e.g. 'which button is the real Add to Cart?').",
     )
+
+
+def _render_mission_progress(checklist: list) -> str:
+    """Render the task's own sub-goals into a serialized, ledger-aware focus block.
+
+    Generalized + task-agnostic: it only reads the checklist's verified/done flags
+    (no website or action keywords). It enforces (a) ONE sub-goal at a time, (b)
+    never repeating a verified one, and (c) the adaptive critical-thinker
+    verification chain the agent must reason through for THIS action.
+    """
+    if not checklist:
+        return ""
+    done, current, later = [], None, []
+    for d in checklist:
+        desc = (d.get("desc") or "").strip()
+        if not desc:
+            continue
+        if d.get("verified") or d.get("status") == "done":
+            done.append(desc)
+        elif current is None:
+            current = desc
+        else:
+            later.append(desc)
+
+    lines = ["═══ MISSION PROGRESS — finish & verify ONE sub-goal at a time ═══"]
+    if done:
+        lines.append("✓ ALREADY DONE (verified — NEVER repeat these):")
+        lines += [f"   • {d}" for d in done]
+    if current:
+        lines.append(f"▶ FOCUS NOW — do ONLY this, then verify it: {current}")
+    if later:
+        lines.append("◦ LATER — ignore entirely until FOCUS is verified:")
+        lines += [f"   • {d}" for d in later]
+    lines.append(
+        "\nCRITICAL-THINKER VERIFICATION (reason about THIS action; use the "
+        "SIMPLEST check that gives certainty — never over-verify):\n"
+        "  • Predict the exact result first (fill 'expected_change').\n"
+        "  • A click executing is NOT proof of success; but a clear anticipated "
+        "STATE CHANGE is strong proof — don't demand perfect text if the state "
+        "visibly switched. Confirm via the cheapest sufficient tier:\n"
+        "    (1) Page structure shows the predicted change (a control switched to "
+        "its done-state, an element appeared/disappeared, or a redirect happened).\n"
+        "    (2) If a small visual change is ambiguous in the DOM, set needs_vision "
+        "to confirm it visually.\n"
+        "    (3) Only if still unsure, navigate to where the result undeniably "
+        "lives and confirm there.\n"
+        "  • Do NOT re-do a sub-goal that is already verified done."
+    )
+    return "\n".join(lines)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -121,6 +182,11 @@ async def invoke_worker(
     facts_render = state.get("facts_render", "")
     history_compressed = state.get("history_compressed", "")
     skill_context = state.get("skill_context", "")
+
+    # ── V26: serialized sub-goal focus + sticky verification ledger ──
+    #   The agent works ONE sub-goal at a time and never repeats a verified one.
+    #   Fully generalized — derived from the task's own checklist, zero UI rules.
+    mission_progress = _render_mission_progress(state.get("prm_checklist", []))
 
     # ── V18 Cognition: the agent reasons WITH its persistent strategy + beliefs ──
     from cognition import render_strategy_block
@@ -171,7 +237,8 @@ async def invoke_worker(
         f"{login_hint}"
         f"{state_override}"
         f"{dedup_override}\n\n"
-        f"═══ ACTION HISTORY (compressed) ═══\n"
+        + (f"{mission_progress}\n\n" if mission_progress else "")
+        + f"═══ ACTION HISTORY (compressed) ═══\n"
         f"{history_compressed or '(first step)'}\n\n"
         f"═══ PAGE STRUCTURE ═══\n"
         f"{dom_markdown}\n\n"
@@ -198,6 +265,8 @@ async def invoke_worker(
     logger.info("🔄 PREVIOUS: %s", decision.previous_action_result[:150])
     logger.info("📊 PROGRESS: %s", decision.goal_progress[:150])
     logger.info("🧠 REASONING: %s", decision.reasoning[:200])
+    if getattr(decision, "expected_change", ""):
+        logger.info("🔮 EXPECT: %s", decision.expected_change[:180])
     logger.info("⚡ ACTION: %s", decision.action_type)
 
     # ── Classify action risk ──
@@ -232,6 +301,7 @@ async def invoke_worker(
         "previous_action_result": decision.previous_action_result[:150],
         "goal_progress": decision.goal_progress[:150],
         "reasoning": decision.reasoning[:200],
+        "expected_change": getattr(decision, "expected_change", "")[:250],
         "wait_ms": decision.wait_ms,
     }
 

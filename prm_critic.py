@@ -46,6 +46,12 @@ class ChecklistItem:
     status: str = "pending"     # pending | in_progress | done | failed
     confidence: float = 0.0     # 0.0 to 1.0 — how confident we are this is done
     step_completed: int = -1    # Which step completed this item (-1 = not done)
+    # V26: once a sub-goal is VERIFIED done it is sticky — a later audit that
+    # can't re-confirm it from the current page must NOT demote it (the root
+    # cause of the "re-do an already-completed action" loop). Generalized: this
+    # is task-agnostic, driven purely by the verdict, not by any site/UI rule.
+    verified: bool = False
+    evidence: str = ""          # the concrete on-page proof captured at verification
     
     @property
     def score(self) -> float:
@@ -157,13 +163,15 @@ Rules:
 
 CHECKLIST_EVAL_PROMPT = """You are a progress evaluator for a browser automation agent. Given the current page state and a checklist of sub-goals, evaluate which items have been completed.
 
+Think situationally about THIS task — the evidence of completion differs per goal, so reason about what a *completed* version of each sub-goal would look like on the page, then check for it. Do not apply a fixed template.
+
 Rules:
-- Base your evaluation ONLY on the evidence in the current page state
-- 'done' = you can see clear evidence this step is completed
-- 'in_progress' = partial evidence (e.g., on the right page but haven't found the element yet)
-- 'pending' = no evidence of progress on this item
-- Set confidence 0.0-1.0 based on how certain you are
-- Be conservative: only mark 'done' if you're quite sure"""
+- An item already marked "✓ VERIFIED COMPLETE" is LOCKED — keep it 'done'. A finished sub-goal does not become un-finished just because this page view doesn't re-show its proof. Never demote it.
+- 'done' = there is evidence the sub-goal is complete. Evidence includes a STATE CHANGE, not only literal text — e.g. a control now showing its post-action state (active/selected/applied/added/submitted), a confirmation, a count change, or a redirect to where the result lives. A control that has switched into its "already-done" state IS proof of completion.
+- 'in_progress' = partial evidence (e.g., on the right page but the action isn't reflected yet).
+- 'pending' = no evidence of progress on this item.
+- Set confidence 0.0-1.0; quote the concrete on-page proof in 'evidence'.
+- Promote freely when you see completion; do not invent completion you can't point to."""
 
 
 TRAJECTORY_EVAL_PROMPT = """You are a value function for a web automation agent. Given the objective's checklist and a PREDICTED future state (not the current state), estimate how many checklist items would be completed.
@@ -250,9 +258,13 @@ class PRMCritic:
         
         Compares item statuses before and after to detect progress.
         """
-        # Build checklist context
+        # Build checklist context. Verified items are shown as LOCKED so the
+        # evaluator doesn't re-litigate a finished sub-goal (belt-and-suspenders
+        # with the code-level monotonicity in the result loop below).
         checklist_text = "\n".join(
-            f"  [{item.id}] {item.description} (currently: {item.status})"
+            f"  [{item.id}] {item.description} "
+            + ("(✓ VERIFIED COMPLETE — locked, keep 'done')"
+               if item.verified else f"(currently: {item.status})")
             for item in checklist
         )
         
@@ -278,18 +290,35 @@ class PRMCritic:
             
             for eval_item in evaluations:
                 item_id = eval_item.id
-                if 0 <= item_id < len(checklist):
-                    item = checklist[item_id]
-                    new_status = eval_item.status or "pending"
-                    new_confidence = float(eval_item.confidence)
-                    
-                    # Track newly completed items
-                    if new_status == "done" and item.status != "done":
-                        newly_completed.append(item.description)
-                        item.step_completed = step_number
-                    
-                    item.status = new_status
-                    item.confidence = new_confidence
+                if not (0 <= item_id < len(checklist)):
+                    continue
+                item = checklist[item_id]
+                new_status = eval_item.status or "pending"
+                new_confidence = float(eval_item.confidence)
+
+                # V26 MONOTONICITY — the core loop fix:
+                # 1) A VERIFIED item is immutable. Never re-evaluate or demote it;
+                #    a completed task stays completed regardless of what a later,
+                #    truncated page view does (or doesn't) show.
+                if item.verified:
+                    continue
+                # 2) Don't demote a plain 'done' item to a lesser status just
+                #    because this audit can't re-confirm it (conservative LLM +
+                #    2500-char DOM = frequent false "pending"). Promotions are
+                #    always allowed; regressions of 'done' are not.
+                if item.status == "done" and new_status != "done":
+                    continue
+
+                if new_status == "done" and item.status != "done":
+                    newly_completed.append(item.description)
+                    item.step_completed = step_number
+                    # A confident 'done' becomes VERIFIED (sticky) with its proof.
+                    if new_confidence >= 0.7:
+                        item.verified = True
+                        item.evidence = (eval_item.evidence or "")[:200]
+
+                item.status = new_status
+                item.confidence = new_confidence
             
         except Exception as e:
             logger.warning("PRM step scoring failed: %s", e)
