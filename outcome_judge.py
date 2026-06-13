@@ -140,17 +140,27 @@ def build_judge_messages(
     history_tail: str,
     claim: str,
     page_text: str = "",
+    verified_subgoals: str = "",
 ) -> list[dict]:
     """Build the judge conversation (pure — unit-testable).
 
     page_text is the rendered body text — essential evidence the interactive
     element map cannot carry (confirmation toasts, facts the task asked to find,
     cart line-items). Without it the judge is blind to every non-clickable proof.
+
+    verified_subgoals lists sub-goals that were ALREADY verified complete DURING
+    execution (with their captured proof). These are trusted prior evidence — the
+    judge should confirm the objective using them, not re-derive every sub-goal
+    from a cold final page (which causes false 'not done' on subtle UI changes).
     """
     user = (
         f"═══ OBJECTIVE ═══\n{objective}\n\n"
         + (f"═══ PLANNED SUCCESS CRITERIA (done when) ═══\n{success_criteria}\n\n"
            if success_criteria else "")
+        + (f"═══ SUB-GOALS ALREADY VERIFIED DURING EXECUTION (trusted proof) ═══\n"
+           f"{verified_subgoals}\nTreat these as established — confirm the objective "
+           f"in light of them; do not mark the task incomplete merely because this "
+           f"final page no longer re-shows their proof.\n\n" if verified_subgoals else "")
         + f"═══ AGENT'S CLAIM (NOT evidence) ═══\n{claim or '(none)'}\n\n"
         f"═══ RECENT ACTION TRAIL ═══\n{history_tail or '(none)'}\n\n"
         f"═══ FRESH PAGE STATE (the ONLY evidence) ═══\n"
@@ -182,6 +192,7 @@ async def judge_done(
     history_tail: str = "",
     claim: str = "",
     page_text: str = "",
+    verified_subgoals: str = "",
 ) -> DoneVerdict | None:
     """Run the outcome judge. Returns None when no verdict could be obtained
     (caller falls back to the legacy heuristic gate)."""
@@ -192,7 +203,7 @@ async def judge_done(
     raw = build_judge_messages(
         objective=objective, success_criteria=success_criteria, url=url,
         dom_markdown=dom_markdown, history_tail=history_tail, claim=claim,
-        page_text=page_text,
+        page_text=page_text, verified_subgoals=verified_subgoals,
     )
     messages = [SystemMessage(content=raw[0]["content"]),
                 HumanMessage(content=raw[1]["content"])]

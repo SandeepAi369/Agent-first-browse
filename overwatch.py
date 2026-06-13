@@ -341,6 +341,19 @@ def _block_done(state: dict, updates: dict, reason: str,
     return updates
 
 
+def _render_verified_subgoals(state: dict) -> str:
+    """Sub-goals already verified complete during execution, with their captured
+    proof — trusted prior evidence handed to the done-judge so it confirms rather
+    than re-deriving subtle UI changes from a cold final page. Generalized: read
+    straight from the task's own checklist, no website/action rules."""
+    lines = []
+    for d in (state.get("prm_checklist", []) or []):
+        if d.get("verified") or d.get("status") == "done":
+            ev = (d.get("evidence") or "").strip()
+            lines.append(f"  ✓ {(d.get('desc') or '').strip()}" + (f" — {ev}" if ev else ""))
+    return "\n".join(lines)
+
+
 async def final_outcome_audit(state: dict, page) -> tuple[bool, str]:
     """Last-chance outcome verification when the agent shuts down WITHOUT a
     verified 'done' (budget exhausted, restrategize cap, …).
@@ -378,6 +391,7 @@ async def final_outcome_audit(state: dict, page) -> tuple[bool, str]:
         history_tail=state.get("history_compressed", ""),
         claim="(none — the agent shut down without declaring done)",
         page_text=page_text,
+        verified_subgoals=_render_verified_subgoals(state),
     )
     if verdict is None:
         return False, "unverifiable (judge offline)"
@@ -445,6 +459,7 @@ async def _layer_4_cove_check(state: dict, page, updates: dict) -> dict:
         history_tail=state.get("history_compressed", ""),
         claim=claim,
         page_text=page_text,
+        verified_subgoals=_render_verified_subgoals(state),
     )
 
     if verdict is not None:
