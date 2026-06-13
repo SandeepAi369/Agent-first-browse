@@ -76,6 +76,12 @@ STEALTH_LAUNCH_ARGS = [
     "--no-default-browser-check",
     "--disable-popup-blocking",
     "--disable-infobars",
+    # Suppress the "Restore pages / Chrome didn't shut down correctly" crash
+    # bubble — it renders top-right and overlaps page controls (e.g. GitHub's
+    # Star button), blinding the agent. We hard-terminate sessions (pkill/Ctrl-C)
+    # so Chrome thinks it crashed. Both flag spellings for cross-version coverage.
+    "--hide-crash-restore-bubble",
+    "--disable-session-crashed-bubble",
     "--disable-features=IsolateOrigins,SitePerProcess,OptimizeImageLoading,EnableOverscroll",
     "--password-store=basic",
     # Prevent WebRTC from leaking local IP via mDNS — a common headless tell
