@@ -93,55 +93,6 @@ class WorkerAction(BaseModel):
     )
 
 
-def _render_mission_progress(checklist: list) -> str:
-    """Render the task's own sub-goals into a serialized, ledger-aware focus block.
-
-    Generalized + task-agnostic: it only reads the checklist's verified/done flags
-    (no website or action keywords). It enforces (a) ONE sub-goal at a time, (b)
-    never repeating a verified one, and (c) the adaptive critical-thinker
-    verification chain the agent must reason through for THIS action.
-    """
-    if not checklist:
-        return ""
-    done, current, later = [], None, []
-    for d in checklist:
-        desc = (d.get("desc") or "").strip()
-        if not desc:
-            continue
-        if d.get("verified") or d.get("status") == "done":
-            done.append(desc)
-        elif current is None:
-            current = desc
-        else:
-            later.append(desc)
-
-    lines = ["═══ MISSION PROGRESS — finish & verify ONE sub-goal at a time ═══"]
-    if done:
-        lines.append("✓ ALREADY DONE (verified — NEVER repeat these):")
-        lines += [f"   • {d}" for d in done]
-    if current:
-        lines.append(f"▶ FOCUS NOW — do ONLY this, then verify it: {current}")
-    if later:
-        lines.append("◦ LATER — ignore entirely until FOCUS is verified:")
-        lines += [f"   • {d}" for d in later]
-    lines.append(
-        "\nCRITICAL-THINKER VERIFICATION (reason about THIS action; use the "
-        "SIMPLEST check that gives certainty — never over-verify):\n"
-        "  • Predict the exact result first (fill 'expected_change').\n"
-        "  • A click executing is NOT proof of success; but a clear anticipated "
-        "STATE CHANGE is strong proof — don't demand perfect text if the state "
-        "visibly switched. Confirm via the cheapest sufficient tier:\n"
-        "    (1) Page structure shows the predicted change (a control switched to "
-        "its done-state, an element appeared/disappeared, or a redirect happened).\n"
-        "    (2) If a small visual change is ambiguous in the DOM, set needs_vision "
-        "to confirm it visually.\n"
-        "    (3) Only if still unsure, navigate to where the result undeniably "
-        "lives and confirm there.\n"
-        "  • Do NOT re-do a sub-goal that is already verified done."
-    )
-    return "\n".join(lines)
-
-
 # ═══════════════════════════════════════════════════════════════════════════════
 #  Worker Invocation (shared by all workers)
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -182,11 +133,6 @@ async def invoke_worker(
     facts_render = state.get("facts_render", "")
     history_compressed = state.get("history_compressed", "")
     skill_context = state.get("skill_context", "")
-
-    # ── V26: serialized sub-goal focus + sticky verification ledger ──
-    #   The agent works ONE sub-goal at a time and never repeats a verified one.
-    #   Fully generalized — derived from the task's own checklist, zero UI rules.
-    mission_progress = _render_mission_progress(state.get("prm_checklist", []))
 
     # ── V18 Cognition: the agent reasons WITH its persistent strategy + beliefs ──
     from cognition import render_strategy_block
@@ -237,7 +183,6 @@ async def invoke_worker(
         f"{login_hint}"
         f"{state_override}"
         f"{dedup_override}\n\n"
-        + (f"{mission_progress}\n\n" if mission_progress else "")
         + f"═══ ACTION HISTORY (compressed) ═══\n"
         f"{history_compressed or '(first step)'}\n\n"
         f"═══ PAGE STRUCTURE ═══\n"
@@ -481,8 +426,21 @@ def build_system_prompt(
         "extractor": EXTRACTOR_SYSTEM_PROMPT,
     }
     template = templates.get(worker_type, INTERACTOR_SYSTEM_PROMPT)
+    # Concise, generalized acting guidance — replaces the old verbose mission
+    # block. Keeps forward-modeling + adaptive verification WITHOUT a second,
+    # competing task list (which caused goal-loss).
+    guidance = (
+        "\n═══ HOW TO ACT ═══\n"
+        "• Work ONLY on the CURRENT SUB-TASK above, using elements actually on screen.\n"
+        "• Before a click/type, predict the exact result in 'expected_change'.\n"
+        "• A click merely executing is NOT proof of success — but a clear, anticipated "
+        "state change IS strong proof. Confirm with the cheapest sufficient signal: "
+        "the predicted DOM change; if a small visual change is ambiguous, set "
+        "needs_vision; only navigate elsewhere to prove it if you are truly unsure.\n"
+        "• Output action_type='done' as soon as the MASTER GOAL is achieved.\n"
+    )
     return template.format(
-        plan_context=plan_context,
+        plan_context=plan_context + guidance,
         facts_context=f"═══ WHAT YOU KNOW ═══\n{facts_context}\n" if facts_context else "",
         skill_context=skill_context,
     )

@@ -296,26 +296,27 @@ class PRMCritic:
                 new_status = eval_item.status or "pending"
                 new_confidence = float(eval_item.confidence)
 
-                # V26 MONOTONICITY — the core loop fix:
-                # 1) A VERIFIED item is immutable. Never re-evaluate or demote it;
-                #    a completed task stays completed regardless of what a later,
-                #    truncated page view does (or doesn't) show.
+                # MONOTONICITY (safe loop guard):
+                # 1) A manually-verified item is immutable (defensive).
                 if item.verified:
                     continue
-                # 2) Don't demote a plain 'done' item to a lesser status just
-                #    because this audit can't re-confirm it (conservative LLM +
-                #    2500-char DOM = frequent false "pending"). Promotions are
+                # 2) Don't demote a 'done' item to a lesser status just because
+                #    this background audit can't re-confirm it on a truncated page
+                #    (that demotion was the original re-do loop). Promotions are
                 #    always allowed; regressions of 'done' are not.
+                #
+                # NOTE: this background goal-audit does NOT auto-lock items as
+                # "verified". An earlier version did (confidence ≥ 0.7), which on
+                # busy/dynamic e-commerce pages prematurely marked sub-goals done
+                # and made the agent SKIP real work. The evidence-grounded
+                # done-judge — which inspects the live page — is the real gate.
                 if item.status == "done" and new_status != "done":
                     continue
 
                 if new_status == "done" and item.status != "done":
                     newly_completed.append(item.description)
                     item.step_completed = step_number
-                    # A confident 'done' becomes VERIFIED (sticky) with its proof.
-                    if new_confidence >= 0.7:
-                        item.verified = True
-                        item.evidence = (eval_item.evidence or "")[:200]
+                    item.evidence = (eval_item.evidence or "")[:200]
 
                 item.status = new_status
                 item.confidence = new_confidence
