@@ -197,33 +197,45 @@ class BrainState(BaseModel):
         return None
 
     def get_plan_render(self) -> str:
-        """Render plan for injection into system prompt (compact)."""
+        """The agent's SINGLE source of cognitive state (injected into the system
+        prompt). This is the ONE authoritative answer to: what is the master goal,
+        what is the one sub-task to do right now, what's already done, and what to
+        ignore. There is intentionally NO second/competing task list — a prior
+        design that injected a separate checklist caused the agent to lose track
+        of its goal and tunnel onto abstract sub-goals.
+        """
         done = [s for s in self.plan_steps if s.get("status") == "done"]
         active = self.get_current_plan_step()
         pending = [s for s in self.plan_steps if s.get("status") == "pending"]
 
-        lines = [f"MISSION: {self.objective[:200]}"]
-        lines.append(f"PROGRESS: {self.plan_progress_pct}% ({len(done)}/{len(self.plan_steps)} steps)")
+        lines = [f"🎯 MASTER GOAL: {self.objective[:240]}"]
+        lines.append(f"📊 PROGRESS: {self.plan_progress_pct}% ({len(done)}/{len(self.plan_steps)} steps done)")
 
         if done:
             done_str = "; ".join(s["desc"][:50] for s in done[-3:])
             if len(done) > 3:
                 done_str = f"...({len(done)-3} earlier); " + done_str
-            lines.append(f"DONE: {done_str}")
+            lines.append(f"✓ DONE (do NOT repeat): {done_str}")
 
         if active:
-            lines.append(f"CURRENT: ▶ {active['desc']}")
+            lines.append(
+                f"▶ CURRENT SUB-TASK (your ONLY focus right now — accomplish THIS "
+                f"using what is actually on the screen): {active['desc']}")
+            nxt = pending[0]["desc"][:50] if pending else None
+            if nxt:
+                lines.append(f"   (do NOT start the next step until current is done): {nxt}")
         elif not pending:
-            lines.append("CURRENT: All steps completed — verify and finish")
+            lines.append("▶ CURRENT SUB-TASK: all steps complete — verify the goal on screen and finish.")
 
-        if pending:
-            remaining = "; ".join(s["desc"][:40] for s in pending[:3])
-            if len(pending) > 3:
-                remaining += f"; ...+{len(pending)-3} more"
-            lines.append(f"REMAINING: {remaining}")
+        # Distraction guard — the #1 real-world failure on dense e-commerce pages.
+        lines.append(
+            "⚠️ STAY ON TASK: act only on the element(s) that advance your CURRENT "
+            "SUB-TASK. Ignore distractions — ads, 'sponsored', 'recommended', "
+            "'related products', 'people also bought', newsletter/cookie popups, "
+            "and any widget unrelated to the current sub-task.")
 
         if self.reflections:
-            lines.append(f"REFLECTION: {self.reflections[-1][:150]}")
+            lines.append(f"💡 NOTE: {self.reflections[-1][:150]}")
 
         return "\n".join(lines)
 

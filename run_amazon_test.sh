@@ -1,3 +1,3 @@
 #!/bin/bash
 cd "/home/sandeep/agent first IDE"
-.venv/bin/python run_v16.py run "Navigate to https://www.amazon.in. Search for 'water bottle under 500'. Pick one of the best bottles from the search results (ignore sponsored items if possible). Click on the bottle to view its product page. Once on the product page, click the 'Add to Cart' button. Wait for the confirmation that the item has been added to the cart, and verify success."
+.venv/bin/python run_v16.py run "Navigate to Amazon (https://www.amazon.in). Find the search bar, search for 'Huawei band 10' and press enter. Wait for the search results to load. Click on the first or most relevant product link to go to its product page. On the product page, locate and click the 'Add to Cart' button. Once the item has been successfully added to your cart, mark the task as complete."
