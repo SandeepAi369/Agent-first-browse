@@ -1,183 +1,291 @@
-# Agent First IDE
+# 🌐 Agent First Browse
 
-> Autonomous AI-powered browser agent with crash-proof session persistence, multi-model orchestration, and real-world marketing automation.
+> **An autonomous, vision-capable browser agent that thinks before it acts, verifies before it moves on, and behaves like a real human user — not a script.**
 
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://python.org)
 [![LangGraph](https://img.shields.io/badge/langgraph-1.x-orange.svg)](https://langchain-ai.github.io/langgraph/)
 [![Playwright](https://img.shields.io/badge/playwright-1.55%2B-green.svg)](https://playwright.dev/python/)
-[![Private](https://img.shields.io/badge/repo-private-red.svg)](#)
+[![Status](https://img.shields.io/badge/status-private%20preview-red.svg)](#project-status)
 
 ---
 
-## Architecture
+## Overview
 
-The system provides two execution modes:
+**Agent First Browse** turns a plain-English instruction — *“search Flipkart for a water bottle under ₹300 and add it to the cart”*, *“star this GitHub repo”*, *“log in and create an API key”* — into a fully autonomous browser session that completes the task on a **real, headed Chromium browser**.
 
-### 1. Advanced Single-Agent Mode (`advanced_agent.py`) — **Recommended**
+Unlike screen-scrapers or brittle click-bots, it runs on a **LangGraph cognitive “brain”**: a graph of specialized reasoning nodes that perceives the page through the **accessibility tree first** (fast and cheap), escalates to a **vision model only when genuinely confused**, and **verifies every outcome with evidence** before declaring success. It plans, predicts the consequence of each action, recovers from failure with a non-repeating tactical ladder, and presents a human-grade fingerprint to evade bot detection.
 
-A streamlined, high-performance browser automation agent that bypasses the complex multi-agent graph in favor of a tight action loop:
-
-```
-Extract DOM → Query LLM → Execute Playwright Action → Repeat
-```
-
-**Key Features:**
-- **Single-model driving** — Uses Groq GPT-OSS-120B for lightning-fast JSON tactical decisions
-- **Crash-proof session persistence** — 4-layer protection (user_data_dir + storage_state injection + periodic auto-save + signal handlers)
-- **Google OAuth support** — Leverages persisted Gmail session for "Continue with Google" flows on platforms like Dev.to, Hashnode, etc.
-- **Zero stuck loops** — Action history injection prevents the model from repeating itself
-
-### 2. Multi-Agent Swarm Mode (`start_campaign.py`) — Legacy
-
-Full LangGraph orchestrator with Supervisor subgraph + Worker nodes:
-
-```mermaid
-graph TD
-    START([Start]) --> SUP[Supervisor Subgraph]
-
-    subgraph SUP_INNER["Supervisor Meeting (4 Sub-Agents)"]
-        CA[Context Analyzer] --> SP[Strategy Planner]
-        SP --> CW[Copywriter]
-        SP --> RS[Risk & Stealth Assessor]
-        CW --> FM[Final Merge]
-        RS --> FM
-    end
-
-    SUP --> STRAT[Strategic Planner - GLM 5.1]
-    STRAT --> TACT[Tactical Selector - Groq 120B]
-    TACT --> STUCK{Stuck Evaluator}
-    STUCK --> BC[Browser Controller]
-    BC --> STRAT
-```
-
-**Model Hierarchy (Linear, No Load Balancing):**
-- **Strategic Planner**: NVIDIA GLM-5.1 → Gemma 4 (backup)
-- **Tactical Executor**: Groq GPT-OSS-120B → Gemma 4 (backup)
-- **Vision Tool**: Google Gemma 4 (on-demand)
+In short: it is engineered to be a **critical thinker**, not an obedient parrot — it reasons about *what* to do, *how little* it needs to confirm success, and *when* it is truly done.
 
 ---
 
-## Session Persistence (Crash-Proof)
+## Table of Contents
 
-The biggest challenge in browser automation is keeping authentication sessions alive across restarts. This project implements a **4-layer persistence strategy**:
-
-| Layer | Protection | Mechanism |
-|---|---|---|
-| **Layer 1** | Normal restarts | Chromium `user_data_dir` (native disk storage) |
-| **Layer 2** | WSL cookie corruption | `storage_state` JSON injection via `add_cookies()` |
-| **Layer 3** | Mid-task crashes | Periodic auto-save every 3 steps during execution |
-| **Layer 4** | Ctrl+C / SIGTERM / exceptions | `SessionGuard` singleton with signal handlers + atexit + triple-attempt finally block |
-
-**Atomic writes** prevent file corruption. A `.backup.json` is maintained as a fallback.
+- [Overview](#overview)
+- [Why It’s Different](#why-its-different)
+- [Key Features & Architecture](#key-features--architecture)
+  - [1. The Cognitive Brain (LangGraph)](#1-the-cognitive-brain-langgraph)
+  - [2. Accessibility-DOM-First Perception](#2-accessibility-dom-first-perception)
+  - [3. Vision-on-Demand (Thinker, not Parrot)](#3-vision-on-demand-thinker-not-parrot)
+  - [4. Critical-Thinker Verification](#4-critical-thinker-verification)
+  - [5. Self-Curating Model Layer](#5-self-curating-model-layer)
+  - [6. Human-Grade Anti-Bot Realism](#6-human-grade-anti-bot-realism)
+  - [7. Resilient Execution & Self-Healing](#7-resilient-execution--self-healing)
+- [How It Works](#how-it-works)
+- [Installation](#installation)
+- [Configuration & API Keys](#configuration--api-keys)
+  - [Operating Modes](#operating-modes)
+  - [Text Models](#text-models)
+  - [Vision Models (Optional)](#vision-models-optional)
+  - [Graceful Fallback](#graceful-fallback)
+- [Usage](#usage)
+- [Project Status](#project-status)
+- [License](#license)
 
 ---
 
-## Quick Start
+## Why It’s Different
 
-### 1. Clone & Setup
+Most browser agents do one of two things: drive everything through an expensive vision model (slow, imprecise clicking), or follow rigid DOM selectors (brittle, breaks on any UI change). Agent First Browse was engineered to avoid both traps — and to solve the failure modes those approaches ignore:
+
+| Common failure in browser agents | How Agent First Browse solves it |
+| --- | --- |
+| Clicks the *wrong* look-alike element on dense pages | **Stable element registry** resolves the exact node the LLM chose, with fresh, drift-proof coordinates |
+| “Completes” a task but can’t confirm it, then **loops re-doing it** | **Sticky Verification Ledger** — once a sub-goal is verified, it can never be silently un-completed |
+| Misses a button that’s off-screen or rendered as a styled `<div>` | **Primary-action recall** + real-scroll fix surface the goal button even when the DOM hides it |
+| Gets flagged as a bot and has its clicks ignored | **Headed-under-Xvfb** real browser + 12-layer fingerprint stealth + trusted OS-level clicks |
+| Burns tokens/latency sending every frame to a vision model | **A11y-DOM by default**, vision **only** when the text view is ambiguous |
+| Declares success without checking, or never stops | **Evidence-grounded outcome judge** that cites on-page proof |
+
+---
+
+## Key Features & Architecture
+
+### 1. The Cognitive Brain (LangGraph)
+
+The agent is not a simple `observe → act` loop. It is a **stateful graph of cognitive nodes**, each with a single responsibility:
+
+```
+Goal Compiler → Planner → Perceive → Router ─► [ Navigator | Interactor | Extractor ]
+                                                          │
+                                          Overwatch (multi-layer verification)
+                                                          │
+                          ┌───────────────┬───────────────┼───────────────┐
+                        commit          retry           rollback        finalize
+```
+
+- **Goal Compiler / Planner** decompose the objective into a strategy, explicit *success criteria* (“done when…”), and an ordered checklist of sub-goals.
+- **Mixture-of-Experts Router** dispatches each step to the right specialist worker (navigation, interaction, or data extraction).
+- **Overwatch** is the only node allowed to commit state — every proposed action passes through layered verification first.
+- A deterministic **escalation ladder** guarantees that a stuck step never repeats a tactic that already failed, and terminates cleanly instead of looping.
+
+### 2. Accessibility-DOM-First Perception
+
+Perception runs in a **single zero-mutation `page.evaluate()` pass (~80 ms)** that produces a compact, LLM-friendly semantic map of the page:
+
+- **Shadow-DOM piercer** captures elements inside open *and* closed shadow roots.
+- **Semantic Markdown compression** cuts perception tokens by 60–80% versus raw DOM/HTML.
+- **Stable element registry** stamps every interactive element with a durable handle, so an action resolves to the *exact* node the model chose — re-read at click time, immune to layout drift and “snap to the wrong neighbor” errors.
+- **Primary-action recall** guarantees commerce/checkout “goal” buttons (Add to Cart, Buy Now, Star, …) are surfaced even when they’re scrolled off-screen or rendered as non-semantic `<div>`s.
+
+### 3. Vision-on-Demand (Thinker, not Parrot)
+
+The agent works from the accessibility DOM by default and **“opens its eyes” only when it genuinely cannot resolve the page from text** — for example, two visually identical buttons where one is disabled, or a canvas-rendered control with no DOM. A single screenshot is sent to a vision model, the answer is mapped back to a **stable element id** (not fuzzy pixels), and the agent **immediately reverts to the a11y DOM**. Vision is strictly **viewport-bounded** — it never sees or maps coordinates onto the surrounding desktop.
+
+### 4. Critical-Thinker Verification
+
+This is the heart of the system — the mechanism that makes the agent trustworthy on multi-step tasks:
+
+- **Forward Modeling (pre-click anticipation).** Before acting, the worker explicitly predicts the exact observable change (*“the button flips to ‘Starred’ and the count increments”*). The verifier then checks reality against that prediction.
+- **Adaptive 3-Tier Verification.** The agent uses the *cheapest sufficient* proof, escalating only when needed:
+  1. **A11y DOM** — did the predicted structural change happen (state switched, element appeared/vanished, redirect)?
+  2. **Vision** — if the DOM is ambiguous for a small visual change, confirm it visually (e.g., “did the star fill?”).
+  3. **Path Proof** — only if still unsure, navigate to where the result *undeniably* lives and confirm there.
+- **Sticky Verification Ledger.** Once a sub-goal is verified, it is **permanently locked** — a later glance that can’t re-confirm it can never demote it back to “pending.” This is what eliminates the classic *“did it, couldn’t confirm it, did it again”* loop.
+- **Task Serialization.** Given multiple tasks, the agent finishes and verifies **one** before it even considers the next.
+- **Evidence-Grounded Outcome Judge.** The final “done” gate is a skeptical, independent verdict over the *fresh* page that must **cite concrete on-page proof**; if the proof isn’t there, it returns actionable feedback instead of blindly stopping or blindly looping.
+
+### 5. Self-Curating Model Layer
+
+- **Model-first failover** orders the chain by capability tier and expected cost, exhausting every instance of the best model (across all keys/providers) before falling to a weaker one.
+- **Agentic Capability Gate.** At startup, each model is probed with a real structured-reasoning task; any model that can’t reliably produce agentic structured output is **excluded** — so weak models never derail a run. The pipeline is never left empty (a safety floor always remains).
+- **Role Separation.** The *worker* (the critical decision-maker) draws only from top-tier proven models; cheaper models handle low-stakes auxiliary calls.
+- **Dual-Mode design.** Runs equally well for the **free-tier user** (juggling several free keys with deep fallback) and the **premium user** (one paid, top-tier multimodal key that bypasses all the juggling — no probing, no gates).
+
+### 6. Human-Grade Anti-Bot Realism
+
+- **Headed under a virtual display (Xvfb).** The browser runs as a *genuinely headed* Chromium — no `HeadlessChrome` tell, real window/compositor — while staying invisible on a server/WSL machine.
+- **12-layer fingerprint stealth:** `navigator.webdriver` proxy masking, canvas/WebGL/audio noise seeding, **platform-consistent GPU** spoofing, plugin/`chrome` stubs, WebRTC IP sanitization, and font hardening.
+- **Trusted, human-like input:** Bézier-curve mouse paths and OS-level CDP clicks (`isTrusted = true`), a **realistic native arrow cursor** with accurate, continuous coordinate awareness, and automatic suppression of the Chrome “didn’t shut down correctly” crash bubble.
+
+### 7. Resilient Execution & Self-Healing
+
+- **Multi-strategy click waterfall** (CDP native event → JS click → direct navigation) with post-action verification.
+- **Overlay penetration** to click through cookie banners and modals.
+- **Circuit breaker + provider health tracker** quarantine failing models with exponential backoff and recover automatically.
+- **Skill memory** records successful workflows for reuse, and a **per-run log file** captures every session for later analysis.
+
+---
+
+## How It Works
+
+```
+                ┌─────────────────────────────────────────────────────────┐
+   "star this   │  GOAL COMPILER → strategy + success criteria + checklist │
+    repo"  ───► │  PLANNER        → ordered, serialized sub-goals          │
+                └───────────────────────────┬─────────────────────────────┘
+                                            ▼
+        ┌──────────────────────────── PER-STEP LOOP ───────────────────────────────┐
+        │  PERCEIVE   a11y DOM (fast)  ──► ambiguous? ──► VISION consult (1 shot)    │
+        │  DECIDE     worker predicts the exact expected change (forward modeling)   │
+        │  EXECUTE    trusted CDP click / type / scroll on the live browser          │
+        │  VERIFY     A11y → Vision → Path proof  (cheapest sufficient tier)         │
+        │  LEDGER     verified sub-goal is locked — never re-done                    │
+        └───────────────────────────────────────────────────────────────────────────┘
+                                            ▼
+                 OUTCOME JUDGE → cites on-page proof → ✅ done, or 🔁 actionable retry
+```
+
+---
+
+## Installation
+
+**Requirements:** Python **3.11+**, Linux / WSL / macOS, and (for stealth mode) the `xvfb` system package.
 
 ```bash
-git clone https://github.com/SandeepAi369/agent-first-ide.git
-cd agent-first-ide
-python3 -m venv .venv
+# 1. Clone
+git clone https://github.com/SandeepAi369/Agent-first-ide.git
+cd Agent-first-ide
+
+# 2. Create and activate a virtual environment
+python3.11 -m venv .venv
 source .venv/bin/activate
-pip install -r python-orchestrator/requirements.txt
-playwright install chromium
+
+# 3. Install Python dependencies
+pip install -e .
+
+# 4. Install the Chromium browser engine
+python -m playwright install chromium
+
+# 5. (Recommended) Install Xvfb for headed "stealth" mode on a display-less machine
+sudo apt-get install -y xvfb
+
+# 6. Configure your API keys (see next section)
+cp .env.example .env      # then edit .env with your keys
+
+# 7. Make the launcher executable
+chmod +x agent.sh
 ```
 
-### 2. Configure Environment
-
-```bash
-cp .env.example .env
-# Edit .env with your API keys (GOOGLE_API_KEY, GROQ_API_KEY, NVIDIA_NIM_API_KEY, etc.)
-```
-
-### 3. Login (One-Time)
-
-```bash
-python3 advanced_agent.py login
-```
-
-A browser window opens. Log into your Google/Gmail account manually, then press ENTER in the terminal. Your session is saved to `persistence/session_state.json` and will survive all future restarts.
-
-### 4. Run Agent Tasks
-
-```bash
-# Simple test (Wikipedia search)
-python3 advanced_agent.py run "Go to https://en.wikipedia.org, search for Alan Turing, and verify the article title."
-
-# Form fill test
-python3 advanced_agent.py run "Go to https://the-internet.herokuapp.com/login, type 'tomsmith' as username, type 'SuperSecretPassword!' as password, click Login, verify success."
-
-# Marketing task (Dev.to article)
-python3 advanced_agent.py run "Go to https://dev.to, log in with Google, create a new post about your project, and publish it."
-```
+> 💡 If `xvfb` is not installed, the agent automatically falls back to headless mode (more bot-detectable, but fully functional).
 
 ---
 
-## Project Structure
+## Configuration & API Keys
 
+All configuration lives in a `.env` file at the project root. The system is provider-agnostic and reads keys for any combination of providers you have.
+
+### Operating Modes
+
+Set `AGENT_MODE` to choose how the model layer behaves:
+
+| `AGENT_MODE` | Behavior |
+| --- | --- |
+| `auto` *(default)* | **Premium** if a `PREMIUM_API_KEY` is set, otherwise **Free**. |
+| `free` | Multi-key free-tier juggling + the Agentic Capability Gate. |
+| `premium` | One trusted paid model for **both text and vision** — skips probing/gating entirely. |
+
+**Premium (single-key) setup** — one paid, multimodal key does everything:
+
+```dotenv
+AGENT_MODE=premium
+PREMIUM_API_KEY=sk-...
+PREMIUM_MODEL=gpt-5                            # or claude-opus-4, gemini-2.5-pro, openrouter/...
+PREMIUM_BASE_URL=https://api.openai.com/v1     # any OpenAI-compatible endpoint (OpenRouter, etc.)
+# PREMIUM_VISION_MODEL=                        # optional; defaults to PREMIUM_MODEL
+# PREMIUM_PROVIDER=openai                      # use "google" for the Gemini client
 ```
-agent-first-ide/
-├── advanced_agent.py                  # Single-agent browser automation (recommended)
-├── start_campaign.py                  # Legacy multi-agent campaign launcher
-├── check_cookies.py                   # Cookie inspection utility
-├── test_form_fill.py                  # Swarm testing script
-├── .env                               # API keys (git-ignored)
-├── .gitignore
-├── README.md
-├── persistence/                       # Runtime data (git-ignored)
-│   ├── session_state.json             # Saved cookies + localStorage
-│   ├── session_state.backup.json      # Backup state
-│   └── browser_sessions/             # Chromium profiles
-├── python-orchestrator/
-│   ├── requirements.txt
-│   ├── app/
-│   │   ├── config.py                  # Centralized environment configuration
-│   │   ├── logger.py                  # Structured logging
-│   │   ├── observability.py           # LangSmith tracing
-│   │   └── browser_promoter/
-│   │       ├── state.py               # Pydantic state models
-│   │       ├── graph.py               # LangGraph compilation
-│   │       ├── nodes.py               # All graph nodes + DOM extraction
-│   │       ├── browser_runtime.py     # Playwright persistent context runtime
-│   │       ├── cdp_stealth_launcher.py # Stealth hardening (UA, canvas, WebGL)
-│   │       ├── worker_planner.py      # Strategic + Tactical + Vision planners
-│   │       ├── supervisor_subgraph.py # 4-agent supervisor meeting
-│   │       ├── database.py            # SQLite persistence
-│   │       ├── dashboard.py           # Terminal status dashboard
-│   │       ├── github_intelligence.py # GitHub repo analysis for marketing
-│   │       └── marketing_engine.py    # Platform strategy engine
-│   └── tests/
-└── scripts/
+
+### Text Models
+
+The reasoning chain. `gpt-oss-120b` is the proven default and is fast on Groq / Cerebras / NVIDIA.
+
+```dotenv
+# Provider keys (any subset; comma-separate multiple keys of one provider)
+GROQ_API_KEY=gsk_...
+NVIDIA_NIM_API_KEY=nvapi-...
+CEREBRAS_API_KEY=csk-...
+GEMINI_API_KEY=...
+
+# Optional model overrides
+GROQ_MODEL=openai/gpt-oss-120b
+NVIDIA_TEXT_MODELS=openai/gpt-oss-120b,openai/gpt-oss-20b   # comma-separated
+CEREBRAS_MODEL=gpt-oss-120b
+GEMINI_TEXT_MODEL=gemma-4-31b-it
 ```
+
+### Vision Models (Optional)
+
+Vision is **entirely optional** — used only for on-demand visual confirmation. Defaults to the Llama 4 family (Scout on Groq, Maverick on NVIDIA).
+
+```dotenv
+# Groq Vision — Llama 4 Scout (primary)
+GROQ_VISION_API_KEY=gsk_...
+GROQ_VISION_MODEL=meta-llama/llama-4-scout-17b-16e-instruct
+
+# NVIDIA Vision — Llama 4 Maverick (+ optional fallbacks, comma-separated)
+NVIDIA_VISION_API_KEY=nvapi-...
+NVIDIA_VISION_MODELS=meta/llama-4-maverick-17b-128e-instruct
+```
+
+### Graceful Fallback
+
+- **No vision keys?** The agent runs **accessibility-DOM only** — it never crashes or requires vision; it simply doesn’t escalate to a screenshot. (NVIDIA vision transparently falls back to your text NVIDIA key if a dedicated vision key isn’t set.)
+- **Dead or incapable model?** The startup Capability Gate prunes it automatically; the chain self-curates down to models that actually work.
+- **All top models rate-limited?** Failover walks the full chain across every key/provider before giving up.
 
 ---
 
-## Environment Variables
+## Usage
 
-| Variable | Required | Description |
-|---|---|---|
-| `GOOGLE_API_KEY` | ✅ | Google key for Gemma 4 models (vision + backup) |
-| `NVIDIA_NIM_API_KEY` | ❌ | NVIDIA NIM key for GLM-5.1 strategic planner |
-| `GROQ_API_KEY` | ❌ | Groq key for GPT-OSS-120B tactical executor |
-| `OPENAI_API_KEY` | ❌ | Fallback key for OpenAI-compatible providers |
-| `BROWSER_HEADLESS` | ❌ | Run browser headless (default: `false`) |
-| `DRY_RUN_MODE` | ❌ | Skip destructive actions (default: `true`) |
-| `MAX_CYCLES` | ❌ | Maximum graph cycles (default: `15`) |
+The simplest path — the one-click launcher (runs in stealth headed mode automatically):
+
+```bash
+./agent.sh "search Flipkart for a water bottle under ₹300 and add it to the cart"
+```
+
+Run it with no argument and it will prompt you for the task:
+
+```bash
+./agent.sh
+```
+
+Or call the brain directly:
+
+```bash
+# Stealth headed mode (default — recommended)
+.venv/bin/python run_v16.py run "Go to github.com/torvalds/linux and star the repository"
+
+# Force true headless (more bot-detectable)
+.venv/bin/python run_v16.py run "your task here" --headless
+```
+
+**Persisting a login session** — open a browser to sign in manually once; the session is reused on future runs:
+
+```bash
+.venv/bin/python run_v16.py login
+```
+
+Every run is saved to `logs/run_<timestamp>.log` for later inspection.
 
 ---
 
-## Safety & Security
+## Project Status
 
-- **Private repository** — All code and credentials stay private
-- **`.gitignore` protection** — `.env`, `persistence/`, browser profiles, and cookies are never committed
-- **Dry-run mode** — Destructive actions are skipped by default
-- **Stealth hardening** — WebDriver masking, canvas noise, WebGL spoofing, 12 browser fingerprint profiles
-- **Crash-proof saves** — Session state is always preserved, even on crashes
+Agent First Browse is in **active private preview**. The core architecture — cognitive brain, perception, verification, model layer, and anti-bot stealth — is implemented and covered by an automated test suite. APIs and configuration may still evolve.
 
 ---
 
 ## License
 
-MIT © SandeepAi369
+Licensing terms are **being finalized** and are intentionally not yet specified. The repository is **private** for now; a license will be added prior to any public release. _License details to be updated._
