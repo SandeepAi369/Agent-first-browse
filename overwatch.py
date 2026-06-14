@@ -346,9 +346,12 @@ def _render_verified_subgoals(state: dict) -> str:
     proof — trusted prior evidence handed to the done-judge so it confirms rather
     than re-deriving subtle UI changes from a cold final page. Generalized: read
     straight from the task's own checklist, no website/action rules."""
+    # ONLY genuinely-locked sub-goals — never the background audit's unverified
+    # "done" guesses (those would bias the judge toward false completion). The
+    # done-judge otherwise stays purely evidence-grounded on the live page.
     lines = []
     for d in (state.get("prm_checklist", []) or []):
-        if d.get("verified") or d.get("status") == "done":
+        if d.get("verified"):
             ev = (d.get("evidence") or "").strip()
             lines.append(f"  ✓ {(d.get('desc') or '').strip()}" + (f" — {ev}" if ev else ""))
     return "\n".join(lines)
