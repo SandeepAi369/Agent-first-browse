@@ -75,7 +75,9 @@ def _collect_keys(*env_vars: str) -> list[str]:
 DEFAULT_MODEL_TIERS: dict[str, int] = {
     # Tier 0 — proven excellent for tactical browser decisions
     "gpt-oss-120b": 0,
-    # Tier 1 — strong general models
+    # Tier 1 — strong general models (benchmark 2026-06: gpt-oss-20b 88%/1.0s/100%JSON,
+    #   gemma-4-31b-it 100% via Gemini — both ideal cascade-consensus voters)
+    "gpt-oss-20b": 1,
     "gemma-4-31b-it": 1,
     "gemma-4-32b-it": 1,
     # ── Vision-only models (NEVER used by the text chain — tiering them here is
@@ -580,8 +582,10 @@ def _build_text_pipeline() -> list[ModelClient]:
     # Override via NVIDIA_TEXT_MODELS="model1,model2" in .env.
     nvidia_keys = _collect_keys("NVIDIA_NIM_API_KEY", "NVIDIA_NIM_API_KEYS")
     base = os.getenv("NVIDIA_NIM_BASE_URL", "https://integrate.api.nvidia.com/v1")
+    # gpt-oss-20b added (benchmark 2026-06: fast 1.0s, 88% acc, 100% JSON) — gives the
+    # dynamic cascade-consensus a fast, reliable, DISTINCT tertiary voter.
     _nvidia_models_raw = os.getenv(
-        "NVIDIA_TEXT_MODELS", "openai/gpt-oss-120b,google/gemma-4-31b-it"
+        "NVIDIA_TEXT_MODELS", "openai/gpt-oss-120b,openai/gpt-oss-20b,google/gemma-4-31b-it"
     )
     nvidia_text_models = [
         (m.strip(), 30) for m in _nvidia_models_raw.split(",") if m.strip()
