@@ -269,49 +269,39 @@ async def invoke_worker(
     }
 
     # ══════════════════════════════════════════════════════════════════════
-    #  P2 CONSENSUS GATE — protect the one-shot IRREVERSIBLE action
-    #  A reversible action can be retried (the p_eff amplifier handles it); an
-    #  irreversible one cannot, so we replace "trust one model" with a vote of
-    #  DISTINCT base-models and ABSTAIN when they disagree. Fires ~1-2×/task.
+    #  P2 DYNAMIC CASCADE CONSENSUS — need-based, latency-aware
+    #  IRREVERSIBLE actions can't be retried, so they get a second opinion — but
+    #  via a CASCADE, not an always-on N-voter poll (latency is critical):
+    #    Tier 1  primary confident + structurally sound → execute NOW (0 extra calls)
+    #    Tier 2  else poll the SECONDARY; if it agrees → execute       (1 extra call)
+    #    Tier 3  else poll the TERTIARY → CISC vote                    (2 extra calls)
+    #    Abstain vote still split → vision / safe-wait
+    #  All voting lives in consensus.cascade_consensus (modular — this block only
+    #  triggers it and applies the result; it never touches prompt/guidance state).
     # ══════════════════════════════════════════════════════════════════════
     consensus_update: dict[str, Any] = {}
     force_consult = False
     try:
-        from consensus import (
-            consensus_enabled, count_distinct_base_models,
-            distinct_base_model_clients, sample_ensemble, weighted_vote,
-            should_abstain, CONSENSUS_N,
-        )
+        from consensus import (consensus_enabled, count_distinct_base_models,
+                               cascade_consensus)
         if (risk == ActionRisk.IRREVERSIBLE and consensus_enabled()
                 and count_distinct_base_models(failover_chain) >= 2):
-            from model_registry import ProviderHealthTracker
-            orig_base = ProviderHealthTracker._base_model_name(used_model)
-            voters = distinct_base_model_clients(
-                failover_chain, CONSENSUS_N - 1, exclude_base=orig_base)
-            ensemble = await sample_ensemble(
-                voters, messages, WorkerAction, invoke_fn, breaker, health_tracker)
+            # "Hesitation / stuck" forces a second opinion even on a confident primary.
+            force_escalate = (state.get("consecutive_identical_actions", 0) >= 2
+                              or bool(state.get("correction_context")))
+            cascade = await cascade_consensus(
+                primary_decision=decision, primary_model=used_model,
+                messages=messages, schema=WorkerAction,
+                invoke_fn=invoke_fn, chain=failover_chain,
+                breaker=breaker, health_tracker=health_tracker,
+                selector_map=selector_map, force_escalate=force_escalate)
 
-            samples = [{
-                "verb": decision.action_type, "element_id": decision.element_id,
-                "text": decision.text,
-                "confidence": getattr(decision, "confidence", 0.7),
-            }]
-            for d, _m in ensemble:
-                samples.append({
-                    "verb": d.action_type, "element_id": d.element_id,
-                    "text": d.text, "confidence": getattr(d, "confidence", 0.7),
-                })
-
-            vote = weighted_vote(samples)
             consensus_update["consensus_votes"] = state.get("consensus_votes", 0) + 1
-            if vote:
-                logger.info(
-                    "🗳️ CONSENSUS [IRREVERSIBLE %s]: %d voters, %d unique, "
-                    "agreement=%.0f%%, mean_conf=%.2f | tally=%s",
-                    decision.action_type, vote.n_votes, vote.n_unique,
-                    vote.agreement * 100, vote.mean_conf, vote.tally)
+            logger.info("🗳️ CASCADE [%s] +%d calls, agreement=%.0f%% — %s",
+                        cascade.path, cascade.extra_calls,
+                        cascade.agreement * 100, cascade.detail)
 
-            if should_abstain(vote):
+            if cascade.abstain:
                 consensus_update["abstentions"] = state.get("abstentions", 0) + 1
                 if vision_chain:
                     logger.warning("🛑 ABSTAIN → consulting vision to disambiguate "
@@ -326,23 +316,26 @@ async def invoke_worker(
                         "\n\n⚖️ The critical irreversible action is AMBIGUOUS — the "
                         "models disagreed on the target. Re-examine the page and "
                         "identify the SINGLE correct element before committing.")
-            elif vote and (vote.verb != decision.action_type
-                           or vote.element_id != decision.element_id):
-                # Ensemble winner differs from the first pick → adopt the winner
-                win_el = selector_map.get(vote.element_id, {}) if vote.element_id else {}
-                win_target = (win_el.get("name", win_el.get("text", "")) or "")[:60]
-                win_risk = classify_action(
-                    action_type=vote.verb, target_name=win_target,
-                    target_text=(vote.text or "")[:60], url=current_url,
-                    element_kind=win_el.get("kind", ""))
-                logger.info("🗳️ CONSENSUS override → %s [%s]",
-                            vote.verb, vote.element_id or "")
-                proposed = {**proposed, "verb": vote.verb,
-                            "element_id": vote.element_id, "text": vote.text,
-                            "target_name": win_target, "risk_level": win_risk.name,
-                            "reversible": win_risk == ActionRisk.REVERSIBLE}
+            else:
+                cd = cascade.decision
+                if (cd is not decision
+                        and (getattr(cd, "action_type", None) != decision.action_type
+                             or getattr(cd, "element_id", None) != decision.element_id)):
+                    # The cascade settled on a DIFFERENT action than the primary pick.
+                    win_el = selector_map.get(cd.element_id, {}) if cd.element_id else {}
+                    win_target = (win_el.get("name", win_el.get("text", "")) or "")[:60]
+                    win_risk = classify_action(
+                        action_type=cd.action_type, target_name=win_target,
+                        target_text=(cd.text or "")[:60], url=current_url,
+                        element_kind=win_el.get("kind", ""))
+                    logger.info("🗳️ CASCADE override → %s [%s]",
+                                cd.action_type, cd.element_id or "")
+                    proposed = {**proposed, "verb": cd.action_type,
+                                "element_id": cd.element_id, "text": cd.text,
+                                "target_name": win_target, "risk_level": win_risk.name,
+                                "reversible": win_risk == ActionRisk.REVERSIBLE}
     except Exception as e:  # noqa: BLE001 — consensus never breaks the step
-        logger.debug("Consensus gate skipped (non-fatal): %s", e)
+        logger.debug("Cascade consensus skipped (non-fatal): %s", e)
 
     # ── Vision-on-demand (V21): the agent works on the a11y DOM by default and
     #    "opens its eyes" for ONE step only when it cannot resolve the page from
