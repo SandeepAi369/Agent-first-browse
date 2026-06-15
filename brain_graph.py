@@ -432,17 +432,41 @@ async def commit_node(state: BrainState) -> dict:
 
     for i, step in enumerate(plan_steps):
         if step.get("status") in ("active", "in_progress"):
-            # Check if step is done based on action outcome
+            # V17: semantic plan advancement — the action outcome must indicate
+            # success AND the action should relate to the current plan step.
+            # Old heuristic (`"OK" in outcome`) advanced on ANY success, causing
+            # critical steps to be skipped prematurely.
             outcome = state.action_outcome or ""
-            if "OK" in outcome or "navigated" in outcome.lower():
-                plan_steps[i] = {**step, "status": "done"}
-                # Activate next pending step
-                for j in range(i + 1, len(plan_steps)):
-                    if plan_steps[j].get("status") == "pending":
-                        plan_steps[j] = {**plan_steps[j], "status": "active"}
-                        plan_cursor = j
-                        break
-                advanced = True
+            action_ok = ("OK" in outcome or "navigated" in outcome.lower()
+                         or "SUCCESS" in outcome.upper())
+            if action_ok:
+                # Only advance if the action plausibly matches this plan step.
+                # We check overlap between action context and step description.
+                step_desc = step.get("desc", "").lower()
+                action_ctx = " ".join([
+                    (state.proposed_action or {}).get("verb", ""),
+                    (state.proposed_action or {}).get("target_name", ""),
+                    (state.proposed_action or {}).get("text", "") or "",
+                    outcome,
+                ]).lower()
+
+                # Advance if any meaningful keyword from the step appears in
+                # the action context, OR if the step is a generic navigation
+                # step that any successful action can satisfy.
+                step_words = {w for w in step_desc.split() if len(w) > 3}
+                overlap = step_words & {w for w in action_ctx.split() if len(w) > 3}
+                is_generic = any(kw in step_desc for kw in
+                                 ("navigate", "open", "go to", "visit", "load"))
+
+                if overlap or is_generic:
+                    plan_steps[i] = {**step, "status": "done"}
+                    # Activate next pending step
+                    for j in range(i + 1, len(plan_steps)):
+                        if plan_steps[j].get("status") == "pending":
+                            plan_steps[j] = {**plan_steps[j], "status": "active"}
+                            plan_cursor = j
+                            break
+                    advanced = True
             break
 
     if advanced:
@@ -497,6 +521,43 @@ async def commit_node(state: BrainState) -> dict:
                 updates["strategy_confidence"] = penalized
         except Exception as e:
             logger.debug("PRM audit error (non-fatal): %s", e)
+
+    # ── V17 Win-State Recognizer (generalized — zero hardcoded platforms) ──
+    # If the agent just executed an IRREVERSIBLE action (as classified by
+    # action_classifier: add-to-cart, submit, fork, star, post, etc.) AND the
+    # page responded with a significant state change (URL changed or large DOM
+    # delta), this is the cognitive signal that the CRITICAL task action just
+    # completed. Inject a strong nudge to call 'done' immediately — preventing
+    # the agent from wandering into post-action pages (cart recommendations,
+    # confirmation screens, etc.) and clicking similar-looking buttons.
+    #
+    # This is NOT hardcoding any platform. The action_classifier already knows
+    # what "critical" looks like from its regex patterns (buy, submit, add to
+    # cart, delete, post, etc.) — all task-agnostic. The URL change is a
+    # universal signal that the action had a real effect.
+    action = state.proposed_action or {}
+    if (action.get("risk_level") == "IRREVERSIBLE"
+            and state.action_outcome
+            and "OK" in state.action_outcome):
+        # The critical action succeeded — check if the page reacted
+        outcome_lower = state.action_outcome.lower()
+        page_reacted = ("navigated" in outcome_lower
+                        or "structure changed" in outcome_lower
+                        or "element count changed" in outcome_lower)
+        if page_reacted:
+            logger.info(
+                "🏆 WIN-STATE: IRREVERSIBLE action '%s' on '%s' succeeded with "
+                "page reaction — nudging agent to verify and finish.",
+                action.get("verb", "?"), action.get("target_name", "?")[:40],
+            )
+            updates["goal_complete_hint"] = (
+                "\n\n🏆 CRITICAL ACTION COMPLETED: You just performed the KEY "
+                "irreversible action for this task and the page confirmed it "
+                "(URL/DOM changed). Your task is very likely DONE. Verify the "
+                "result on screen and output action_type='done' IMMEDIATELY. "
+                "Do NOT click any other buttons, links, or recommendations. "
+                "Do NOT navigate away. Just verify and finish."
+            )
 
     return updates
 
