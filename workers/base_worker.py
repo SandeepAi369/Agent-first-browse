@@ -66,7 +66,7 @@ class WorkerAction(BaseModel):
         ),
     )
     action_type: str = Field(
-        description="One of: 'goto', 'click', 'type', 'scroll', 'press_enter', 'wait', 'done'"
+        description="One of: 'goto', 'click', 'type', 'scroll', 'press_enter', 'wait', 'done', 'ask_user'"
     )
     element_id: str | None = Field(
         default=None,
@@ -77,6 +77,16 @@ class WorkerAction(BaseModel):
     y: float | None = Field(default=None, description="Y coordinate (fallback)")
     text: str | None = Field(default=None, description="Text to type for 'type' action")
     wait_ms: int | None = Field(default=None, description="Milliseconds for 'wait' action")
+    confidence: float = Field(
+        default=0.7,
+        description=(
+            "Your confidence (0.0-1.0) that THIS action is the correct next step. "
+            "Be honest and calibrated: high (>0.8) only when the target and intent "
+            "are unambiguous; low (<0.5) when several elements look plausible or "
+            "you are unsure the action will work. Used to weight multi-model "
+            "consensus on critical irreversible actions."
+        ),
+    )
     needs_vision: bool = Field(
         default=False,
         description=(
@@ -90,6 +100,15 @@ class WorkerAction(BaseModel):
     vision_question: str = Field(
         default="",
         description="If needs_vision: the specific thing to resolve by looking (e.g. 'which button is the real Add to Cart?').",
+    )
+    # V17: Interactive Data Guardrails — stop and ask when personal data is needed
+    missing_data: str = Field(
+        default="",
+        description=(
+            "If action_type='ask_user': describe WHAT information is missing that "
+            "prevents you from continuing. E.g., 'Shipping address required for "
+            "checkout' or 'Phone number needed for account verification'."
+        ),
     )
 
 
@@ -135,16 +154,17 @@ async def invoke_worker(
     skill_context = state.get("skill_context", "")
 
     # ── V18 Cognition: the agent reasons WITH its persistent strategy + beliefs ──
-    from cognition import render_strategy_block
+    # V27: strategy block is the PERSISTENT context only; the goal_complete_hint
+    # (transient "finish now" nudge) is now owned by the Guidance Bus below.
+    from cognition import render_strategy_block, build_guidance
     strategy_block = render_strategy_block(
         strategy=state.get("strategy", ""),
         confidence=state.get("strategy_confidence", 1.0),
         beliefs=state.get("beliefs", []) or [],
         success_criteria=state.get("success_criteria", ""),
-        goal_complete_hint=state.get("goal_complete_hint", ""),
     )
 
-    # Login hint
+    # Login hint (informational, non-conflicting — not part of the guidance bus)
     login_hint = ""
     if login_detected:
         login_hint = (
@@ -153,20 +173,13 @@ async def invoke_worker(
             "DO NOT attempt to log in again."
         )
 
-    # State override
-    state_override = ""
-    if correction_context:
-        state_override += correction_context
-    if recovery_advice:
-        state_override += f"\n\n🛠️ RECOVERY ADVICE: {recovery_advice}"
-
-    # Dedup override
-    dedup_override = ""
-    if consecutive_identical >= 2:
-        dedup_override = (
-            f"\n\n🛑 REPETITION BLOCK: EXACT SAME action {consecutive_identical + 1} times. "
-            "You MUST choose a COMPLETELY DIFFERENT action NOW."
-        )
+    # ── V27 Guidance Bus: exactly ONE arbitrated transient directive ──
+    # Replaces the old stacking of correction_context + recovery_advice +
+    # dedup_override + critical_action_hint (the F2 regression). The PRM-checklist
+    # re-injection is GONE — plan_steps (system prompt) is the only sub-goal source.
+    guidance_block = build_guidance(state)
+    if guidance_block:
+        logger.info("🧭 GUIDANCE: %s", guidance_block.split("\n", 1)[-1][:120])
 
     user_prompt = (
         f"═══ YOUR MISSION ═══\n"
@@ -180,13 +193,18 @@ async def invoke_worker(
         + f"═══ CURRENT CONTEXT ═══\n"
         f"URL: {current_url}\n"
         f"Step: {step_number+1}/{max_steps} ({max_steps - step_number - 1} remaining)"
-        f"{login_hint}"
-        f"{state_override}"
-        f"{dedup_override}\n\n"
+        f"{login_hint}\n\n"
+        + (f"{guidance_block}\n\n" if guidance_block else "")
         + f"═══ ACTION HISTORY (compressed) ═══\n"
         f"{history_compressed or '(first step)'}\n\n"
         f"═══ PAGE STRUCTURE ═══\n"
         f"{dom_markdown}\n\n"
+        # V17: Objective anchor at the BOTTOM of the prompt (sandwich pattern).
+        # On pages with large DOM markdown, the objective at the top gets buried
+        # in the context window. Repeating it here ensures the LLM's attention
+        # stays locked on the goal, not on pattern-matching DOM elements.
+        f"═══ REMEMBER YOUR MISSION ═══\n"
+        f"{objective[:300]}\n"
         f"Now OBSERVE the page structure above, THINK about your situation, and choose your NEXT action."
     )
 
@@ -250,6 +268,82 @@ async def invoke_worker(
         "wait_ms": decision.wait_ms,
     }
 
+    # ══════════════════════════════════════════════════════════════════════
+    #  P2 CONSENSUS GATE — protect the one-shot IRREVERSIBLE action
+    #  A reversible action can be retried (the p_eff amplifier handles it); an
+    #  irreversible one cannot, so we replace "trust one model" with a vote of
+    #  DISTINCT base-models and ABSTAIN when they disagree. Fires ~1-2×/task.
+    # ══════════════════════════════════════════════════════════════════════
+    consensus_update: dict[str, Any] = {}
+    force_consult = False
+    try:
+        from consensus import (
+            consensus_enabled, count_distinct_base_models,
+            distinct_base_model_clients, sample_ensemble, weighted_vote,
+            should_abstain, CONSENSUS_N,
+        )
+        if (risk == ActionRisk.IRREVERSIBLE and consensus_enabled()
+                and count_distinct_base_models(failover_chain) >= 2):
+            from model_registry import ProviderHealthTracker
+            orig_base = ProviderHealthTracker._base_model_name(used_model)
+            voters = distinct_base_model_clients(
+                failover_chain, CONSENSUS_N - 1, exclude_base=orig_base)
+            ensemble = await sample_ensemble(
+                voters, messages, WorkerAction, invoke_fn, breaker, health_tracker)
+
+            samples = [{
+                "verb": decision.action_type, "element_id": decision.element_id,
+                "text": decision.text,
+                "confidence": getattr(decision, "confidence", 0.7),
+            }]
+            for d, _m in ensemble:
+                samples.append({
+                    "verb": d.action_type, "element_id": d.element_id,
+                    "text": d.text, "confidence": getattr(d, "confidence", 0.7),
+                })
+
+            vote = weighted_vote(samples)
+            consensus_update["consensus_votes"] = state.get("consensus_votes", 0) + 1
+            if vote:
+                logger.info(
+                    "🗳️ CONSENSUS [IRREVERSIBLE %s]: %d voters, %d unique, "
+                    "agreement=%.0f%%, mean_conf=%.2f | tally=%s",
+                    decision.action_type, vote.n_votes, vote.n_unique,
+                    vote.agreement * 100, vote.mean_conf, vote.tally)
+
+            if should_abstain(vote):
+                consensus_update["abstentions"] = state.get("abstentions", 0) + 1
+                if vision_chain:
+                    logger.warning("🛑 ABSTAIN → consulting vision to disambiguate "
+                                   "the critical action.")
+                    force_consult = True
+                else:
+                    logger.warning("🛑 ABSTAIN → no vision; holding (wait) and "
+                                   "re-examining before committing.")
+                    proposed = {**proposed, "verb": "wait", "wait_ms": 800,
+                                "risk_level": "REVERSIBLE", "reversible": True}
+                    consensus_update["correction_context"] = (
+                        "\n\n⚖️ The critical irreversible action is AMBIGUOUS — the "
+                        "models disagreed on the target. Re-examine the page and "
+                        "identify the SINGLE correct element before committing.")
+            elif vote and (vote.verb != decision.action_type
+                           or vote.element_id != decision.element_id):
+                # Ensemble winner differs from the first pick → adopt the winner
+                win_el = selector_map.get(vote.element_id, {}) if vote.element_id else {}
+                win_target = (win_el.get("name", win_el.get("text", "")) or "")[:60]
+                win_risk = classify_action(
+                    action_type=vote.verb, target_name=win_target,
+                    target_text=(vote.text or "")[:60], url=current_url,
+                    element_kind=win_el.get("kind", ""))
+                logger.info("🗳️ CONSENSUS override → %s [%s]",
+                            vote.verb, vote.element_id or "")
+                proposed = {**proposed, "verb": vote.verb,
+                            "element_id": vote.element_id, "text": vote.text,
+                            "target_name": win_target, "risk_level": win_risk.name,
+                            "reversible": win_risk == ActionRisk.REVERSIBLE}
+    except Exception as e:  # noqa: BLE001 — consensus never breaks the step
+        logger.debug("Consensus gate skipped (non-fatal): %s", e)
+
     # ── Vision-on-demand (V21): the agent works on the a11y DOM by default and
     #    "opens its eyes" for ONE step only when it cannot resolve the page from
     #    text — then this update reverts (force_vision cleared) and the next step
@@ -261,6 +355,8 @@ async def invoke_worker(
         state=state,
         action_type=decision.action_type,
     )
+    if force_consult:
+        consult, why = True, "consensus abstention — disambiguate critical action"
     if consult and vision_chain:
         logger.info("🧠→👁️ Escalating to vision: %s", why)
         verdict, _vm = await consult_vision(
@@ -289,6 +385,7 @@ async def invoke_worker(
         "proposed_action": proposed,
         "last_action_signature": current_sig,
         "consecutive_identical_actions": new_consecutive,
+        **consensus_update,
         **vision_update,
     }
 
@@ -359,6 +456,10 @@ selecting options, and interacting with UI elements.
     the button typically becomes "Go to cart" or a cart-count badge appears: that
     means the item IS in the cart, so treat the goal as ACHIEVED and output 'done'.
     Never re-click the same add/buy button once the page has already changed.
+12. MISSING PERSONAL DATA: If a form, checkout, or registration requires information
+    you DO NOT have (shipping address, payment info, phone number, custom specs),
+    output action_type='ask_user' and describe the missing data in 'missing_data'.
+    NEVER guess, hallucinate, or fabricate personal information.
 
 ═══ CRITICAL COORDINATE RULE ═══
 NEVER guess raw x, y coordinates! You MUST ALWAYS use the element_id (e.g., 'e5')

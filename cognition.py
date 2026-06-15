@@ -48,7 +48,7 @@ GAMMA = 0.3          # confidence EWMA rate: 3 consecutive no-progress → below
 TAU = 0.4            # confidence below this triggers a strategy review
 STALL_EPS = 0.05     # goal-score spread below this over the window = stalled
 STALL_WINDOW = 4     # number of recent goal-scores to inspect for a stall
-PRM_AUDIT_EVERY = 3  # run the (LLM) goal-audit at most every K steps
+PRM_AUDIT_EVERY = 2  # V17: tightened from 3 — catches sub-goal regression faster
 MAX_RESTRATEGIZE = 3 # hard cap on full re-strategy calls per task
 MAX_BELIEFS = 6      # keep injected memory LEAN — never flood the prompt
 BELIEF_MAXLEN = 120  # truncate each belief so one bad line can't dominate
@@ -294,10 +294,15 @@ def render_strategy_block(strategy: str,
                           beliefs: list[str],
                           success_criteria: str = "",
                           goal_complete_hint: str = "") -> str:
-    """Render the cognitive context for injection into the worker prompt.
+    """Render the PERSISTENT cognitive context for the worker prompt.
 
     Deliberately compact (~6 short lines): a one-line approach, the finish line,
     a confidence percentage, and at most a few short learned facts.
+
+    V27: `goal_complete_hint` is NO LONGER embedded here — transient "finish now"
+    nudges are owned by the Guidance Bus (`build_guidance`) so the worker never
+    sees more than ONE transient directive per step. The param is kept for
+    backward compatibility but ignored.
     """
     if not (strategy or beliefs or success_criteria):
         return ""
@@ -313,10 +318,57 @@ def render_strategy_block(strategy: str,
         for b in beliefs[-MAX_BELIEFS:]:
             lines.append(f"• {b.strip()[:BELIEF_MAXLEN]}")
 
-    if goal_complete_hint:
-        lines.append(goal_complete_hint)
-
     return "\n".join(lines)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  V27 Guidance Bus — exactly ONE arbitrated transient directive per step
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Fixes F2 (audit): the worker prompt used to stack up to five transient,
+#  possibly-conflicting directives — including a re-injection of the abstract PRM
+#  checklist (`critical_action_hint`), the exact pattern that caused the V26
+#  goal-amnesia regression. The single source of truth for sub-goals stays
+#  `plan_steps` (rendered in the system prompt). This bus arbitrates only the
+#  TRANSIENT nudges, emitting the single highest-priority one.
+
+GUIDANCE_MAXLEN = 400  # keep the directive lean — never crowd out the DOM
+
+
+def build_guidance(state: dict[str, Any]) -> str:
+    """Return the single highest-priority transient directive (or "").
+
+    Priority (highest first), each mapped to an existing state field set by an
+    existing node — we centralize only the READER, never the setters:
+      1. WIN/DONE  — `goal_complete_hint` (commit_node win-state / PRM ceiling):
+                     acting further is actively harmful (post-action wandering).
+      2. REPETITION — `consecutive_identical_actions >= 2`: break loops first.
+      3. ESCALATION — `correction_context` (overwatch `_escalate` ladder tactic).
+      4. RECOVERY   — `recovery_advice` (rollback advisor).
+
+    The abstract PRM-checklist re-injection is deliberately NOT a source here.
+    """
+    win = (state.get("goal_complete_hint") or "").strip()
+    if win:
+        directive = win
+
+    elif state.get("consecutive_identical_actions", 0) >= 2:
+        n = state.get("consecutive_identical_actions", 0) + 1
+        directive = (
+            f"🛑 REPETITION BLOCK: you chose the EXACT SAME action {n} times. "
+            "It is not working. Choose a COMPLETELY DIFFERENT action now."
+        )
+
+    elif (state.get("correction_context") or "").strip():
+        directive = state["correction_context"].strip()
+
+    elif (state.get("recovery_advice") or "").strip():
+        directive = f"🛠️ RECOVERY ADVICE: {state['recovery_advice'].strip()}"
+
+    else:
+        return ""
+
+    directive = directive[:GUIDANCE_MAXLEN].rstrip()
+    return f"═══ PRIORITY GUIDANCE (do this before anything else) ═══\n{directive}"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
