@@ -125,6 +125,97 @@ def test_sample_ensemble_polls_each_and_tolerates_failure():
     assert len(out) == 2               # the failing voter dropped out
 
 
+# ── dynamic cascade consensus (V28: time-vs-accuracy) ──
+
+class _Dec:
+    """Minimal WorkerAction-like decision for cascade tests."""
+    def __init__(self, action_type, element_id=None, text=None, confidence=0.7,
+                 url=None, x=None, y=None):
+        self.action_type = action_type; self.element_id = element_id
+        self.text = text; self.confidence = confidence
+        self.url = url; self.x = x; self.y = y; self.missing_data = ""; self.rationale = ""
+
+
+def test_structural_ok():
+    from consensus import structural_ok
+    assert structural_ok(_Dec("click", "e5"), {"e5": {}}) is True
+    assert structural_ok(_Dec("click", "e9"), {"e5": {}}) is False   # id not in map
+    assert structural_ok(_Dec("click", None), {}) is False           # no target
+    assert structural_ok(_Dec("click", None, x=10, y=20), {}) is True  # coords ok
+    assert structural_ok(_Dec("goto", url="https://x.com"), {}) is True
+    assert structural_ok(_Dec("goto"), {}) is False
+    assert structural_ok(_Dec("done"), {}) is True
+
+
+def _cascade(primary, voters_decisions, force=False, smap=None):
+    """Drive cascade_consensus with a fake invoke that returns scripted votes."""
+    from consensus import cascade_consensus
+    seq = list(voters_decisions)
+    calls = {"n": 0}
+
+    async def fake_invoke(chain, messages, schema, breaker, health_tracker=None):
+        calls["n"] += 1
+        d = seq.pop(0)
+        return (d, chain[0].name)
+
+    chain = [_MC("groq:openai/gpt-oss-120b:0"),
+             _MC("nvidia:openai/gpt-oss-20b:0"),
+             _MC("gemini:gemma-4-31b-it:0")]
+    res = asyncio.run(cascade_consensus(
+        primary_decision=primary, primary_model="groq:openai/gpt-oss-120b:0",
+        messages=["m"], schema=object, invoke_fn=fake_invoke, chain=chain,
+        breaker=None, health_tracker=None, selector_map=smap or {"e5": {}, "e6": {}},
+        force_escalate=force))
+    return res, calls["n"]
+
+
+def test_cascade_tier1_confident_executes_immediately():
+    res, n = _cascade(_Dec("click", "e5", confidence=0.95), [])
+    assert res.path == "primary_confident"
+    assert res.extra_calls == 0 and n == 0     # NO secondary polled — fast path
+    assert res.abstain is False
+
+
+def test_cascade_low_confidence_polls_secondary_and_agrees():
+    # primary low conf; secondary agrees → execute after 1 extra call
+    res, n = _cascade(_Dec("click", "e5", confidence=0.4),
+                      [_Dec("click", "e5", confidence=0.9)])
+    assert res.path == "secondary_agree"
+    assert res.extra_calls == 1 and n == 1
+    assert res.abstain is False
+
+
+def test_cascade_disagreement_escalates_to_tertiary_and_votes():
+    # primary low; secondary disagrees; tertiary breaks the tie toward e6
+    res, n = _cascade(_Dec("click", "e5", confidence=0.4),
+                      [_Dec("click", "e6", confidence=0.9),
+                       _Dec("click", "e6", confidence=0.9)])
+    assert res.extra_calls == 2 and n == 2
+    assert res.path == "voted"
+    assert res.decision.element_id == "e6"     # tertiary tipped the vote
+
+
+def test_cascade_three_way_split_abstains():
+    res, n = _cascade(_Dec("click", "e5", confidence=0.4),
+                      [_Dec("click", "e6", confidence=0.8),
+                       _Dec("wait", confidence=0.8)])
+    assert res.abstain is True and res.path == "abstain"
+
+
+def test_cascade_force_escalate_overrides_high_confidence():
+    # Even a 0.95 primary must get a second opinion when the agent is stuck.
+    res, n = _cascade(_Dec("click", "e5", confidence=0.95),
+                      [_Dec("click", "e5", confidence=0.9)], force=True)
+    assert res.extra_calls == 1 and res.path == "secondary_agree"
+
+
+def test_cascade_malformed_primary_escalates_despite_confidence():
+    # confident but element_id not in the selector map → structurally unsound
+    res, n = _cascade(_Dec("click", "e99", confidence=0.95),
+                      [_Dec("click", "e5", confidence=0.9)], smap={"e5": {}})
+    assert res.extra_calls >= 1                 # did NOT take the fast path
+
+
 if __name__ == "__main__":
     import pytest
     sys.exit(pytest.main([__file__, "-v"]))
