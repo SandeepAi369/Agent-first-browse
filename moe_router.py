@@ -84,6 +84,12 @@ def route_to_worker(state: dict[str, Any]) -> str:
             logger.info("🔀 Router → overwatch (done verification)")
             return "done_check"
 
+        # V17: ask_user — agent needs user input before proceeding
+        if verb == "ask_user":
+            missing = proposed.get("missing_data") or proposed.get("rationale", "")
+            logger.info("🙋 Router → finalize (ask_user: %s)", missing[:100])
+            return "finalize"
+
         if verb in ("goto", "scroll"):
             logger.info("🔀 Router → navigator (verb=%s)", verb)
             return "navigator"
@@ -162,6 +168,17 @@ def _classify_plan_step(step_desc: str) -> str | None:
 #  Verdict Router (for Overwatch → next node)
 # ═══════════════════════════════════════════════════════════════════════════════
 
+# P2 — Verifier-gated retry is the reliability amplifier. A worker with per-step
+# accuracy p, retried up to RETRY_BUDGET times against the live-DOM verifier,
+# reaches an effective per-step success of:
+#       p_eff = 1 − (1 − p)^(RETRY_BUDGET + 1)
+# so a k-critical-step task succeeds with S = p_eff^k. With p=0.70, k=6:
+#       RETRY_BUDGET 0 → 12%,  2 → 85%,  3 → 95%.
+# Independence of attempts is guaranteed by the V18 escalation ladder (each retry
+# is a DISTINCT tactic). RETRY_BUDGET=3 ⇒ 4 attempts ⇒ exponent (RETRY_BUDGET+1)=4.
+RETRY_BUDGET = 3
+
+
 def verdict_router(state: dict[str, Any]) -> str:
     """Route based on Overwatch's verification verdict.
 
@@ -173,8 +190,9 @@ def verdict_router(state: dict[str, Any]) -> str:
     if verdict == "pass":
         return "commit"
     elif verdict == "retry":
-        if retry_count >= 3:
-            logger.warning("🔀 Verdict → rollback (retry exhausted: %d)", retry_count)
+        if retry_count >= RETRY_BUDGET:
+            logger.warning("🔀 Verdict → rollback (retry exhausted: %d/%d)",
+                           retry_count, RETRY_BUDGET)
             return "rollback"
         return "retry"
     elif verdict == "rollback":

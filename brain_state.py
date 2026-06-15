@@ -177,6 +177,10 @@ class BrainState(BaseModel):
     critic_no_progress: int = 0
     reflexion_triggers: int = 0
     done_blocked: int = 0
+    # P2: consensus diagnostics — how many IRREVERSIBLE actions were put to a
+    # multi-model vote, and how many were abstained (held back as too ambiguous).
+    consensus_votes: int = 0
+    abstentions: int = 0
     # V20: the outcome judge's cited on-page proof (or the honest gap on an
     # unverified shutdown) — surfaced in the finalize report.
     done_evidence: str = ""
@@ -240,7 +244,13 @@ class BrainState(BaseModel):
         return "\n".join(lines)
 
     def compress_history(self) -> str:
-        """SWE-agent style history compression."""
+        """SWE-agent style history compression.
+        
+        V17: Deliberately excludes 'expected_change' from history entries.
+        The EXPECT field caused cognitive confusion — when reality differed
+        from the prediction, the next step's OBSERVE tried to reconcile them,
+        creating loops. The agent should react to what IS, not what it predicted.
+        """
         if not self.history:
             return "[]"
         entries = list(self.history)

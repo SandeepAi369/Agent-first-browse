@@ -52,16 +52,20 @@ class ChecklistItem:
     # is task-agnostic, driven purely by the verdict, not by any site/UI rule.
     verified: bool = False
     evidence: str = ""          # the concrete on-page proof captured at verification
+    # V17: weighted scoring — navigation/setup items get 0.5, critical actions
+    # get 2.0. Prevents the total score from being dominated by trivially-
+    # completed early steps while the actual critical action is still pending.
+    weight: float = 1.0
     
     @property
     def score(self) -> float:
-        """Numeric score for this item."""
+        """Weighted numeric score for this item."""
+        raw = 0.0
         if self.status == "done":
-            return 1.0
+            raw = 1.0
         elif self.status == "in_progress":
-            return 0.5 * self.confidence
-        else:
-            return 0.0
+            raw = 0.5 * self.confidence
+        return raw * self.weight
 
 
 @dataclass
@@ -156,7 +160,11 @@ CHECKLIST_GEN_PROMPT = """You are a task decomposition expert. Break the given b
 Rules:
 - Each item must be specific and independently verifiable from the page state
 - Items should be in chronological order of expected completion
-- Include verification steps (e.g., "Verify the item was added to cart")
+- Do NOT include "navigate and verify" or "verify the page loaded" items — once
+  the agent has navigated somewhere, that step is DONE and must never be repeated.
+  Navigation is always forward-only.
+- The FINAL item should always describe the concrete end-state (e.g., "Confirm
+  the item appears in the shopping cart" or "Verify the repository shows as starred").
 - Don't include meta-steps like "Open browser" or "Close browser"
 - Each item should correspond to a meaningful milestone in the task"""
 
@@ -226,20 +234,31 @@ class PRMCritic:
             self._total_calls += 1
             
             items_raw = result.items if hasattr(result, 'items') else []
-            checklist = [
-                ChecklistItem(id=i, description=desc.strip())
-                for i, desc in enumerate(items_raw)
-                if desc.strip()
-            ]
+            checklist = []
+            total_items = len([d for d in items_raw if d.strip()])
+            for i, desc in enumerate(items_raw):
+                if not desc.strip():
+                    continue
+                # V17: weight assignment — generalized by position.
+                # First item (usually navigation/setup) gets low weight.
+                # Last item (usually the critical verification) gets high weight.
+                # Middle items get normal weight.
+                if i == 0 and total_items > 2:
+                    w = 0.5   # setup/navigation — trivially completed
+                elif i == total_items - 1 and total_items > 1:
+                    w = 2.0   # final verification — the actual goal
+                else:
+                    w = 1.0   # normal milestone
+                checklist.append(ChecklistItem(id=i, description=desc.strip(), weight=w))
             
             if not checklist:
                 logger.warning("PRM: LLM returned empty checklist, creating fallback")
-                checklist = [ChecklistItem(id=0, description=objective)]
+                checklist = [ChecklistItem(id=0, description=objective, weight=2.0)]
             
             logger.info(
                 "📋 PRM Checklist (%d items by %s): %s",
                 len(checklist), model,
-                " → ".join(item.description[:40] for item in checklist),
+                " → ".join(f"{item.description[:35]}(w={item.weight})" for item in checklist),
             )
             return checklist
             
@@ -324,8 +343,9 @@ class PRMCritic:
         except Exception as e:
             logger.warning("PRM step scoring failed: %s", e)
         
-        # Calculate aggregate score
-        total_score = sum(item.score for item in checklist) / len(checklist) if checklist else 0.0
+        # Calculate aggregate score (V17: weighted — item.score already includes weight)
+        total_weight = sum(item.weight for item in checklist) if checklist else 1.0
+        total_score = sum(item.score for item in checklist) / total_weight if checklist else 0.0
         items_done = sum(1 for item in checklist if item.status == "done")
         items_in_progress = sum(1 for item in checklist if item.status == "in_progress")
         

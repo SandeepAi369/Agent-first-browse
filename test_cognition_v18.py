@@ -151,9 +151,10 @@ def test_push_goal_score_bounds_window():
 
 
 def test_prm_should_audit_cadence_and_progress():
-    assert prm_should_audit(0, True) is True       # critic progress always audits
-    assert prm_should_audit(3, False) is True       # cadence hit (every 3)
-    assert prm_should_audit(4, False) is False      # off-cadence, no progress
+    from cognition import PRM_AUDIT_EVERY            # tracks the tuned cadence (V-parallel: 2)
+    assert prm_should_audit(0, True) is True         # critic progress always audits
+    assert prm_should_audit(PRM_AUDIT_EVERY, False) is True       # on-cadence
+    assert prm_should_audit(PRM_AUDIT_EVERY + 1, False) is False  # off-cadence, no progress
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
