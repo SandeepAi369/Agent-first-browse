@@ -220,8 +220,34 @@ async def perceive_node(state: BrainState) -> dict:
     logger.info("━━━ Step %d/%d ━━━", state.step_number + 1, state.max_steps)
     logger.info("URL: %s", current_url)
 
-    # DOM snapshot via MCP
-    snapshot = await mcp_tools.mcp_snapshot()
+    # DOM snapshot — routed through the Adaptive Perception Engine when enabled.
+    # P0: the engine is a behavior-identical Tier-1 passthrough over this same
+    # mcp_snapshot call; it adds the routing seam for later deep-sweep / vision
+    # tiers without changing this node. A hard fallback to the direct snapshot
+    # guarantees perception can never be broken by the engine layer.
+    async def _direct_snapshot() -> dict:
+        return await mcp_tools.mcp_snapshot()
+
+    snapshot = None
+    try:
+        from feature_flags import adaptive_perception_enabled
+        if adaptive_perception_enabled():
+            from perception_engine import perceive as _perceive
+            pr = await _perceive(page, ctx={
+                "objective": state.objective,
+                "bound_target": state.bound_target,
+                "step_number": state.step_number,
+            })
+            snapshot = {
+                "elements": pr.elements, "markdown": pr.markdown,
+                "selector_map": pr.selector_map, "element_count": pr.element_count,
+            }
+    except Exception as e:
+        logger.warning("Adaptive perception failed (%s) — using direct snapshot", e)
+        snapshot = None
+    if snapshot is None:
+        snapshot = await _direct_snapshot()
+
     elements_list = snapshot.get("elements", [])
     dom_markdown = snapshot.get("markdown", "")
     selector_map = snapshot.get("selector_map", {})
@@ -248,6 +274,27 @@ async def perceive_node(state: BrainState) -> dict:
     facts_render = state.render_facts()
     history_compressed = state.compress_history()
 
+    # ── V29 Phase 3: progress-aware stagnation (revives the previously-DEAD
+    #    same_url_streak signal). "Busy but not progressing" → break the loop. ──
+    stagnation_level = 0
+    stagnation_note = ""
+    try:
+        from feature_flags import stagnation_enabled
+        if stagnation_enabled():
+            from stagnation import detect_stagnation
+            sig = detect_stagnation({
+                "same_url_streak": same_url_streak,
+                "goal_score_window": state.goal_score_window,
+                "loop_signatures": state.loop_signatures,
+            })
+            stagnation_level = sig.level
+            stagnation_note = sig.note
+            if sig.stuck:
+                logger.warning("🔁 STAGNATION (level %d): %s", sig.level,
+                               "; ".join(sig.reasons))
+    except Exception as e:
+        logger.debug("Stagnation check skipped (non-fatal): %s", e)
+
     return {
         "current_url": current_url,
         "dom_markdown": dom_markdown,
@@ -258,6 +305,9 @@ async def perceive_node(state: BrainState) -> dict:
         "page_fsm": "READY",
         "same_url_streak": same_url_streak,
         "last_url_for_streak": current_url,
+        # V29 stagnation signals (read by the guidance bus next worker step)
+        "stagnation_level": stagnation_level,
+        "stagnation_note": stagnation_note,
         # Pre-computed renders (avoids re-computing in workers)
         "plan_render": plan_render,
         "facts_render": facts_render,
@@ -297,6 +347,7 @@ async def navigator_worker(state: BrainState) -> dict:
         state.model_dump(), prompt,
         _WORKER_CHAIN or _FAILOVER_CHAIN, _BREAKER, _HEALTH_TRACKER, _INVOKE_FN,
         vision_chain=_VISION_CHAIN,
+        dreamer=_DREAMER,
     )
 
 
@@ -313,6 +364,7 @@ async def interactor_worker(state: BrainState) -> dict:
         state.model_dump(), prompt,
         _WORKER_CHAIN or _FAILOVER_CHAIN, _BREAKER, _HEALTH_TRACKER, _INVOKE_FN,
         vision_chain=_VISION_CHAIN,
+        dreamer=_DREAMER,
     )
 
 
@@ -329,6 +381,7 @@ async def extractor_worker(state: BrainState) -> dict:
         state.model_dump(), prompt,
         _WORKER_CHAIN or _FAILOVER_CHAIN, _BREAKER, _HEALTH_TRACKER, _INVOKE_FN,
         vision_chain=_VISION_CHAIN,
+        dreamer=_DREAMER,
     )
 
 
@@ -917,6 +970,26 @@ async def run_brain(objective: str, headless: bool = False):
     logger.info("🎯 [%s mode] Worker chain (%d top models): %s",
                 registry.mode, len(_WORKER_CHAIN),
                 " → ".join(registry.get_worker_chain_names()))
+
+    # ── V29 Cognitive Overhaul — log the active feature switches (auditability) ──
+    try:
+        from feature_flags import active_flags, v29_enabled
+        flags = active_flags()
+        if v29_enabled():
+            on = [k for k, v in flags.items() if v and k != "V29_ENABLED"]
+            logger.info("🧬 V29 Cognitive Overhaul ACTIVE — %s", ", ".join(on) or "(master only)")
+        else:
+            logger.info("🧬 V29 disabled (V29_ENABLED=0) — running pure V28 behavior")
+    except Exception as e:
+        logger.debug("V29 flag log skipped (non-fatal): %s", e)
+
+    # Clear any durable intent ledger left behind by a previously-crashed run, so a
+    # stale write-ahead record can never contaminate this fresh task's audit trail.
+    try:
+        from intent_journal import resolve_intent
+        resolve_intent()
+    except Exception:
+        pass
 
     # ── V21 Vision chain (for on-demand consults; a11y DOM stays the default) ──
     try:
