@@ -236,22 +236,55 @@ async def mcp_type(
 #  Tool: Scroll
 # ═══════════════════════════════════════════════════════════════════════════════
 
-async def mcp_scroll(pixels: int = 600) -> dict:
-    """Scroll the page down by a given number of pixels.
+_SCROLL_METRICS_JS = """
+() => {
+  const se = document.scrollingElement || document.documentElement || document.body;
+  return {
+    y: Math.round(window.scrollY || (se && se.scrollTop) || 0),
+    h: Math.round((se && se.scrollHeight) || (document.body && document.body.scrollHeight) || 0),
+    vh: Math.round(window.innerHeight || (se && se.clientHeight) || 0),
+  };
+}
+"""
 
-    Delegates to: ghost_input.ghost_scroll()
-    Returns: {"success": bool, "error": str}
+
+async def mcp_scroll(pixels: int = 600) -> dict:
+    """Scroll the page down WITH feedback (V29 smart scroll).
+
+    Delegates the humanized scroll to ghost_input.ghost_scroll (FROZEN — unchanged)
+    and only MEASURES the viewport before/after, so the brain knows whether the page
+    actually moved and whether it has reached the bottom. This is what lets the agent
+    stop scrolling into a wall instead of looping.
+
+    Returns: {success, error, scrolled_px, at_bottom, position, page_height, viewport_h}
     """
     page = _get_page()
     try:
+        try:
+            before = await page.evaluate(_SCROLL_METRICS_JS)
+        except Exception:
+            before = {}
         from ghost_input import ghost_scroll
         await asyncio.wait_for(ghost_scroll(page, pixels), timeout=10.0)
-        return {"success": True, "error": ""}
+        try:
+            after = await page.evaluate(_SCROLL_METRICS_JS)
+        except Exception:
+            after = {}
+        by = int(before.get("y", 0) or 0)
+        ay = int(after.get("y", by) or by)
+        ph = int(after.get("h", before.get("h", 0)) or 0)
+        vh = int(after.get("vh", before.get("vh", 0)) or 0)
+        at_bottom = bool(ph and vh and (ay + vh >= ph - 4))
+        return {"success": True, "error": "", "scrolled_px": ay - by,
+                "at_bottom": at_bottom, "position": ay,
+                "page_height": ph, "viewport_h": vh}
     except asyncio.TimeoutError:
-        return {"success": False, "error": "Scroll timed out (10s)"}
+        return {"success": False, "error": "Scroll timed out (10s)",
+                "scrolled_px": 0, "at_bottom": False}
     except Exception as e:
         logger.warning("mcp_scroll failed: %s", e)
-        return {"success": False, "error": str(e)[:200]}
+        return {"success": False, "error": str(e)[:200],
+                "scrolled_px": 0, "at_bottom": False}
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -270,6 +303,81 @@ async def mcp_press_enter() -> dict:
     except Exception as e:
         logger.warning("mcp_press_enter failed: %s", e)
         return {"success": False, "error": str(e)[:200]}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  V29 Phase A — Expanded primitives (hover / select_option / press_key)
+#  Universal handlers reusing existing backends (ghost_move_to, keyboard, __aid).
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def mcp_press_key(key: str) -> dict:
+    """Press a single key or chord (e.g. 'Escape', 'Tab', 'ArrowDown', 'Control+A').
+    Reuses Playwright keyboard. Universal — Playwright validates the key name."""
+    page = _get_page()
+    key = (key or "").strip()
+    if not key or len(key) > 40:
+        return {"success": False, "error": "no/invalid key specified"}
+    try:
+        await page.keyboard.press(key)
+        return {"success": True, "error": ""}
+    except Exception as e:
+        logger.warning("mcp_press_key failed: %s", e)
+        return {"success": False, "error": str(e)[:160]}
+
+
+async def mcp_hover(element_id: str | None = None, x: float = 0, y: float = 0) -> dict:
+    """Hover over an element (reveal menus/tooltips/submenus). Resolves fresh
+    coordinates via the V19 registry, then reuses the humanized ghost_move_to."""
+    page = _get_page()
+    try:
+        if element_id:
+            import dom_parser
+            r = await dom_parser.resolve_element(page, element_id)
+            if r.get("ok"):
+                x, y = float(r["x"]), float(r["y"])
+        from ghost_input import ghost_move_to
+        await ghost_move_to(page, x, y)
+        await asyncio.sleep(0.15)  # let hover-triggered UI settle
+        return {"success": True, "error": ""}
+    except Exception as e:
+        logger.warning("mcp_hover failed: %s", e)
+        return {"success": False, "error": str(e)[:160]}
+
+
+_SELECT_OPTION_JS = r"""
+(args) => {
+  const el = window.__aid && window.__aid[args.id];
+  if (!el) return {ok:false, reason:'no live node for id'};
+  if ((el.tagName||'').toUpperCase() !== 'SELECT') return {ok:false, reason:'not a native select element'};
+  const want = String(args.value||''), wl = want.toLowerCase();
+  let m = null;
+  for (const o of el.options) { if (o.value === want || (o.textContent||'').trim() === want) { m = o; break; } }
+  if (!m) { for (const o of el.options) { if ((o.textContent||'').toLowerCase().includes(wl)) { m = o; break; } } }
+  if (!m) return {ok:false, reason:'option not found: '+want.slice(0,40)};
+  el.value = m.value;
+  el.dispatchEvent(new Event('input', {bubbles:true}));
+  el.dispatchEvent(new Event('change', {bubbles:true}));
+  return {ok:true, selected:(m.textContent||'').trim().slice(0,40)};
+}
+"""
+
+
+async def mcp_select_option(element_id: str | None, value: str) -> dict:
+    """Choose an option in a NATIVE <select> by value or visible text (sets the
+    value + dispatches input/change). Universal: works on any native dropdown via
+    the __aid registry node; returns a clear reason if the target isn't a <select>
+    (so the agent falls back to clicking a custom/ARIA dropdown)."""
+    page = _get_page()
+    if not element_id:
+        return {"success": False, "error": "select_option requires an element_id"}
+    try:
+        res = await page.evaluate(_SELECT_OPTION_JS, {"id": element_id, "value": value or ""})
+        if res.get("ok"):
+            return {"success": True, "selected": res.get("selected", ""), "error": ""}
+        return {"success": False, "error": res.get("reason", "select failed")}
+    except Exception as e:
+        logger.warning("mcp_select_option failed: %s", e)
+        return {"success": False, "error": str(e)[:160]}
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

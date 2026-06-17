@@ -94,7 +94,7 @@ def route_to_worker(state: dict[str, Any]) -> str:
             logger.info("🔀 Router → navigator (verb=%s)", verb)
             return "navigator"
 
-        if verb in ("click", "type", "press_enter"):
+        if verb in ("click", "type", "press_enter", "hover", "select_option", "press_key"):
             logger.info("🔀 Router → interactor (verb=%s)", verb)
             return "interactor"
 

@@ -141,6 +141,7 @@ def build_judge_messages(
     claim: str,
     page_text: str = "",
     verified_subgoals: str = "",
+    bound_target: str = "",
 ) -> list[dict]:
     """Build the judge conversation (pure — unit-testable).
 
@@ -155,6 +156,10 @@ def build_judge_messages(
     """
     user = (
         f"═══ OBJECTIVE ═══\n{objective}\n\n"
+        + (f"═══ 🎯 TARGET FOCUS (the specific item/entity this task is about) ═══\n"
+           f"{bound_target}\nVerify the objective is achieved for THIS specific "
+           f"target — never accept proof that belongs to a similar but DIFFERENT "
+           f"item/element.\n\n" if bound_target else "")
         + (f"═══ PLANNED SUCCESS CRITERIA (done when) ═══\n{success_criteria}\n\n"
            if success_criteria else "")
         + (f"═══ SUB-GOALS ALREADY VERIFIED DURING EXECUTION (trusted proof) ═══\n"
@@ -193,6 +198,7 @@ async def judge_done(
     claim: str = "",
     page_text: str = "",
     verified_subgoals: str = "",
+    bound_target: str = "",
 ) -> DoneVerdict | None:
     """Run the outcome judge. Returns None when no verdict could be obtained
     (caller falls back to the legacy heuristic gate)."""
@@ -204,6 +210,7 @@ async def judge_done(
         objective=objective, success_criteria=success_criteria, url=url,
         dom_markdown=dom_markdown, history_tail=history_tail, claim=claim,
         page_text=page_text, verified_subgoals=verified_subgoals,
+        bound_target=bound_target,
     )
     messages = [SystemMessage(content=raw[0]["content"]),
                 HumanMessage(content=raw[1]["content"])]

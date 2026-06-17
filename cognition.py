@@ -339,17 +339,35 @@ def build_guidance(state: dict[str, Any]) -> str:
 
     Priority (highest first), each mapped to an existing state field set by an
     existing node — we centralize only the READER, never the setters:
+      0. REALITY    — `reality_note` (V29 Overwatch Reality Monitor): the live
+                      screen CONTRADICTED the worker's prediction. This is the most
+                      urgent signal — acting on the assumed (wrong) state is the
+                      "blind execution" failure — so it outranks everything.
       1. WIN/DONE  — `goal_complete_hint` (commit_node win-state / PRM ceiling):
                      acting further is actively harmful (post-action wandering).
+      1.5 STAGNATION — `stagnation_note` (V29 Phase 3): busy but not progressing —
+                     break the loop before it deepens.
       2. REPETITION — `consecutive_identical_actions >= 2`: break loops first.
       3. ESCALATION — `correction_context` (overwatch `_escalate` ladder tactic).
       4. RECOVERY   — `recovery_advice` (rollback advisor).
 
     The abstract PRM-checklist re-injection is deliberately NOT a source here.
     """
+    reality = (state.get("reality_note") or "").strip()
     win = (state.get("goal_complete_hint") or "").strip()
-    if win:
+    if reality:
+        directive = (
+            f"🚨 SCREEN-REALITY MISMATCH: {reality} "
+            "Do NOT repeat or assume your last action worked. Re-read what is "
+            "ACTUALLY on the screen right now and respond to that real state "
+            "(handle the error/redirect/popup, or choose a different element)."
+        )
+
+    elif win:
         directive = win
+
+    elif (state.get("stagnation_note") or "").strip():
+        directive = f"🔁 STAGNATION: {state['stagnation_note'].strip()}"
 
     elif state.get("consecutive_identical_actions", 0) >= 2:
         n = state.get("consecutive_identical_actions", 0) + 1
@@ -435,6 +453,16 @@ def clear_transient() -> dict[str, Any]:
         "correction_context": "",
         "recovery_advice": "",
         "consecutive_identical_actions": 0,
+        # V29: a resolved step clears the reality discrepancy so a stale
+        # "screen mismatch" directive never bleeds into the next sub-task.
+        "reality_status": "",
+        "reality_note": "",
+        # V29 Phase 3: progress was made → wipe the stagnation/loop signals.
+        "stagnation_note": "",
+        "stagnation_level": 0,
+        "scroll_stuck_streak": 0,
+        # V29 Intent Journal: a verified-success step resolves any pending intent.
+        "last_attempted_action": None,
     }
 
 

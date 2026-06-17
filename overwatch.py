@@ -190,18 +190,93 @@ async def overwatch_node(state: dict[str, Any], page, critic, action_verifier=No
         except Exception:
             pass
 
+    # ═══════════════════════════════════════════════════════════════════
+    #  V29 Atomic Intent Journal — WRITE-AHEAD record BEFORE the side-effect.
+    #  If the action times out / crashes mid-execution, this record survives so the
+    #  NEXT decision knows the action was attempted (and may have partially applied)
+    #  and must NOT blindly repeat it. The in-state write rides the node's atomic
+    #  super-step commit; the durable file is written immediately (pre-execution).
+    # ═══════════════════════════════════════════════════════════════════
+    intent_entry = None
+    try:
+        from feature_flags import intent_journal_enabled
+        if intent_journal_enabled():
+            from intent_journal import make_intent, should_journal, persist_intent
+            if should_journal(verb):
+                el_kind = ""
+                if element_id and isinstance(selector_map, dict):
+                    el_kind = (selector_map.get(element_id, {}) or {}).get("kind", "") or ""
+                intent_entry = make_intent(proposed, step_number, element_kind=el_kind)
+                updates["last_attempted_action"] = intent_entry  # survives node return
+                persist_intent(intent_entry)                      # durable, atomic, pre-exec
+                logger.info("📝 Intent journaled (pre-exec): %s [%s] hazard=%s",
+                            intent_entry["verb"], intent_entry.get("element_id") or "",
+                            intent_entry.get("hazard"))
+    except Exception as e:  # noqa: BLE001 — journaling never blocks the action
+        logger.debug("Intent journal write-ahead skipped (non-fatal): %s", e)
+
     # Execute the action via MCP tools
     action_outcome = await _execute_action(proposed, page)
     updates["action_outcome"] = action_outcome
     updates["page_fsm"] = "ACTION_PENDING"
     updates["total_actions"] = state.get("total_actions", 0) + 1
 
+    # Stamp the journal with the post-execution status so every downstream return
+    # path (contradiction / ineffective / retry) carries an accurate ledger. The
+    # verified-success path below clears it entirely.
+    if intent_entry is not None:
+        try:
+            from intent_journal import classify_status
+            intent_entry = {**intent_entry, "status": classify_status(action_outcome)}
+            updates["last_attempted_action"] = intent_entry
+        except Exception:  # noqa: BLE001
+            pass
+
+    # ═══════════════════════════════════════════════════════════════════
+    #  V29 Smart-Scroll guard — stop scrolling into a wall (Mandate 3)
+    #  A scroll that doesn't move the page, or that has reached the bottom, is not
+    #  going to reveal the target. Track the streak and escalate a DIFFERENT tactic
+    #  instead of looping the scroll. Flag-gated; off ⇒ identical to V28.
+    # ═══════════════════════════════════════════════════════════════════
+    if verb == "scroll":
+        try:
+            from feature_flags import smart_scroll_enabled
+            if smart_scroll_enabled():
+                ol = action_outcome.lower()
+                unproductive = ("no-op" in ol or "reached page bottom" in ol
+                                or "did not move" in ol)
+                if unproductive:
+                    streak = state.get("scroll_stuck_streak", 0) + 1
+                    updates["scroll_stuck_streak"] = streak
+                    if streak >= 2:
+                        logger.warning("🧭 Smart-scroll: %d unproductive scrolls — the "
+                                       "target isn't reachable by scrolling here; "
+                                       "escalating a different tactic.", streak)
+                        _escalate(state, "Scrolling is not revealing the target "
+                                  "(page at bottom / won't move).", updates)
+                        if updates.get("overwatch_verdict") != "rollback":
+                            updates["overwatch_verdict"] = "retry"
+                        updates["page_fsm"] = "READY"
+                        return updates
+                else:
+                    updates["scroll_stuck_streak"] = 0
+        except Exception as e:  # noqa: BLE001
+            logger.debug("Smart-scroll guard skipped (non-fatal): %s", e)
+
     # Post-action DOM check
+    post_markdown = ""
+    post_url = state.get("current_url", "")
     try:
         import dom_parser
         from cognitive_core import dom_data_to_a11y_format
         post_dom = await dom_parser.extract(page, timeout=3.0)
         post_a11y = dom_data_to_a11y_format(post_dom)
+        # V29 Reality Monitor inputs (free — we already extracted the post DOM).
+        post_markdown = post_dom.get("markdown", "") or ""
+        try:
+            post_url = page.url or post_url
+        except Exception:
+            pass
     except Exception:
         post_a11y = None
 
@@ -216,6 +291,80 @@ async def overwatch_node(state: dict[str, Any], page, critic, action_verifier=No
         target_name=proposed.get("text", "")[:30] if proposed.get("text") else proposed.get("target_name", ""),
         a11y_data_after=post_a11y,
     )
+    # V29 Phase A: surface the unified state-change score (CriticV12 diffing).
+    updates["state_change_score"] = float(getattr(verdict, "state_change_score", 0.0) or 0.0)
+
+    # ═══════════════════════════════════════════════════════════════════
+    #  V29 Reality Monitor — did the page do what the worker PREDICTED?
+    #  CriticV12 above only answers "did *anything* change?". This compares the
+    #  worker's pre-committed `expected_change` against the LIVE screen. A
+    #  CONTRADICTED screen (error / rejection / wrong redirect / out-of-stock)
+    #  must NOT be committed as progress just because the DOM mutated — that is
+    #  exactly the "blind execution" failure. We block it, note the discrepancy,
+    #  and feed it back to the worker (via the guidance bus) to re-evaluate.
+    #  Fully additive + flag-gated (V29_REALITY) — off ⇒ identical to V28.
+    # ═══════════════════════════════════════════════════════════════════
+    try:
+        from feature_flags import reality_enabled, reality_llm_enabled
+        if reality_enabled() and verb in ("click", "type", "press_enter"):
+            from reality import (classify_reality, reconcile_with_llm,
+                                 CONTRADICTED, CONFIRMED, UNCLEAR)
+            rv = classify_reality(
+                expected_change=proposed.get("expected_change", "") or "",
+                verb=verb,
+                action_outcome=action_outcome,
+                pre_text=state.get("dom_markdown", "") or "",
+                post_text=post_markdown,
+                pre_url=state.get("current_url", ""),
+                post_url=post_url,
+                critic_success=verdict.success,
+            )
+            # Deterministic-first: spend a cheap LLM call ONLY on ambiguous deltas.
+            if (rv.status == UNCLEAR and reality_llm_enabled()
+                    and _JUDGE_CHAIN and _JUDGE_INVOKE_FN):
+                rv = await reconcile_with_llm(
+                    _JUDGE_INVOKE_FN, _JUDGE_CHAIN, _JUDGE_BREAKER, _JUDGE_HEALTH,
+                    objective=state.get("objective", ""),
+                    expected_change=proposed.get("expected_change", "") or "",
+                    action_outcome=action_outcome,
+                    post_text=post_markdown,
+                    fallback=rv,
+                )
+            updates["reality_status"] = rv.status
+
+            if rv.status == CONTRADICTED:
+                logger.warning("🚨 Overwatch REALITY: screen contradicts the "
+                               "prediction — %s", rv.note[:160])
+                # Temporal self-questioning + target lock: a contradiction on the
+                # bound target must NOT cause a drift to a neighboring look-alike.
+                note = rv.note[:300]
+                bt = (state.get("bound_target") or "").strip()
+                if bt:
+                    note = (note + f" Your bound target is: {bt[:90]}. Do NOT now act "
+                            "on a similar control for a DIFFERENT or neighboring item "
+                            "— that abandons the goal. Re-examine YOUR target, or halt "
+                            "and let the ensemble vote.")
+                updates["reality_note"] = note[:500]
+                updates["critic_no_progress"] = state.get("critic_no_progress", 0) + 1
+                if verb in ("click", "type"):
+                    updates["ineffective_streak"] = state.get("ineffective_streak", 0) + 1
+                updates["reflexion_triggers"] = state.get("reflexion_triggers", 0) + 1
+                # Escalate a DISTINCT tactic and re-evaluate the real screen.
+                _escalate(state,
+                          "The screen did NOT do what the action predicted.",
+                          updates)
+                if updates.get("overwatch_verdict") != "rollback":
+                    updates["overwatch_verdict"] = "retry"
+                return updates
+
+            if rv.status == CONFIRMED:
+                # Positive reconciliation — clear any stale discrepancy note.
+                updates["reality_note"] = ""
+                if rv.note:
+                    logger.info("✅ Overwatch REALITY: prediction confirmed — %s",
+                                rv.note[:120])
+    except Exception as e:  # noqa: BLE001 — reality monitor never breaks the step
+        logger.debug("Reality monitor skipped (non-fatal): %s", e)
 
     if verdict.success:
         updates["correction_failures"] = 0
@@ -271,6 +420,16 @@ async def overwatch_node(state: dict[str, Any], page, critic, action_verifier=No
     updates["overwatch_verdict"] = "pass"
     updates["page_fsm"] = "VALIDATED"
     updates["loop_signatures"] = [sig]
+
+    # V29: the action is VERIFIED-effective → resolve the intent journal. There is
+    # no ambiguity to carry forward, so the next decision starts with a clean slate.
+    if intent_entry is not None:
+        updates["last_attempted_action"] = None
+        try:
+            from intent_journal import resolve_intent
+            resolve_intent()
+        except Exception:  # noqa: BLE001
+            pass
 
     # Record step in history
     history_entry = {
@@ -395,6 +554,7 @@ async def final_outcome_audit(state: dict, page) -> tuple[bool, str]:
         claim="(none — the agent shut down without declaring done)",
         page_text=page_text,
         verified_subgoals=_render_verified_subgoals(state),
+        bound_target=state.get("bound_target", ""),
     )
     if verdict is None:
         return False, "unverifiable (judge offline)"
@@ -463,6 +623,7 @@ async def _layer_4_cove_check(state: dict, page, updates: dict) -> dict:
         claim=claim,
         page_text=page_text,
         verified_subgoals=_render_verified_subgoals(state),
+        bound_target=state.get("bound_target", ""),
     )
 
     if verdict is not None:
@@ -508,9 +669,30 @@ async def _layer_4_cove_check(state: dict, page, updates: dict) -> dict:
 #  Action Executor — delegates to MCP tools
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _fmt_fail(clean: bool, verb: str, legacy_prefix: str, error: str) -> str:
+    """Failure outcome: clean semantic FailureClass when hybrid feedback is on, else
+    the legacy string. Both preserve the raw error so downstream detectors work."""
+    if not clean:
+        return f"→ {legacy_prefix}: {error}"
+    from action_feedback import classify_failure, render_failure
+    return render_failure(classify_failure(verb, error), error)
+
+
 async def _execute_action(proposed: dict, page) -> str:
-    """Execute a proposed action via MCP tools. Returns outcome string."""
+    """Execute a proposed action via MCP tools. Returns an outcome string.
+
+    V29 Phase A: asymmetric verbosity — terse on success (observable effect only,
+    no internal strategy name), semantic FailureClass on failure — gated by
+    `hybrid_primitives_enabled`. Plus expanded primitives (hover/select_option/
+    press_key). Success keeps the "→ OK" prefix and failures keep the raw error so
+    the win-state / Reality / Intent-Journal detectors are unaffected.
+    """
     verb = proposed.get("verb", "wait")
+    try:
+        from feature_flags import hybrid_primitives_enabled
+        clean = hybrid_primitives_enabled()
+    except Exception:
+        clean = False
 
     try:
         if verb == "goto":
@@ -518,7 +700,7 @@ async def _execute_action(proposed: dict, page) -> str:
             result = await mcp_navigate(proposed.get("url", ""))
             if result["success"]:
                 return f"→ OK (navigated to {result['url'][:60]})"
-            return f"→ FAILED: {result['error']}"
+            return _fmt_fail(clean, verb, "FAILED", result["error"])
 
         elif verb == "click":
             from mcp_tools import mcp_click
@@ -528,12 +710,17 @@ async def _execute_action(proposed: dict, page) -> str:
                 element_id=proposed.get("element_id"),
             )
             if result["success"]:
-                return (
-                    f"→ OK (click via {result['strategy']}"
-                    f"{',' + ' navigated' if result['navigated'] else ''}"
-                    f"{',' + ' DOM changed' if result['dom_changed'] else ''})"
-                )
-            return f"→ CLICK INEFFECTIVE: {result['error']}"
+                bits = []
+                if result.get("navigated"):
+                    bits.append("navigated")
+                if result.get("dom_changed"):
+                    bits.append("DOM changed")
+                if clean:  # terse, NO internal strategy name
+                    return "→ OK" + (f" ({', '.join(bits)})" if bits else "")
+                return (f"→ OK (click via {result['strategy']}"
+                        f"{',' + ' navigated' if result['navigated'] else ''}"
+                        f"{',' + ' DOM changed' if result['dom_changed'] else ''})")
+            return _fmt_fail(clean, verb, "CLICK INEFFECTIVE", result["error"])
 
         elif verb == "type":
             from mcp_tools import mcp_type
@@ -544,18 +731,45 @@ async def _execute_action(proposed: dict, page) -> str:
                 element_id=proposed.get("element_id"),
             )
             if result["success"]:
+                if clean:
+                    return f"→ OK (typed {result['actual_length']} chars)"
                 return f"→ OK (typed {result['actual_length']} chars via {result['strategy']})"
-            return f"→ TYPE FAILED: {result['error']}"
+            return _fmt_fail(clean, verb, "TYPE FAILED", result["error"])
 
         elif verb == "scroll":
             from mcp_tools import mcp_scroll
             result = await mcp_scroll(600)
-            return "→ OK" if result["success"] else f"→ FAILED: {result['error']}"
+            if not result["success"]:
+                return _fmt_fail(clean, verb, "FAILED", result["error"])
+            moved = int(result.get("scrolled_px", 0) or 0)
+            if abs(moved) < 5:
+                return "→ NO-OP (page did not move — already at bottom or unscrollable)"
+            if result.get("at_bottom"):
+                return f"→ OK (scrolled {moved}px, reached page bottom)"
+            return f"→ OK (scrolled {moved}px)"
 
         elif verb == "press_enter":
             from mcp_tools import mcp_press_enter
             result = await mcp_press_enter()
-            return "→ OK" if result["success"] else f"→ FAILED: {result['error']}"
+            return "→ OK" if result["success"] else _fmt_fail(clean, verb, "FAILED", result["error"])
+
+        elif verb == "hover":
+            from mcp_tools import mcp_hover
+            result = await mcp_hover(element_id=proposed.get("element_id"),
+                                     x=proposed.get("x", 0), y=proposed.get("y", 0))
+            return "→ OK (hovered)" if result["success"] else _fmt_fail(clean, verb, "HOVER FAILED", result["error"])
+
+        elif verb == "select_option":
+            from mcp_tools import mcp_select_option
+            result = await mcp_select_option(proposed.get("element_id"), proposed.get("text", "") or "")
+            if result["success"]:
+                return f"→ OK (selected '{result.get('selected', '')}')"
+            return _fmt_fail(clean, verb, "SELECT FAILED", result["error"])
+
+        elif verb == "press_key":
+            from mcp_tools import mcp_press_key
+            result = await mcp_press_key(proposed.get("text", "") or proposed.get("key", ""))
+            return "→ OK" if result["success"] else _fmt_fail(clean, verb, "FAILED", result["error"])
 
         elif verb == "wait":
             from mcp_tools import mcp_wait

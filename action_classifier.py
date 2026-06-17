@@ -92,6 +92,7 @@ _ALWAYS_REVERSIBLE_ACTIONS: frozenset[str] = frozenset({
     "scroll",
     "wait",
     "done",
+    "hover",   # V29: pointer move only — never mutates state
 })
 
 # Element kinds that are generally navigational (and therefore safer).

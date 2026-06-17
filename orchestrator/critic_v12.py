@@ -45,7 +45,7 @@ class Verdict:
     __slots__ = (
         "success", "reason", "confidence",
         "url_changed", "semantic_changed", "element_delta",
-        "circuit_breaker_triggered",
+        "circuit_breaker_triggered", "state_change_score",
     )
 
     def __init__(
@@ -57,6 +57,7 @@ class Verdict:
         semantic_changed: bool = False,
         element_delta: int = 0,
         circuit_breaker_triggered: bool = False,
+        state_change_score: float = 0.0,
     ):
         self.success = success
         self.reason = reason
@@ -65,6 +66,8 @@ class Verdict:
         self.semantic_changed = semantic_changed
         self.element_delta = element_delta
         self.circuit_breaker_triggered = circuit_breaker_triggered
+        # V29 Diffing: unified [0,1] "how much did the page state change" signal.
+        self.state_change_score = state_change_score
 
     def __repr__(self) -> str:
         icon = "✅" if self.success else ("🛑" if self.circuit_breaker_triggered else "❌")
@@ -141,6 +144,7 @@ class CriticV12:
     def __init__(self, page: Page) -> None:
         self._page = page
         self._prev_state: PageState | None = None
+        self._prev_signals: dict | None = None   # V29 Diffing: page-signal vector
         self._no_progress_streak: int = 0
         self._action_history: deque[ActionFingerprint] = deque(maxlen=self.MAX_ACTION_HISTORY)
         self._total_actions: int = 0
@@ -193,6 +197,22 @@ class CriticV12:
             element_states=element_states,
             title=title,
         )
+
+        # V29 Diffing: capture the pre-action page-signal vector (cheap, gated).
+        self._prev_signals = await self._capture_signals()
+
+    async def _capture_signals(self) -> dict | None:
+        """One cheap page.evaluate → the ~8-number universal page-signal vector.
+        Returns None when diffing is disabled or the eval fails (never raises)."""
+        try:
+            from feature_flags import diffing_enabled
+            if not diffing_enabled():
+                return None
+            from dom_diff import PAGE_SIGNAL_JS
+            return await asyncio.wait_for(self._page.evaluate(PAGE_SIGNAL_JS), timeout=2.0)
+        except Exception as e:  # noqa: BLE001 — diffing never breaks the verdict
+            logger.debug("page-signal capture skipped: %s", e)
+            return None
 
     # ── Post-Action Evaluation ────────────────────────────────────────────
 
@@ -368,6 +388,27 @@ class CriticV12:
                 semantic_changed=semantic_changed,
             )
 
+        # ── V29 Diffing: fold subtle overlay/panel/focus changes into the signals.
+        #    A click that opens a small overlay using existing nodes (so element_delta
+        #    ≈ 0) used to read as "no progress" → stagnation loop. The page-signal
+        #    vector catches it. The diff stays in code; only this one phrase reaches
+        #    the LLM. Computes the unified state_change_score either way.
+        sc_score = 0.0
+        try:
+            from dom_diff import signal_vector_diff, state_change_score, progress_phrase
+            post_signals = await self._capture_signals()
+            vector = signal_vector_diff(self._prev_signals, post_signals)
+            if vector.get("meaningful") and not progress_signals:
+                phrase = progress_phrase(vector)
+                if phrase:
+                    progress_signals.append(phrase)
+            sc_score = state_change_score(
+                url_changed=url_changed, semantic_changed=semantic_changed,
+                element_delta=element_delta, new_count=len(new_elements),
+                disappeared_count=len(disappeared_elements), vector=vector)
+        except Exception as e:  # noqa: BLE001 — diffing never breaks the verdict
+            logger.debug("diffing fold skipped: %s", e)
+
         # ── For click/type/scroll: require actual progress signals ──
         made_progress = len(progress_signals) > 0
 
@@ -381,6 +422,7 @@ class CriticV12:
                 url_changed=url_changed,
                 semantic_changed=semantic_changed,
                 element_delta=element_delta,
+                state_change_score=sc_score,
             )
 
         # ── NO PROGRESS DETECTED ──
@@ -406,6 +448,7 @@ class CriticV12:
             url_changed=False,
             semantic_changed=False,
             element_delta=element_delta,
+            state_change_score=sc_score,
         )
 
     # ── Internal: Verdict Construction + Circuit Breaker ──────────────────
@@ -419,6 +462,7 @@ class CriticV12:
         url_changed: bool = False,
         semantic_changed: bool = False,
         element_delta: int = 0,
+        state_change_score: float = 0.0,
     ) -> Verdict:
         """Build a Verdict and update the circuit breaker state."""
 
@@ -449,6 +493,7 @@ class CriticV12:
             semantic_changed=semantic_changed,
             element_delta=element_delta,
             circuit_breaker_triggered=circuit_breaker,
+            state_change_score=state_change_score,
         )
 
     # ── Diagnostics ───────────────────────────────────────────────────────

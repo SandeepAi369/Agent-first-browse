@@ -30,7 +30,10 @@ from pydantic import BaseModel, Field
 class ProposedAction(BaseModel):
     """An action proposed by a worker node. Never committed until Overwatch validates."""
 
-    verb: Literal["goto", "click", "type", "scroll", "press_enter", "wait", "done"] = "wait"
+    verb: Literal[
+        "goto", "click", "type", "scroll", "press_enter", "wait", "done",
+        "hover", "select_option", "press_key",
+    ] = "wait"
     element_id: str | None = None
     target_name: str = ""
     text: str | None = None
@@ -157,6 +160,37 @@ class BrainState(BaseModel):
     vision_consults: int = 0       # per-task budget counter
     force_vision: bool = False     # set by the ladder's vision rung; consumed next step
     ineffective_streak: int = 0    # consecutive ineffective click/type on same target
+
+    # ── V29 Reality Monitor (Phase 1) — screen-reality reconciliation ──
+    # Written ONLY by Overwatch after executing an action. `reality_status` is
+    # observational; `reality_note` carries a CONTRADICTED discrepancy back to the
+    # worker via the guidance bus so the agent re-evaluates the REAL screen instead
+    # of blindly proceeding. Cleared on a successful commit (clear_transient).
+    reality_status: str = ""   # "" | CONFIRMED | CONTRADICTED | UNCLEAR | NULL
+    reality_note: str = ""     # discrepancy fed to the guidance bus on contradiction
+
+    # ── V29 Phase A — unified DOM-diff state-change signal (written by Overwatch
+    # from CriticV12). 0..1: how much the page state changed after the last action.
+    state_change_score: float = 0.0
+
+    # ── V29 Phase B — WebDreamer (predictive simulation) diagnostics ──
+    webdreamer_runs: int = 0       # times the dreamer simulated before acting
+    webdreamer_overrides: int = 0  # times its imagined best replaced the worker pick
+
+    # ── V29 Phase 2/3 — Clarity Gate, Target Lock, Stagnation, Smart Scroll ──
+    # bound_target: the semantic identity of the current sub-task's target (written
+    # by perceive_node). stagnation_*: written by perceive_node. scroll_stuck_streak:
+    # written by overwatch when a scroll yields no new content / no movement.
+    bound_target: str = ""             # human-readable focus (target_lock phrase)
+    stagnation_level: int = 0          # 0..3 progress-signals fired
+    stagnation_note: str = ""          # guidance-bus directive when stuck
+    scroll_stuck_streak: int = 0       # consecutive unproductive scrolls
+
+    # ── V29 Atomic Intent Journal — write-ahead record of a side-effecting action.
+    # Written by Overwatch BEFORE execution; cleared on a confirmed success. While
+    # set (action timed out / unconfirmed), the next worker decision is warned not
+    # to blindly repeat it — fixes handoff-amnesia double-toggling.
+    last_attempted_action: dict | None = None
 
     # ── Session Results ──
     mission_success: bool = False

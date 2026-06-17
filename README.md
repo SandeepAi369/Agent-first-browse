@@ -5,7 +5,8 @@
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://python.org)
 [![LangGraph](https://img.shields.io/badge/langgraph-1.x-orange.svg)](https://langchain-ai.github.io/langgraph/)
 [![Playwright](https://img.shields.io/badge/playwright-1.55%2B-green.svg)](https://playwright.dev/python/)
-[![Status](https://img.shields.io/badge/status-private%20preview-red.svg)](#project-status)
+[![Status](https://img.shields.io/badge/status-active%20preview-orange.svg)](#project-status)
+[![License: GPLv3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 
 ---
 
@@ -224,6 +225,35 @@ CEREBRAS_MODEL=gpt-oss-120b
 GEMINI_TEXT_MODEL=gemma-4-31b-it
 ```
 
+#### ⭐ Recommended setup — two keys per provider (rate-limit resilience)
+
+The agent **rotates across keys** and fails over automatically, so providing **two keys for each provider**
+keeps it running smoothly when one hits a free-tier rate limit. A solid, fully-free configuration:
+
+```dotenv
+# 2× Groq  — primary worker (gpt-oss-120b: fast + accurate)
+GROQ_API_KEY=gsk_key1,gsk_key2
+
+# 2× NVIDIA NIM — secondary (gpt-oss-120b / gpt-oss-20b)
+NVIDIA_NIM_API_KEY=nvapi-key1
+NVIDIA_NIM_API_KEYS=nvapi-key2
+
+# 2× Google Gemini — fallback (Gemma 4 31B; generous free daily quota)
+GEMINI_API_KEY=AIza-key1
+GEMINI_API_KEY_FALLBACKS=AIza-key2
+GEMINI_TEXT_MODEL=gemma-4-31b-it
+```
+
+> 💡 **Get the two keys per provider from different accounts/projects.** Free-tier quotas are billed
+> **per project**, so two keys from the same project don't add capacity. `gpt-oss-120b` (Groq/NVIDIA) is the
+> proven worker; `gemma-4-31b-it` via Gemini is the validated free fallback.
+
+> ⚠️ **A note on API keys & speed.** If your keys are valid and not rate-limited, the agent runs at
+> **100% capability and full speed — the best value.** If a key is missing, invalid, or hitting its rate
+> limit, the agent does **not** fail — it transparently fails over to the next key/provider, so a task may
+> just run **slightly slower** while it juggles limits. For the smoothest experience, keep at least one
+> healthy key per provider (two is better).
+
 ### Vision Models (Optional)
 
 Vision is **entirely optional** — used only for on-demand visual confirmation. Defaults to the Llama 4 family (Scout on Groq, Maverick on NVIDIA).
@@ -286,6 +316,33 @@ Agent First Browse is in **active private preview**. The core architecture — c
 
 ---
 
+## Acknowledgements & Credits
+
+Agent First Browse stands on the shoulders of outstanding open-source work and research. Deep thanks to:
+
+- **[LangGraph](https://github.com/langchain-ai/langgraph)** & **[LangChain](https://github.com/langchain-ai/langchain)** — the stateful graph that forms the orchestration spine of the cognitive brain.
+- **[Playwright](https://playwright.dev/python/)** — the browser-automation engine (CDP, trusted OS-level input).
+- **[Pydantic](https://github.com/pydantic/pydantic)** — typed global state and strict structured-output schemas.
+- **Browser-agent projects we studied and learned from** (concepts assimilated and re-implemented cleanly, never copied): **[browser-use](https://github.com/browser-use/browser-use)** (DOM pruning, viewport filtering, CDP event-listener detection), **[Stagehand](https://github.com/browserbase/stagehand)** (act/observe/extract action abstraction), **Skyvern** (multi-signal element identification), **Crawl4AI** (markdown compression), **BrowserGym** (stable element IDs), and **Agent-E** (text-DOM-first navigation).
+- **Research that shaped the cognitive layers** (cited inline across the modules): WebDreamer (model-based planning), LATS — Language Agent Tree Search, Reflexion, CISC / self-consistency, Self-Grounded Verification, PABU, Prune4Web, and the MAST / Six-Sigma-Agent reliability analyses.
+- **Model providers** for fast, accessible inference: **[Groq](https://groq.com)**, **[NVIDIA NIM](https://build.nvidia.com)**, **[Google Gemini](https://ai.google.dev)**, and **Cerebras**.
+
+If your project or work is reflected here and you'd like different or additional attribution, please open an issue — credit is gladly given.
+
 ## License
 
-Licensing terms are **being finalized** and are intentionally not yet specified. The repository is **private** for now; a license will be added prior to any public release. _License details to be updated._
+Licensed under the **GNU General Public License v3.0 (GPLv3)** — see [LICENSE](LICENSE) for the full text.
+
+You are free to use, study, share, and modify this software under the terms of the GPLv3; derivative works
+and redistributions must remain licensed under GPLv3 and keep this notice. The software is provided **"as is",
+without warranty of any kind**, express or implied.
+
+```
+Agent First Browse — an autonomous, vision-capable browser agent.
+Copyright (C) 2026  SandeepAi369
+
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU General Public License as published by the Free Software
+Foundation, either version 3 of the License, or (at your option) any later version.
+This program is distributed WITHOUT ANY WARRANTY; see the GNU GPL v3 for details.
+```
