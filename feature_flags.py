@@ -73,6 +73,13 @@ def intent_journal_enabled() -> bool:
     return v29_enabled() and _flag("V29_INTENT_JOURNAL", True)
 
 
+def subgoal_lock_enabled() -> bool:
+    """Sub-Goal Lock: a verified-complete sub-goal stays LOCKED even when the
+    Outcome Judge globally rejects a premature 'done' — so the agent never re-does
+    a finished sub-goal (the multi-part 'amnesia loop' fix)."""
+    return v29_enabled() and _flag("V29_SUBGOAL_LOCK", True)
+
+
 # ── Phase 3 — Progress-Aware Loops & Smart Scrolling (Mandate 3) ────────────────
 def stagnation_enabled() -> bool:
     """Revive the dead `same_url_streak` into a generalized stagnation detector."""
@@ -152,6 +159,7 @@ def active_flags() -> dict[str, bool]:
         "V29_CLARITY_CONSENSUS": clarity_consensus_enabled(),
         "V29_TARGET_LOCK": target_lock_enabled(),
         "V29_INTENT_JOURNAL": intent_journal_enabled(),
+        "V29_SUBGOAL_LOCK": subgoal_lock_enabled(),
         "V29_STAGNATION": stagnation_enabled(),
         "V29_SMART_SCROLL": smart_scroll_enabled(),
         "V29_PAGE_CONTEXT": page_context_enabled(),
