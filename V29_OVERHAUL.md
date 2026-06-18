@@ -22,6 +22,7 @@ All flags live in [`feature_flags.py`](feature_flags.py). Defaults **ON**; read 
 | `V29_CLARITY_CONSENSUS` | on | Broaden pre-action consensus to any low-clarity step | 2 ✅ |
 | `V29_TARGET_LOCK` | on | Strict goal-binding + distractor resistance + temporal self-check | 2 ✅ |
 | `V29_INTENT_JOURNAL` | on | Write-ahead action ledger + handoff hesitation (anti double-toggle) | 2.5 ✅ |
+| `V29_SUBGOAL_LOCK` | on | Lock verified sub-goals across a global 'done' rejection (anti amnesia-loop) | 2.7 ✅ |
 | `V29_STAGNATION` | on | Revived `same_url_streak` → generalized stagnation detector | 3 ✅ |
 | `V29_SMART_SCROLL` | on | Scroll with feedback (delta / at-bottom / new-content) | 3 ✅ |
 | `V29_PAGE_CONTEXT` | on | Page archetype + instruction-aware DOM re-rank | 4 ⏳ |
@@ -283,6 +284,29 @@ penalize ONLY unproductive scroll (`scroll_stuck_streak`) so infinite feeds are 
 = one kwarg (`situation=state`); Overwatch/registry untouched. **Tests:** [test_phase_b_v29.py](test_phase_b_v29.py)
 — 16, incl. the 4 universal situations (reveal / infinite-scroll / SPA / desperation-goto) as real selection
 flips + flag-off parity. **Full suite: 220 passed.**
+
+## 6.95 Sub-Goal Lock — the "amnesia loop" fix  ✅ DONE
+
+**Bug:** on "Do X and Do Y", the agent finishes Y, prematurely says 'done', the Outcome Judge rejects
+globally ("missing X"), and — because the rejection was binary/missing-only and the worker is blind to the
+PRM ledger — the agent **re-does Y** (its button is still visible). **Audit finding:** the sticky PRM ledger
+(verified+evidence, V26) already LOCKS Y and survives the rejection — it just never *drives* the worker. So
+the fix activates existing memory rather than building a new one (no competing decomposition → no V26 regression).
+
+[`subgoal_lock.py`](subgoal_lock.py) (pure, reuses the Target-Lock tokenizer), 4 layers:
+- **L1 ledger** = the existing sticky `prm_checklist` (verified ⇒ locked/immutable).
+- **L2 partial-success rejection** ([overwatch.py](overwatch.py) L4): `compose_rejection` re-affirms locked-done
+  (Y) + names only what remains (X) — instead of a global "False" — and `reconcile_plan_with_ledger` marks the
+  locked sub-goal's plan step done + activates the remainder.
+- **L3 worker lock-list** ([base_worker.py](workers/base_worker.py)): a FORBID block ("already done — never repeat")
+  from the ledger injected into the worker prompt — connects the ledger to the decision (the missing link);
+  it forbids, never adds pending focus, so it's complementary to `plan_steps`.
+- **L4 deterministic backstop**: fires ONLY in the post-rejection danger zone (`done_blocked > 0`); a proposed
+  RE-DO of a locked sub-goal (≥2 shared identity tokens, state-changing verb) is held (wait) + redirected to the
+  remaining work. Distinct remaining actions are never falsely blocked.
+
+Flag `V29_SUBGOAL_LOCK`; termination guarantee (`MAX_DONE_BLOCKS`) intact. **Tests:**
+[test_subgoal_lock_v29.py](test_subgoal_lock_v29.py) — 7. **Full suite: 227 passed.**
 
 ## 7. Next (not yet built)
 

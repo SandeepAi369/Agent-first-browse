@@ -633,10 +633,30 @@ async def _layer_4_cove_check(state: dict, page, updates: dict) -> dict:
             updates["mission_success"] = True
             updates["done_evidence"] = verdict.evidence[:300]
             return updates
+        # V29 Sub-Goal Lock: a global rejection must NOT erase verified sub-goals.
+        # Re-affirm the locked-done work + name only what REMAINS (Partial Success),
+        # and align the plan to the ledger — instead of a bare "missing X" that makes
+        # the agent re-do an already-finished sub-goal (the amnesia loop).
+        correction = rejection_feedback(verdict)
+        try:
+            from feature_flags import subgoal_lock_enabled
+            if subgoal_lock_enabled() and state.get("prm_checklist"):
+                from subgoal_lock import compose_rejection, reconcile_plan_with_ledger
+                correction = compose_rejection(verdict.missing, verdict.next_hint,
+                                               state["prm_checklist"])
+                reconciled = reconcile_plan_with_ledger(state.get("plan_steps"),
+                                                        state["prm_checklist"])
+                if reconciled is not None:
+                    updates["plan_steps"] = reconciled
+                    logger.info("🔒 Sub-Goal Lock: plan realigned to the verified ledger "
+                                "(locked sub-goals marked done).")
+        except Exception as e:  # noqa: BLE001 — lock logic never breaks the gate
+            logger.debug("Sub-Goal Lock rejection compose skipped: %s", e)
+
         return _block_done(
             state, updates,
             verdict.missing or "no on-page proof of completion",
-            rejection_feedback(verdict),
+            correction,
         )
 
     # ── Fallback (judge unavailable): legacy heuristic trail-check ──
