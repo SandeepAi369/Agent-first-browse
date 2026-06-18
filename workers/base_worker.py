@@ -204,6 +204,19 @@ async def invoke_worker(
     except Exception as e:  # noqa: BLE001
         logger.debug("Hesitation block skipped (non-fatal): %s", e)
 
+    # ── V29 Sub-Goal Lock: surface the FORBID-list of already-completed (verified)
+    #    sub-goals so the agent never re-does finished work — even after a global
+    #    'done' rejection. This forbids; it adds no pending focus, so it is
+    #    complementary to plan_steps (no competing-checklist regression). ──
+    lock_list_block = ""
+    try:
+        from feature_flags import subgoal_lock_enabled
+        if subgoal_lock_enabled() and state.get("prm_checklist"):
+            from subgoal_lock import render_lock_list
+            lock_list_block = render_lock_list(state.get("prm_checklist"))
+    except Exception as e:  # noqa: BLE001
+        logger.debug("Lock-list block skipped (non-fatal): %s", e)
+
     # Login hint (informational, non-conflicting — not part of the guidance bus)
     login_hint = ""
     if login_detected:
@@ -237,6 +250,7 @@ async def invoke_worker(
         f"{login_hint}\n\n"
         + (f"{guidance_block}\n\n" if guidance_block else "")
         + (f"{hesitation_block}\n\n" if hesitation_block else "")
+        + (f"{lock_list_block}\n\n" if lock_list_block else "")
         + f"═══ ACTION HISTORY (compressed) ═══\n"
         f"{history_compressed or '(first step)'}\n\n"
         f"═══ PAGE STRUCTURE ═══\n"
@@ -536,6 +550,32 @@ async def invoke_worker(
     except Exception as e:  # noqa: BLE001 — simulation never breaks the step
         logger.debug("WebDreamer skipped (non-fatal): %s", e)
 
+    # ── V29 Sub-Goal Lock — deterministic anti-amnesia backstop ──
+    # Fires ONLY in the post-rejection danger zone (a 'done' was just rejected),
+    # so it never interferes with normal multi-step work. If the worker proposes
+    # RE-DOING an already-locked sub-goal, we don't execute it — hold (wait) and
+    # redirect to the remaining work via the guidance bus.
+    subgoal_lock_update: dict[str, Any] = {}
+    try:
+        from feature_flags import subgoal_lock_enabled
+        if (subgoal_lock_enabled() and state.get("done_blocked", 0) > 0
+                and state.get("prm_checklist")):
+            from subgoal_lock import targets_locked_subgoal, remaining_subgoals
+            hit = targets_locked_subgoal(proposed, state.get("prm_checklist"))
+            if hit is not None:
+                rem = remaining_subgoals(state.get("prm_checklist"))
+                rem_str = "; ".join((d.get("desc") or "")[:60] for d in rem[:2]) or "the remaining work"
+                logger.warning("🔒 Sub-Goal Lock: blocked a RE-DO of completed '%s' — "
+                               "redirecting to remaining work.", (hit.get("desc") or "")[:50])
+                proposed = {**proposed, "verb": "wait", "wait_ms": 600,
+                            "risk_level": "REVERSIBLE", "reversible": True}
+                subgoal_lock_update["correction_context"] = (
+                    f"\n\n🔒 STOP — '{(hit.get('desc') or 'that sub-goal')[:60]}' is ALREADY "
+                    f"DONE and LOCKED. Do NOT repeat it (its control may still be visible). "
+                    f"Work ONLY on what remains: {rem_str}.")
+    except Exception as e:  # noqa: BLE001 — backstop never breaks the step
+        logger.debug("Sub-Goal Lock backstop skipped (non-fatal): %s", e)
+
     # ── Action dedup tracking ──
     current_sig = f"{proposed['verb']}:{(proposed.get('text') or 'none')[:30]}"
     last_sig = state.get("last_action_signature", "")
@@ -554,6 +594,7 @@ async def invoke_worker(
         **consensus_update,
         **vision_update,
         **webdreamer_update,
+        **subgoal_lock_update,
     }
 
 
