@@ -152,6 +152,46 @@ async def mcp_click(
                 "error": "",
             }
         else:
+            # ── V32 SAFETY NET: element-id state verification ──────────────
+            # If the coordinate-based Visual Truth Override in cdp_click.py
+            # missed the state change (e.g. elementFromPoint returned the
+            # label instead of the input), use the element_id registry to
+            # check the actual element's state directly.
+            # ───────────────────────────────────────────────────────────────
+            if element_id:
+                try:
+                    state_check = await page.evaluate("""
+                    (eid) => {
+                        const el = document.querySelector(`[__aid="${eid}"]`);
+                        if (!el) return {found: false};
+                        return {
+                            found: true,
+                            checked: !!el.checked,
+                            selected: !!el.selected,
+                            value: (el.value || '').slice(0, 50),
+                            ariaChecked: el.getAttribute('aria-checked') || '',
+                        };
+                    }
+                    """, element_id)
+                    if state_check.get("found") and (
+                        state_check.get("checked") or
+                        state_check.get("ariaChecked") == "true"
+                    ):
+                        logger.info(
+                            "✅ V32 SAFETY NET: click engine reported failure but "
+                            "element %s state is checked=%s. Overriding to success.",
+                            element_id, state_check.get("checked"),
+                        )
+                        return {
+                            "success": True,
+                            "strategy": "element_state_verified",
+                            "navigated": False,
+                            "dom_changed": False,
+                            "error": "",
+                        }
+                except Exception as e:
+                    logger.debug("V32 safety net check failed: %s", e)
+
             return {
                 "success": False,
                 "strategy": "",
@@ -377,6 +417,168 @@ async def mcp_select_option(element_id: str | None, value: str) -> dict:
         return {"success": False, "error": res.get("reason", "select failed")}
     except Exception as e:
         logger.warning("mcp_select_option failed: %s", e)
+        return {"success": False, "error": str(e)[:160]}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  V33: Comprehensive Browser Action Suite — New Primitives
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def mcp_drag_and_drop(
+    element_id: str | None = None,
+    x: float = 0, y: float = 0,
+    target_x: float = 0, target_y: float = 0,
+) -> dict:
+    """Drag from (x, y) to (target_x, target_y) using CDP mouse events.
+
+    Resolves source coordinates from element_id if available.
+    Simulates: mousedown → slow mousemove → mouseup (with humanized Bézier path).
+    Works for sliders, CAPTCHA puzzles, reorder lists, range inputs.
+    """
+    page = _get_page()
+    try:
+        # Resolve source from element registry if available
+        if element_id:
+            import dom_parser
+            r = await dom_parser.resolve_element(page, element_id)
+            if r.get("ok"):
+                x, y = float(r["x"]), float(r["y"])
+
+        if x == 0 and y == 0:
+            return {"success": False, "error": "drag_and_drop requires source coordinates or element_id"}
+        if target_x == 0 and target_y == 0:
+            return {"success": False, "error": "drag_and_drop requires target_x, target_y coordinates"}
+
+        # Humanized move to source
+        from ghost_input import ghost_move_to
+        await ghost_move_to(page, x, y)
+        await asyncio.sleep(0.1)
+
+        # CDP mousedown at source
+        cdp = page.context.browser.contexts[0].pages[0]
+        await cdp.evaluate("""
+        ([x, y]) => {
+            const el = document.elementFromPoint(x, y);
+            if (el) {
+                el.dispatchEvent(new MouseEvent('mousedown', {
+                    bubbles: true, cancelable: true,
+                    clientX: x, clientY: y, button: 0
+                }));
+            }
+        }
+        """, [x, y])
+        await asyncio.sleep(0.15)
+
+        # Humanized move to target (simulates dragging)
+        # Move in steps for dragover events
+        steps = 8
+        for i in range(1, steps + 1):
+            ix = x + (target_x - x) * i / steps
+            iy = y + (target_y - y) * i / steps
+            await page.mouse.move(ix, iy)
+            await asyncio.sleep(0.03)
+
+        # Dispatch dragover/mouseover at target
+        await page.evaluate("""
+        ([x, y]) => {
+            const el = document.elementFromPoint(x, y);
+            if (el) {
+                el.dispatchEvent(new MouseEvent('mouseover', {
+                    bubbles: true, clientX: x, clientY: y
+                }));
+                el.dispatchEvent(new MouseEvent('mousemove', {
+                    bubbles: true, clientX: x, clientY: y
+                }));
+            }
+        }
+        """, [target_x, target_y])
+        await asyncio.sleep(0.1)
+
+        # CDP mouseup at target
+        await page.mouse.up()
+
+        # Also fire drop event for HTML5 drag-and-drop
+        await page.evaluate("""
+        ([x, y]) => {
+            const el = document.elementFromPoint(x, y);
+            if (el) {
+                el.dispatchEvent(new MouseEvent('mouseup', {
+                    bubbles: true, cancelable: true,
+                    clientX: x, clientY: y, button: 0
+                }));
+            }
+        }
+        """, [target_x, target_y])
+
+        logger.info("✅ drag_and_drop: (%.0f,%.0f) → (%.0f,%.0f)", x, y, target_x, target_y)
+        return {"success": True, "error": ""}
+    except Exception as e:
+        logger.warning("mcp_drag_and_drop failed: %s", e)
+        return {"success": False, "error": str(e)[:160]}
+
+
+async def mcp_upload_file(element_id: str | None, file_path: str) -> dict:
+    """Upload a file to an <input type='file'> element.
+
+    Uses Playwright's set_input_files() which bypasses the OS file picker.
+    Resolves element via the __aid registry.
+    """
+    page = _get_page()
+    if not element_id:
+        return {"success": False, "error": "upload_file requires an element_id"}
+    if not file_path:
+        return {"success": False, "error": "upload_file requires a file_path"}
+    try:
+        import os
+        if not os.path.exists(file_path):
+            return {"success": False, "error": f"File not found: {file_path[:80]}"}
+
+        # Find the actual input[type=file] element using __aid
+        locator = page.locator(f'[__aid="{element_id}"]')
+        count = await locator.count()
+        if count == 0:
+            # Fallback: try data-eid
+            locator = page.locator(f'[data-eid="{element_id}"]')
+            count = await locator.count()
+        if count == 0:
+            return {"success": False, "error": f"Element {element_id} not found in DOM"}
+
+        await locator.first.set_input_files(file_path)
+        logger.info("✅ upload_file: '%s' → %s", os.path.basename(file_path), element_id)
+        return {"success": True, "error": ""}
+    except Exception as e:
+        logger.warning("mcp_upload_file failed: %s", e)
+        return {"success": False, "error": str(e)[:160]}
+
+
+async def mcp_scroll_directional(direction: str = "down", amount: int = 500) -> dict:
+    """Scroll the page in a specific direction by a given pixel amount.
+
+    Supports: up, down, left, right. Uses page.mouse.wheel() for precision.
+    For carousels, sidebars, infinite scrolls, and targeted navigation.
+    """
+    page = _get_page()
+    direction = (direction or "down").lower().strip()
+    amount = max(50, min(amount or 500, 5000))  # Clamp to [50, 5000]
+
+    direction_map = {
+        "down":  (0,  amount),
+        "up":    (0, -amount),
+        "right": (amount,  0),
+        "left":  (-amount, 0),
+    }
+
+    if direction not in direction_map:
+        return {"success": False, "error": f"Invalid direction '{direction}'. Use: up, down, left, right"}
+
+    try:
+        dx, dy = direction_map[direction]
+        await page.mouse.wheel(dx, dy)
+        await asyncio.sleep(0.3)  # Let scroll settle
+        logger.info("✅ scroll_directional: %s by %dpx", direction, amount)
+        return {"success": True, "error": ""}
+    except Exception as e:
+        logger.warning("mcp_scroll_directional failed: %s", e)
         return {"success": False, "error": str(e)[:160]}
 
 

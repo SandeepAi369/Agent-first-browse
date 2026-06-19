@@ -92,7 +92,8 @@ _ALWAYS_REVERSIBLE_ACTIONS: frozenset[str] = frozenset({
     "scroll",
     "wait",
     "done",
-    "hover",   # V29: pointer move only — never mutates state
+    "hover",      # V29: pointer move only — never mutates state
+    "scroll_to",  # V33: directional scroll — never mutates state
 })
 
 # Element kinds that are generally navigational (and therefore safer).
@@ -285,7 +286,14 @@ def classify_action(
         return ActionRisk.CAUTIOUS
 
     # ------------------------------------------------------------------
-    # 5. Unrecognised action — default to CAUTIOUS
+    # 5. V33: New action types — CAUTIOUS by default (mutate form state)
+    # ------------------------------------------------------------------
+    if action in ("select_option", "press_combo", "drag_and_drop", "upload_file"):
+        logger.debug("V33 action '%s' is CAUTIOUS by default.", action)
+        return ActionRisk.CAUTIOUS
+
+    # ------------------------------------------------------------------
+    # 6. Unrecognised action — default to CAUTIOUS
     # ------------------------------------------------------------------
     logger.warning(
         "Unrecognised action type '%s' — defaulting to CAUTIOUS.",

@@ -9,6 +9,9 @@ All workers share the same pattern:
 
 Workers NEVER execute actions directly. They propose actions that
 Overwatch validates before committing.
+
+V30: Added "Look-Before-You-Leap" coordinate validation for vision-returned
+pixel coordinates (shadow DOM / custom web component targets not in a11y tree).
 """
 
 from __future__ import annotations
@@ -26,6 +29,90 @@ try:
     logger = get_logger("workers")
 except ImportError:
     logger = logging.getLogger("workers")
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  V30: Look-Before-You-Leap Coordinate Validation
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def _validate_coord_click(
+    invoke_fn, vision_chain, breaker, health_tracker,
+    *, x: float, y: float, intended_target: str, objective: str,
+) -> tuple[bool, str]:
+    """Ask Vision to verify what is at (x, y) before clicking.
+
+    This is the "Look-Before-You-Leap" safety net for V30 coordinate fallback.
+    When Vision returns pixel coordinates instead of an element_id (because the
+    target is absent from the a11y tree), we take a SECOND screenshot and ask
+    Vision to confirm that the coordinate actually matches the intended target.
+
+    Returns (valid, reason). Does NOT modify Overwatch — if valid, the action
+    flows to Overwatch with coordinates that pass its grounding check naturally.
+    """
+    if invoke_fn is None or not vision_chain:
+        return False, "no vision chain available"
+
+    from mcp_tools import mcp_screenshot
+    shot = await mcp_screenshot(full_page=False)
+    if not shot.get("ok"):
+        return False, "screenshot failed for coord validation"
+
+    from langchain_core.messages import HumanMessage as _HM, SystemMessage as _SM
+
+    class _CoordValidation(BaseModel):
+        element_at_point: str = Field(
+            description="Describe EXACTLY what visual element/button/link is at the marked coordinate."
+        )
+        matches_target: bool = Field(
+            description="Does the element at the coordinate match the intended target?"
+        )
+        confidence: float = Field(description="0.0-1.0 confidence in the match.")
+        reasoning: str = Field(description="Why this is or is not the right target.")
+
+    vp_w = shot.get("width", 1440)
+    vp_h = shot.get("height", 1080)
+    messages = [
+        _SM(content=(
+            "You are a precision visual validator for a browser automation agent. "
+            "You will be given a screenshot, a coordinate point [x,y], and an "
+            "intended target description. Your ONLY job: look at EXACTLY what is "
+            "at that coordinate on the screenshot and determine if it matches the "
+            "intended target. Be precise — a 'Star' button is NOT the same as a "
+            "'5 stars' text link. A 'Fork' button is NOT the same as a fork count."
+        )),
+        _HM(content=(
+            f"═══ COORDINATE TO VALIDATE ═══\n"
+            f"Point: ({x:.0f}, {y:.0f}) on a {vp_w}×{vp_h} viewport\n\n"
+            f"═══ INTENDED TARGET ═══\n{intended_target}\n\n"
+            f"═══ OBJECTIVE ═══\n{objective}\n\n"
+            f"Look at the screenshot. What EXACTLY is at coordinate "
+            f"({x:.0f}, {y:.0f})? Is it '{intended_target}'?"
+        )),
+    ]
+
+    try:
+        result, _model = await invoke_fn(
+            vision_chain, messages, _CoordValidation,
+            breaker, base64_image=shot["base64"], health_tracker=health_tracker,
+        )
+        if result is None:
+            return False, "vision validation returned None"
+        if result.matches_target and result.confidence >= 0.65:
+            logger.info(
+                "✅ COORD VALIDATED: (%.0f,%.0f) confirmed as '%s' [%.0f%%]",
+                x, y, result.element_at_point[:50], result.confidence * 100,
+            )
+            return True, f"confirmed: {result.element_at_point[:60]}"
+        else:
+            logger.warning(
+                "❌ COORD REJECTED: (%.0f,%.0f) is '%s', not '%s' [%.0f%%]",
+                x, y, result.element_at_point[:50], intended_target[:40],
+                result.confidence * 100,
+            )
+            return False, f"mismatch: found '{result.element_at_point[:60]}'"
+    except Exception as e:
+        logger.warning("coord validation error: %s", str(e)[:120])
+        return False, f"validation error: {str(e)[:80]}"
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  Shared Action Schema (Pydantic structured output)
@@ -101,6 +188,19 @@ class WorkerAction(BaseModel):
     vision_question: str = Field(
         default="",
         description="If needs_vision: the specific thing to resolve by looking (e.g. 'which button is the real Add to Cart?').",
+    )
+    # V31: Worker Veto — proof of completion for done actions
+    proof_of_completion: str = Field(
+        default="",
+        description=(
+            "MANDATORY when action_type='done'. Provide concrete, observed state-change "
+            "evidence that proves the goal is achieved. Cite EXACTLY what you witnessed: "
+            "e.g. 'Cart icon count changed from 0 to 1 after clicking Add to Cart', "
+            "'Button text changed from Star to Unstar', 'Confirmation toast appeared "
+            "saying Thank you for your order', 'Page redirected to order confirmation "
+            "URL'. This is YOUR testimony as the execution witness — the verification "
+            "system will evaluate it. Be specific and factual. Empty for non-done actions."
+        ),
     )
     # V17: Interactive Data Guardrails — stop and ask when personal data is needed
     missing_data: str = Field(
@@ -486,6 +586,39 @@ async def invoke_worker(
             logger.info("👁️→⚡ Vision refined the action → %s [%s]",
                         proposed["verb"], proposed.get("element_id") or "")
 
+            # ── V30 Coordinate Validation: Look-Before-You-Leap ──
+            # When Vision returned raw coordinates (element not in a11y tree),
+            # verify the target via a second vision check before sending to
+            # Overwatch. This ensures coordinate clicks are precise and safe.
+            if (proposed.get("vision_coords")
+                    and proposed.get("x") is not None
+                    and proposed.get("y") is not None):
+                intended = (
+                    (proposed.get("reasoning", "")
+                     .replace("[vision] ", "")[:120])
+                    or proposed.get("target_name", "unknown target")
+                )
+                try:
+                    valid, reason = await _validate_coord_click(
+                        invoke_fn, vision_chain, breaker, health_tracker,
+                        x=proposed["x"], y=proposed["y"],
+                        intended_target=intended, objective=objective,
+                    )
+                    if valid:
+                        logger.info("👁️✅ Coordinate click validated: %s", reason[:80])
+                    else:
+                        logger.warning(
+                            "👁️❌ Coordinate click REJECTED: %s — dropping coords",
+                            reason[:80],
+                        )
+                        proposed["x"] = None
+                        proposed["y"] = None
+                        proposed["vision_coords"] = False
+                except Exception as val_err:  # noqa: BLE001
+                    logger.warning("coord validation failed (non-fatal): %s", val_err)
+                    # On validation failure, keep coords but log the warning —
+                    # better to attempt a click than to loop.
+
     # ══════════════════════════════════════════════════════════════════════
     #  V29 Phase B — WebDreamer: look-before-you-leap on HIGH-STAKES AMBIGUOUS
     #  steps. It IMAGINES (LLM world-model — no real browser action) the outcome
@@ -540,6 +673,22 @@ async def invoke_worker(
                                     "risk_level": win_risk.name,
                                     "reversible": win_risk == ActionRisk.REVERSIBLE,
                                     "reasoning": f"[dreamer] {(best.reasoning or '')[:160]}"}
+                        # V30: Preserve validated vision coordinates through WebDreamer
+                        # override. When WebDreamer's best action has no grounding
+                        # (no element_id, no coords) but the PRIOR proposed action had
+                        # validated vision coordinates, carry them forward. This prevents
+                        # the "bare click" loop where WebDreamer correctly rejects an
+                        # element but loses the coordinate grounding from Vision.
+                        if (not best.element_id and best.x is None and best.y is None
+                                and proposed.get("vision_coords")):
+                            # x/y survive the {**proposed, ...} spread since the
+                            # override dict doesn't set "x" or "y" — but we make
+                            # this explicit for clarity and safety.
+                            logger.info(
+                                "🌙→👁️ WebDreamer inherited validated vision "
+                                "coords (%.0f,%.0f)",
+                                proposed.get("x", 0), proposed.get("y", 0),
+                            )
                         webdreamer_update["webdreamer_overrides"] = state.get("webdreamer_overrides", 0) + 1
                         logger.info("🌙 WebDreamer OVERRIDE → %s", best.describe())
                     else:
@@ -622,7 +771,25 @@ dynamic content to load, and orienting yourself on new pages.
 6. If an action FAILED, do NOT repeat it. Try an alternative.
 7. SCROLL if you can't find the target element.
 8. Use 'wait' (1000-2000ms) after clicks that trigger page loads.
-9. When the goal is FULLY achieved, output action_type='done'.
+9. When the goal is FULLY achieved, output action_type='done' with proof_of_completion.
+
+═══ PROOF OF COMPLETION (CRITICAL) ═══
+When you output action_type='done', you MUST fill proof_of_completion with the
+EXACT state-changes you observed that prove success. Examples:
+  • 'After clicking Add to Cart, the cart badge count changed from 0 to 1'
+  • 'The Star button text changed to Unstar after clicking'
+  • 'Form submitted, page redirected to /thank-you confirmation page'
+This proof is YOUR testimony — be specific and factual about what changed.
+
+═══ HIERARCHY OF TRUTH (V32 — CRITICAL) ═══
+If an action log reports an error (e.g., 'Click Failed', 'Click Ineffective'), but your
+observation of the CURRENT PAGE STATE shows the intended result DID happen (e.g., the
+radio button is now selected, the checkbox is checked, the text is typed, the dropdown
+value changed), YOU MUST TRUST THE VISUAL REALITY. The action succeeded — the error
+log is a false negative from the mechanical click engine.
+DO NOT retry an action that visually succeeded. Ignore the false error, consider the
+step complete, and proceed to the next step in your plan.
+Priority order: Visual Page State > Overwatch Confirmation > Action Engine Logs.
 
 ═══ AVAILABLE ACTIONS ═══
 goto — Navigate to a URL (set url field)
@@ -631,7 +798,13 @@ type — Click then type (set element_id + text; fallback: x, y + text)
 scroll — Scroll down to reveal more content
 press_enter — Press Enter key
 wait — Wait for content to load (set wait_ms)
-done — Goal achieved, stop execution
+select_option — Select dropdown option (set element_id + text for the option value/label)
+hover — Hover over element to reveal menus/tooltips (set element_id; fallback: x, y)
+press_combo — Press key or shortcut (set key_combo like 'Escape', 'Control+A', 'Tab', 'ArrowDown')
+drag_and_drop — Drag from source to target (set x,y for source + target_x,target_y for dest)
+upload_file — Upload file to file input (set element_id + file_path)
+scroll_to — Scroll in direction (set direction: 'up'/'down'/'left'/'right' + scroll_amount in px)
+done — Goal achieved, stop execution (MUST include proof_of_completion)
 
 {skill_context}"""
 
@@ -656,7 +829,7 @@ selecting options, and interacting with UI elements.
 6. If an action FAILED, do NOT repeat it. Try an alternative.
 7. SCROLL if you can't find the target element — it may be below the fold.
 8. Use 'wait' after clicks that trigger page loads.
-9. When the goal is FULLY achieved, output action_type='done'.
+9. When the goal is FULLY achieved, output action_type='done' with proof_of_completion.
 10. When the user provides specific text to type, type it EXACTLY as given.
 11. E-COMMERCE: "Add to Cart"/"Add to Bag" puts an item in the cart. "Buy Now"/
     "Buy at ₹…"/"Place Order" start an IMMEDIATE checkout and are NOT the same —
@@ -668,6 +841,24 @@ selecting options, and interacting with UI elements.
     you DO NOT have (shipping address, payment info, phone number, custom specs),
     output action_type='ask_user' and describe the missing data in 'missing_data'.
     NEVER guess, hallucinate, or fabricate personal information.
+
+═══ PROOF OF COMPLETION (CRITICAL) ═══
+When you output action_type='done', you MUST fill proof_of_completion with the
+EXACT state-changes you observed that prove success. Examples:
+  • 'After clicking Add to Cart, the cart badge count changed from 0 to 1'
+  • 'The Star button text changed to Unstar after clicking'
+  • 'Confirmation toast appeared: Your order has been placed'
+This proof is YOUR testimony — be specific and factual about what changed.
+
+═══ HIERARCHY OF TRUTH (V32 — CRITICAL) ═══
+If an action log reports an error (e.g., 'Click Failed', 'Click Ineffective'), but your
+observation of the CURRENT PAGE STATE shows the intended result DID happen (e.g., the
+radio button is now selected, the checkbox is checked, the text is typed, the dropdown
+value changed), YOU MUST TRUST THE VISUAL REALITY. The action succeeded — the error
+log is a false negative from the mechanical click engine.
+DO NOT retry an action that visually succeeded. Ignore the false error, consider the
+step complete, and proceed to the next step in your plan.
+Priority order: Visual Page State > Overwatch Confirmation > Action Engine Logs.
 
 ═══ CRITICAL COORDINATE RULE ═══
 NEVER guess raw x, y coordinates! You MUST ALWAYS use the element_id (e.g., 'e5')
@@ -686,7 +877,13 @@ type — Click then type (REQUIRED: set element_id + text)
 scroll — Scroll down to reveal more content
 press_enter — Press Enter key
 wait — Wait for content to load (set wait_ms)
-done — Goal achieved, stop execution
+select_option — Select dropdown option (set element_id + text for the option value/label)
+hover — Hover over element to reveal menus/tooltips (set element_id)
+press_combo — Press key or shortcut (set key_combo like 'Escape', 'Control+A', 'Tab', 'ArrowDown')
+drag_and_drop — Drag from source to target (set x,y for source + target_x,target_y for dest)
+upload_file — Upload file to file input (set element_id + file_path)
+scroll_to — Scroll in direction (set direction: 'up'/'down'/'left'/'right' + scroll_amount in px)
+done — Goal achieved, stop execution (MUST include proof_of_completion)
 
 {skill_context}"""
 
@@ -708,7 +905,21 @@ identifying product details, parsing tables, and capturing information.
 4. If data is not visible, SCROLL to find it.
 5. If data is on another page, NAVIGATE there first.
 6. When you find the target data, note it in your reasoning.
-7. When all data is extracted, output action_type='done'.
+7. When all data is extracted, output action_type='done' with proof_of_completion.
+
+═══ PROOF OF COMPLETION (CRITICAL) ═══
+When you output action_type='done', you MUST fill proof_of_completion with the
+EXACT evidence of what you found/extracted. Be specific and factual.
+
+═══ HIERARCHY OF TRUTH (V32 — CRITICAL) ═══
+If an action log reports an error (e.g., 'Click Failed', 'Click Ineffective'), but your
+observation of the CURRENT PAGE STATE shows the intended result DID happen (e.g., the
+radio button is now selected, the checkbox is checked, the text is typed, the dropdown
+value changed), YOU MUST TRUST THE VISUAL REALITY. The action succeeded — the error
+log is a false negative from the mechanical click engine.
+DO NOT retry an action that visually succeeded. Ignore the false error, consider the
+step complete, and proceed to the next step in your plan.
+Priority order: Visual Page State > Overwatch Confirmation > Action Engine Logs.
 
 ═══ AVAILABLE ACTIONS ═══
 goto — Navigate to a URL (set url field)
@@ -717,7 +928,13 @@ type — Type text (set element_id + text)
 scroll — Scroll down to reveal more content
 press_enter — Press Enter key
 wait — Wait for content to load
-done — Goal achieved, stop execution
+select_option — Select dropdown option (set element_id + text for the option value/label)
+hover — Hover over element to reveal menus/tooltips (set element_id; fallback: x, y)
+press_combo — Press key or shortcut (set key_combo like 'Escape', 'Control+A', 'Tab')
+drag_and_drop — Drag from source to target (set x,y + target_x,target_y)
+upload_file — Upload file to file input (set element_id + file_path)
+scroll_to — Scroll in direction (set direction + scroll_amount in px)
+done — Goal achieved, stop execution (MUST include proof_of_completion)
 
 {skill_context}"""
 
@@ -746,7 +963,8 @@ def build_system_prompt(
         "state change IS strong proof. Confirm with the cheapest sufficient signal: "
         "the predicted DOM change; if a small visual change is ambiguous, set "
         "needs_vision; only navigate elsewhere to prove it if you are truly unsure.\n"
-        "• Output action_type='done' as soon as the MASTER GOAL is achieved.\n"
+        "• Output action_type='done' as soon as the MASTER GOAL is achieved. "
+        "ALWAYS fill proof_of_completion with the exact state-changes you observed.\n"
     )
     try:
         from feature_flags import hybrid_primitives_enabled

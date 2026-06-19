@@ -1,4 +1,4 @@
-"""Vision-on-demand — the a11y-DOM ⇄ vision "thinker" toggle (V21).
+"""Vision-on-demand — the a11y-DOM ⇄ vision "thinker" toggle (V21 + V30 coord fallback).
 
 PRINCIPLE (the user's instruction, made literal)
 ═════════════════════════════════════════════════
@@ -14,9 +14,14 @@ enough (`needs_vision`), and the system adds objective safety-net triggers
 gets eyes when it's stuck but hasn't realised it.
 
 The vision model is given the a11y element MAP alongside the screenshot, so its
-answer comes back as a stable `element_id` (resolved via the V19 registry) — not
-brittle pixel coordinates. If vision is unavailable or unsure, we keep the a11y
-decision (strict superset, no regression).
+answer comes back as a stable `element_id` (resolved via the V19 registry).
+
+V30 COORDINATE FALLBACK: when the target element is genuinely absent from the
+a11y tree (shadow DOM, custom web components), Vision may return pixel coordinates
+instead. These coordinates are validated by a second vision check ("Look-Before-
+You-Leap") before being sent to Overwatch, ensuring grounded, safe clicks.
+
+If vision is unavailable or unsure, we keep the a11y decision (no regression).
 """
 
 from __future__ import annotations
@@ -44,7 +49,10 @@ MIN_VISION_CONFIDENCE = 0.55
 
 class VisionVerdict(BaseModel):
     """The vision model's grounded read of the screenshot, mapped back to an
-    action on the labelled a11y elements (stable id, not pixels)."""
+    action on the labelled a11y elements (stable id, not pixels).
+
+    V30: When the target is genuinely absent from the element map (shadow DOM,
+    custom web component), coord_x/coord_y provide pixel-coordinate fallback."""
 
     observation: str = Field(
         description="What the SCREENSHOT actually shows that's relevant to the question."
@@ -59,6 +67,24 @@ class VisionVerdict(BaseModel):
     element_id: str | None = Field(
         default=None,
         description="The element id (e.g. 'e7') from the ELEMENT MAP to act on.",
+    )
+    coord_x: float | None = Field(
+        default=None,
+        description=(
+            "COORDINATE FALLBACK — only when the target is clearly visible on the "
+            "screenshot but genuinely ABSENT from the ELEMENT MAP (e.g. shadow DOM "
+            "button, custom web component). Return the center X pixel coordinate "
+            "of the visual target. Leave null when element_id is provided."
+        ),
+    )
+    coord_y: float | None = Field(
+        default=None,
+        description=(
+            "COORDINATE FALLBACK — only when the target is clearly visible on the "
+            "screenshot but genuinely ABSENT from the ELEMENT MAP. Return the center "
+            "Y pixel coordinate of the visual target. Leave null when element_id "
+            "is provided."
+        ),
     )
     text: str | None = Field(default=None, description="Text to type, if action_type='type'.")
     reasoning: str = Field(description="Why the screenshot leads to this action.")
@@ -76,13 +102,20 @@ SCREENSHOT of the current viewport.
 Your job:
 1. Look at the screenshot and answer the specific question.
 2. Map what you see back to the ELEMENT MAP — return the element_id of the thing
-   to act on (NOT pixel coordinates). Correlate by label text and position.
-3. Catch what text-only perception misses: which of several look-alike controls
+   to act on. Correlate by label text and position.
+3. COORDINATE FALLBACK: If the visual target is clearly visible on the screenshot
+   but does NOT appear in the ELEMENT MAP at all (e.g. a shadow DOM button, custom
+   web component, or element hidden from the accessibility tree), set element_id
+   to null and instead return the target's CENTER pixel coordinates as coord_x and
+   coord_y. The coordinate frame matches the screenshot: (0,0) is at the TOP-LEFT,
+   x increases rightward, y increases downward. Use this ONLY when you are certain
+   the element is genuinely absent from the map — not just hard to match.
+4. Catch what text-only perception misses: which of several look-alike controls
    is the REAL/primary one, whether a prior click actually took effect, whether
    an overlay/popup is covering the target, whether the goal is visually already
    done (a confirmation/toast/cart badge), or whether the layout means the target
    is elsewhere.
-4. If the screenshot does NOT change the plan, return action_type='none' — do not
+5. If the screenshot does NOT change the plan, return action_type='none' — do not
    invent work. Be decisive and ground every claim in what is visibly on screen.
 """
 
@@ -183,10 +216,14 @@ async def consult_vision(
         )
         if verdict is None:
             return None, used_model
+        coord_info = ""
+        if not verdict.element_id and verdict.coord_x is not None and verdict.coord_y is not None:
+            coord_info = f" at ({verdict.coord_x:.0f},{verdict.coord_y:.0f})"
         logger.info(
-            "👁️ Vision consult (%s): %s → %s%s [%.0f%%]",
+            "👁️ Vision consult (%s): %s → %s%s%s [%.0f%%]",
             used_model, verdict.observation[:70], verdict.action_type,
             f" {verdict.element_id}" if verdict.element_id else "",
+            coord_info,
             float(verdict.confidence) * 100,
         )
         return verdict, used_model
@@ -202,6 +239,11 @@ def apply_vision_verdict(proposed: dict, verdict: VisionVerdict) -> tuple[dict, 
     Returns (proposed, overridden). We override only when the vision model is
     confident AND proposes a concrete action — otherwise the a11y decision stands
     (vision confirmed it, or had nothing to add).
+
+    V30: Handles coordinate fallback — when Vision returns coord_x/coord_y
+    instead of element_id (target absent from a11y tree), the coordinates are
+    set on the proposed action with a 'vision_coords' flag for downstream
+    validation before Overwatch grounding.
     """
     if verdict is None:
         return proposed, False
@@ -218,6 +260,21 @@ def apply_vision_verdict(proposed: dict, verdict: VisionVerdict) -> tuple[dict, 
         # time; drop stale a11y coords so they can't fight the vision choice.
         proposed["x"] = None
         proposed["y"] = None
+        proposed["vision_coords"] = False
+    elif (getattr(verdict, "coord_x", None) is not None
+          and getattr(verdict, "coord_y", None) is not None):
+        # V30 COORDINATE FALLBACK: target not in a11y tree — Vision returned
+        # pixel coordinates. Clear element_id and set coords for downstream
+        # validation ("Look-Before-You-Leap" in the worker pipeline).
+        proposed["element_id"] = None
+        proposed["x"] = float(verdict.coord_x)
+        proposed["y"] = float(verdict.coord_y)
+        proposed["vision_coords"] = True
+        logger.info(
+            "👁️📍 Vision coordinate fallback: target at (%.0f, %.0f) — "
+            "element not in a11y tree",
+            verdict.coord_x, verdict.coord_y,
+        )
     if verdict.text is not None:
         proposed["text"] = verdict.text
     proposed["reasoning"] = f"[vision] {verdict.reasoning[:180]}"
