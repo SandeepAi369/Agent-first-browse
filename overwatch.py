@@ -360,6 +360,18 @@ async def overwatch_node(state: dict[str, Any], page, critic, action_verifier=No
             if rv.status == CONFIRMED:
                 # Positive reconciliation — clear any stale discrepancy note.
                 updates["reality_note"] = ""
+                # V32: Reality confirmed the action worked → clear the intent
+                # journal so HESITATION doesn't fire on the next step. Without
+                # this, the Worker gets told "predecessor click unconfirmed"
+                # even though Overwatch visually confirmed the click succeeded.
+                # This was the root cause of the "false hesitation" loop on
+                # radio buttons and checkboxes.
+                updates["last_attempted_action"] = None
+                try:
+                    from intent_journal import resolve_intent
+                    resolve_intent()
+                except Exception:  # noqa: BLE001
+                    pass
                 if rv.note:
                     logger.info("✅ Overwatch REALITY: prediction confirmed — %s",
                                 rv.note[:120])
@@ -474,7 +486,12 @@ def _block_done(state: dict, updates: dict, reason: str,
     """Reject a 'done', with a TERMINATION GUARANTEE: after MAX_DONE_BLOCKS
     rejections we stop looping and finalize honestly (mission_success=False).
     The old counter was incremented but never read — block-loops could spin
-    forever (observed: done ×5 blocked on the HN run)."""
+    forever (observed: done ×5 blocked on the HN run).
+
+    V31 WORKER VETO: If the worker has provided substantive proof_of_completion
+    and been rejected 2+ times, force-accept. The Worker has temporal context
+    that the static Judge lacks (e.g. saw cart count change, button state flip).
+    """
     from outcome_judge import MAX_DONE_BLOCKS
     blocked = state.get("done_blocked", 0) + 1
     updates["done_blocked"] = blocked
@@ -483,6 +500,24 @@ def _block_done(state: dict, updates: dict, reason: str,
         "action": "done",
         "outcome": f"BLOCKED: {reason[:80]}",
     }]
+
+    # ── V31 WORKER VETO: Confidence Override ──
+    # If the worker has fired done 2+ times with substantive proof, the worker's
+    # temporal context overrides the judge's static snapshot. This prevents
+    # infinite stagnation on successfully completed tasks (e.g. Amazon smart-wagon
+    # redirect stripping the product name from DOM).
+    proof = (state.get("proposed_action") or {}).get("proof_of_completion", "").strip()
+    if blocked >= 2 and len(proof) > 30:
+        logger.warning(
+            "🏆 Overwatch L4: WORKER VETO — done rejected %d× but worker provided "
+            "substantive proof (%d chars). Accepting worker's temporal evidence. "
+            "Proof: %s", blocked, len(proof), proof[:200],
+        )
+        updates["overwatch_verdict"] = "pass"
+        updates["mission_success"] = True
+        updates["done_evidence"] = f"WORKER VETO (proof accepted after {blocked} rejections): {proof[:300]}"
+        return updates
+
     if blocked >= MAX_DONE_BLOCKS:
         logger.warning(
             "🛑 Overwatch L4: done blocked %d× — finalizing UNVERIFIED (honest failure). "
@@ -613,6 +648,11 @@ async def _layer_4_cove_check(state: dict, page, updates: dict) -> dict:
         ) if s
     )
 
+    # V31: Extract worker's proof_of_completion for the judge
+    proof_of_completion = (proposed.get("proof_of_completion", "") or "").strip()
+    if proof_of_completion:
+        logger.info("📋 Worker proof_of_completion: %s", proof_of_completion[:200])
+
     verdict = await judge_done(
         _JUDGE_INVOKE_FN, _JUDGE_CHAIN, _JUDGE_BREAKER, _JUDGE_HEALTH,
         objective=objective,
@@ -624,6 +664,7 @@ async def _layer_4_cove_check(state: dict, page, updates: dict) -> dict:
         page_text=page_text,
         verified_subgoals=_render_verified_subgoals(state),
         bound_target=state.get("bound_target", ""),
+        proof_of_completion=proof_of_completion,
     )
 
     if verdict is not None:

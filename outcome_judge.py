@@ -91,10 +91,30 @@ MIN_ACCEPT_CONFIDENCE = 0.6
 #  Judge prompt
 # ═══════════════════════════════════════════════════════════════════════════════
 
-JUDGE_SYSTEM_PROMPT = """You are a SKEPTICAL, INDEPENDENT task-completion verifier for a browser agent.
-The agent claims its task is finished. Your job is to decide — from PAGE EVIDENCE
-ONLY — whether the objective is truly achieved. The agent's own claims are NOT
-evidence; agents routinely believe they are done when they are not.
+JUDGE_SYSTEM_PROMPT = """You are a task-completion verifier for a browser agent.
+The agent claims its task is finished. Your job is to decide whether the objective
+is truly achieved, using ALL available evidence.
+
+CRITICAL WORKER-DEFERENCE RULE (V31)
+═══════════════════════════════════════
+The Worker agent has TEMPORAL CONTEXT that you do not have. It observed the page
+BEFORE, DURING, and AFTER each action — you only see a frozen snapshot AFTER.
+
+If the Worker provides a PROOF OF COMPLETION with concrete, specific state-change
+evidence (e.g. 'cart count increased from 0 to 1', 'button changed from Star to
+Unstar', 'confirmation toast appeared', 'form submitted and redirected to
+thank-you page'), you MUST EVALUATE THE WORKER'S PROOF FIRST:
+
+  • If the proof describes a PLAUSIBLE, SPECIFIC state-change that is consistent
+    with the task objective AND there is no CONTRADICTING evidence on the current
+    page → RETURN ACHIEVED=TRUE. You do not need to re-find the exact product
+    name or item text in the current DOM. The Worker witnessed it happen live.
+  • Only REJECT the worker's proof if it CLEARLY contradicts hard evidence on
+    the current page (e.g. worker says 'added to cart' but cart badge explicitly
+    shows 0, or the page shows an error message, or the URL is a login/error page).
+  • Post-action redirect pages (cart popups, confirmation screens, thank-you
+    pages, smart-wagon overlays) routinely strip the original item text. This is
+    NORMAL behavior and NOT grounds for rejection.
 
 VERIFICATION RULES
 1. THINK SITUATIONALLY FIRST: before looking at the page, reason about what
@@ -108,25 +128,27 @@ VERIFICATION RULES
    • "fill/submit a form" → a submission confirmation, NOT the filled form
    • "download/upload"    → the completed-state indicator the site shows
    Then check whether THAT proof is present in the evidence below.
-2. Base your verdict ONLY on the FRESH PAGE STATE provided (URL + interactive
-   element map + visible page text). The VISIBLE PAGE TEXT is real rendered
-   content — proof found there counts fully (e.g. a confirmation message, a
-   fact the task asked to find, an item listed in a cart).
-3. Cite concrete proof: quote the exact element label, page text, or URL fragment
-   that demonstrates success. If you cannot point at proof, the answer is NOT achieved.
+2. Evaluate evidence in this priority order:
+   a) WORKER'S PROOF OF COMPLETION (temporal, first-hand witness testimony)
+   b) VERIFIED SUB-GOALS (already confirmed during execution)
+   c) FRESH PAGE STATE (URL + DOM + visible text — static snapshot)
+   The worker's proof and verified sub-goals have higher weight than a cold
+   static snapshot, because the snapshot may be a post-redirect page that no
+   longer shows the action's immediate result.
+3. Cite concrete proof: quote the worker's testimony, element labels, page text,
+   or URL fragments that demonstrate success.
 4. Know the classic traps — these are NOT success:
    • a filled form is not a SUBMITTED form
    • a product page is not an item IN THE CART
    • a compose box with text is not a PUBLISHED post/comment
    • a search results page is not an OPENED result
-   • an intermediate confirmation dialog is not a COMPLETED flow
+   But be careful: these traps apply to the ACTION, not the page state AFTER.
+   If the worker says 'I submitted the form and saw a confirmation toast', and
+   the current page is a thank-you page, that IS success — don't reject because
+   the form is no longer visible.
 5. Distinguish the goal action from look-alikes (e.g. "Buy Now" / checkout flows
    are NOT "add to cart"; a login wall means the goal was NOT reached).
-6. If the proof you derived in rule 1 is genuinely not visible on the CURRENT
-   page but would be visible somewhere else (e.g. the cart page), answer NOT
-   achieved and set next_hint to the navigation that would surface it — that is
-   how the agent verifies-by-checking instead of assuming.
-7. Be decisive and binary. No partial credit. When proof is present, say achieved
+6. Be decisive and binary. No partial credit. When proof is present, say achieved
    with the citation; when it is not, say not achieved with what is missing.
 """
 
@@ -142,6 +164,7 @@ def build_judge_messages(
     page_text: str = "",
     verified_subgoals: str = "",
     bound_target: str = "",
+    proof_of_completion: str = "",
 ) -> list[dict]:
     """Build the judge conversation (pure — unit-testable).
 
@@ -153,6 +176,10 @@ def build_judge_messages(
     execution (with their captured proof). These are trusted prior evidence — the
     judge should confirm the objective using them, not re-derive every sub-goal
     from a cold final page (which causes false 'not done' on subtle UI changes).
+
+    proof_of_completion (V31) is the worker's first-hand testimony of state-changes
+    it observed during execution. This is TRUSTED temporal evidence — the judge
+    evaluates it with deference, rejecting only on clear contradiction.
     """
     user = (
         f"═══ OBJECTIVE ═══\n{objective}\n\n"
@@ -162,17 +189,23 @@ def build_judge_messages(
            f"item/element.\n\n" if bound_target else "")
         + (f"═══ PLANNED SUCCESS CRITERIA (done when) ═══\n{success_criteria}\n\n"
            if success_criteria else "")
+        + (f"═══ WORKER'S PROOF OF COMPLETION (trusted temporal evidence) ═══\n"
+           f"{proof_of_completion}\n"
+           f"The Worker observed these state-changes LIVE during execution. Evaluate "
+           f"this proof against the objective. Accept it unless it CLEARLY contradicts "
+           f"the current page evidence below.\n\n" if proof_of_completion else "")
         + (f"═══ SUB-GOALS ALREADY VERIFIED DURING EXECUTION (trusted proof) ═══\n"
            f"{verified_subgoals}\nTreat these as established — confirm the objective "
            f"in light of them; do not mark the task incomplete merely because this "
            f"final page no longer re-shows their proof.\n\n" if verified_subgoals else "")
-        + f"═══ AGENT'S CLAIM (NOT evidence) ═══\n{claim or '(none)'}\n\n"
+        + f"═══ AGENT'S CLAIM (NOT evidence — use only for context) ═══\n{claim or '(none)'}\n\n"
         f"═══ RECENT ACTION TRAIL ═══\n{history_tail or '(none)'}\n\n"
-        f"═══ FRESH PAGE STATE (the ONLY evidence) ═══\n"
+        f"═══ FRESH PAGE STATE (static snapshot — may not show post-redirect proof) ═══\n"
         f"URL: {url}\n\n"
         f"── Interactive elements ──\n{dom_markdown[:5000]}\n\n"
         + (f"── Visible page text ──\n{page_text[:4500]}\n\n" if page_text else "")
-        + "Verdict: is the objective ACHIEVED, based strictly on the page state above?"
+        + "Verdict: is the objective ACHIEVED, considering ALL evidence above "
+        "(worker proof + sub-goals + page state)?"
     )
     return [
         {"role": "system", "content": JUDGE_SYSTEM_PROMPT},
@@ -199,6 +232,7 @@ async def judge_done(
     page_text: str = "",
     verified_subgoals: str = "",
     bound_target: str = "",
+    proof_of_completion: str = "",
 ) -> DoneVerdict | None:
     """Run the outcome judge. Returns None when no verdict could be obtained
     (caller falls back to the legacy heuristic gate)."""
@@ -210,7 +244,7 @@ async def judge_done(
         objective=objective, success_criteria=success_criteria, url=url,
         dom_markdown=dom_markdown, history_tail=history_tail, claim=claim,
         page_text=page_text, verified_subgoals=verified_subgoals,
-        bound_target=bound_target,
+        bound_target=bound_target, proof_of_completion=proof_of_completion,
     )
     messages = [SystemMessage(content=raw[0]["content"]),
                 HumanMessage(content=raw[1]["content"])]

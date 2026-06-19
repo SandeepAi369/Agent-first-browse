@@ -495,7 +495,10 @@ class AutonomousAction(BaseModel):
 
     # ── ACT: The chosen action ──
     action_type: str = Field(
-        description="One of: 'goto', 'click', 'type', 'scroll', 'press_enter', 'wait', 'done'"
+        description=(
+            "One of: 'goto', 'click', 'type', 'scroll', 'press_enter', 'wait', 'done', "
+            "'select_option', 'hover', 'press_combo', 'drag_and_drop', 'upload_file', 'scroll_to'"
+        )
     )
     element_id: str | None = Field(
         default=None,
@@ -508,8 +511,15 @@ class AutonomousAction(BaseModel):
     url: str | None = Field(default=None, description="URL for 'goto' action")
     x: float | None = Field(default=None, description="X coordinate (fallback if element_id unavailable)")
     y: float | None = Field(default=None, description="Y coordinate (fallback if element_id unavailable)")
-    text: str | None = Field(default=None, description="Text to type for 'type' action")
+    text: str | None = Field(default=None, description="Text to type for 'type' action; also the option value for 'select_option'")
     wait_ms: int | None = Field(default=None, description="Milliseconds to wait for 'wait' action (default: 1000)")
+    # V33: New fields for expanded action suite
+    key_combo: str | None = Field(default=None, description="Key or chord for 'press_combo' (e.g. 'Escape', 'Control+A', 'Tab', 'ArrowDown')")
+    direction: str | None = Field(default=None, description="Scroll direction for 'scroll_to': 'up', 'down', 'left', 'right'")
+    scroll_amount: int | None = Field(default=None, description="Pixels to scroll for 'scroll_to' (default: 500)")
+    target_x: float | None = Field(default=None, description="Target X for 'drag_and_drop' drop destination")
+    target_y: float | None = Field(default=None, description="Target Y for 'drag_and_drop' drop destination")
+    file_path: str | None = Field(default=None, description="File path for 'upload_file' action")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1273,6 +1283,124 @@ async def run_agent(objective: str):
                     logger.warning("Scroll failed: %s", e)
                     action_outcome = f"→ FAILED: {e}"
 
+            # ══════════════════════════════════════════════════════════════
+            #  V33: Comprehensive Browser Action Suite — New Dispatches
+            # ══════════════════════════════════════════════════════════════
+
+            elif decision.action_type == "select_option":
+                option_val = decision.text or ""
+                logger.info("Selecting option '%s' on %s", option_val[:40], decision.element_id or "?")
+                try:
+                    from mcp_tools import mcp_select_option
+                    result = await asyncio.wait_for(
+                        mcp_select_option(decision.element_id, option_val),
+                        timeout=10.0,
+                    )
+                    if result.get("success"):
+                        action_outcome = f"→ OK (selected: {result.get('selected', option_val)[:40]})"
+                    else:
+                        action_outcome = f"→ FAILED: {result.get('error', 'select_option failed')[:80]}"
+                except asyncio.TimeoutError:
+                    action_outcome = "→ TIMEOUT (select_option)"
+                except Exception as e:
+                    logger.warning("select_option failed: %s", e)
+                    action_outcome = f"→ FAILED: {e}"
+
+            elif decision.action_type == "hover":
+                logger.info("Hovering over %s", decision.element_id or f"({decision.x},{decision.y})")
+                try:
+                    from mcp_tools import mcp_hover
+                    result = await asyncio.wait_for(
+                        mcp_hover(decision.element_id, decision.x or 0, decision.y or 0),
+                        timeout=10.0,
+                    )
+                    if result.get("success"):
+                        action_outcome = "→ OK (hover)"
+                    else:
+                        action_outcome = f"→ FAILED: {result.get('error', 'hover failed')[:80]}"
+                except Exception as e:
+                    logger.warning("hover failed: %s", e)
+                    action_outcome = f"→ FAILED: {e}"
+
+            elif decision.action_type == "press_combo":
+                combo = decision.key_combo or decision.text or ""
+                logger.info("Pressing key combo: %s", combo)
+                try:
+                    from mcp_tools import mcp_press_key
+                    result = await asyncio.wait_for(
+                        mcp_press_key(combo),
+                        timeout=5.0,
+                    )
+                    if result.get("success"):
+                        action_outcome = f"→ OK (pressed: {combo})"
+                    else:
+                        action_outcome = f"→ FAILED: {result.get('error', 'press_combo failed')[:80]}"
+                except Exception as e:
+                    logger.warning("press_combo failed: %s", e)
+                    action_outcome = f"→ FAILED: {e}"
+
+            elif decision.action_type == "drag_and_drop":
+                tx, ty = decision.target_x or 0, decision.target_y or 0
+                logger.info("Dragging from (%s,%s) to (%s,%s)",
+                            int(decision.x or 0), int(decision.y or 0), int(tx), int(ty))
+                try:
+                    from mcp_tools import mcp_drag_and_drop
+                    result = await asyncio.wait_for(
+                        mcp_drag_and_drop(
+                            decision.element_id,
+                            decision.x or 0, decision.y or 0,
+                            tx, ty,
+                        ),
+                        timeout=15.0,
+                    )
+                    if result.get("success"):
+                        action_outcome = "→ OK (drag_and_drop)"
+                    else:
+                        action_outcome = f"→ FAILED: {result.get('error', 'drag failed')[:80]}"
+                except Exception as e:
+                    logger.warning("drag_and_drop failed: %s", e)
+                    action_outcome = f"→ FAILED: {e}"
+
+            elif decision.action_type == "upload_file":
+                fpath = decision.file_path or decision.text or ""
+                logger.info("Uploading file '%s' to %s", fpath[:60], decision.element_id or "?")
+                try:
+                    from mcp_tools import mcp_upload_file
+                    result = await asyncio.wait_for(
+                        mcp_upload_file(decision.element_id, fpath),
+                        timeout=15.0,
+                    )
+                    if result.get("success"):
+                        action_outcome = f"→ OK (uploaded: {fpath[:40]})"
+                    else:
+                        action_outcome = f"→ FAILED: {result.get('error', 'upload failed')[:80]}"
+                except Exception as e:
+                    logger.warning("upload_file failed: %s", e)
+                    action_outcome = f"→ FAILED: {e}"
+
+            elif decision.action_type == "scroll_to":
+                direction = (decision.direction or "down").lower()
+                amount = decision.scroll_amount or 500
+                logger.info("Scrolling %s by %dpx", direction, amount)
+                try:
+                    from mcp_tools import mcp_scroll_directional
+                    result = await asyncio.wait_for(
+                        mcp_scroll_directional(direction, amount),
+                        timeout=10.0,
+                    )
+                    if result.get("success"):
+                        action_outcome = f"→ OK (scrolled {direction} {amount}px)"
+                    else:
+                        action_outcome = f"→ FAILED: {result.get('error', 'scroll failed')[:80]}"
+                except Exception as e:
+                    logger.warning("scroll_to failed: %s", e)
+                    action_outcome = f"→ FAILED: {e}"
+
+            else:
+                # V33: HARD ERROR — unknown action type. No silent pass-through.
+                action_outcome = f"→ HARD ERROR: unknown action type '{decision.action_type}'. Use only: goto, click, type, scroll, press_enter, wait, done, select_option, hover, press_combo, drag_and_drop, upload_file, scroll_to"
+                logger.error("❌ %s", action_outcome)
+
             # Record action with outcome + screen context
             history_entry = f"{summary} {action_outcome}"
             if decision.screen_state:
@@ -1291,7 +1419,7 @@ async def run_agent(objective: str):
                 working_mem.update_page_map(current_url, elements_list)
 
             # ── v2.1: CriticV12 POST-ACT Verification (RQ-B03) + Reflexion (RQ-B02) + Key-Node (RQ-B05) ──
-            if decision.action_type in ("click", "type", "goto", "scroll"):
+            if decision.action_type in ("click", "type", "goto", "scroll", "select_option", "hover", "drag_and_drop"):
                 try:
                     post_dom = await dom_parser.extract(page, timeout=3.0)
                     post_a11y = dom_data_to_a11y_format(post_dom)

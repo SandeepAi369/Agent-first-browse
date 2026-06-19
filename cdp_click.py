@@ -391,6 +391,72 @@ async def _strategy_direct_navigate(
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+#  V32: Element State Capture (Visual Truth Override)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def _capture_element_state(page: Page, x: float, y: float, timeout: float = 2.0) -> dict:
+    """Capture the interactive state of the element at (x, y).
+
+    Returns checked/selected/value/aria-* attributes for state-change detection
+    on toggleable elements (radio buttons, checkboxes, dropdowns) where DOM
+    structure doesn't change but element state does.
+
+    This is the foundation of the Visual Truth Override — it lets us detect
+    that a click WORKED even when the structural fingerprint sees no change.
+    """
+    try:
+        result = await asyncio.wait_for(page.evaluate("""
+        ([x, y]) => {
+            const el = document.elementFromPoint(x, y);
+            if (!el) return {found: false};
+            // Walk up to find the actual input/select (labels often wrap inputs)
+            const input = el.closest(
+                'input, select, textarea, [role="checkbox"], [role="radio"], '
+                + '[role="switch"], [role="option"], [role="tab"]'
+            ) || el;
+            return {
+                found: true,
+                tag: input.tagName || '',
+                type: (input.type || '').toLowerCase(),
+                checked: !!input.checked,
+                selected: !!input.selected,
+                value: (input.value || '').slice(0, 100),
+                ariaChecked: input.getAttribute('aria-checked') || '',
+                ariaSelected: input.getAttribute('aria-selected') || '',
+                ariaExpanded: input.getAttribute('aria-expanded') || '',
+                ariaPressed: input.getAttribute('aria-pressed') || '',
+                classList: Array.from(input.classList || []).join(' ').slice(0, 100),
+            };
+        }
+        """, [x, y]), timeout=timeout)
+        return result
+    except Exception as e:
+        logger.debug("Element state capture failed: %s", e)
+        return {"found": False}
+
+
+def _element_state_changed(pre: dict, post: dict) -> tuple[bool, list[str]]:
+    """Compare pre/post element state. Returns (changed, list_of_changes).
+
+    Checks standard DOM attributes that toggle on interaction:
+    checked, selected, value, aria-checked, aria-selected, aria-expanded, aria-pressed.
+    Completely generic — no website-specific logic.
+    """
+    if not pre.get("found") or not post.get("found"):
+        return False, []
+
+    changes = []
+    for attr in ("checked", "selected", "value", "ariaChecked",
+                 "ariaSelected", "ariaExpanded", "ariaPressed"):
+        old = pre.get(attr)
+        new = post.get(attr)
+        if old != new:
+            changes.append(f"{attr}: {old!r} → {new!r}")
+
+    return len(changes) > 0, changes
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 #  Main Entry Point: Resilient Click with Waterfall
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -430,6 +496,9 @@ async def resilient_click(
     # Capture pre-click state
     pre_fp = await _capture_page_fingerprint(page)
     pre_url = pre_fp.get("url", "")
+
+    # V32: Capture element state BEFORE clicking (for toggleable controls)
+    pre_element_state = await _capture_element_state(page, x, y)
     
     strategies = [
         ("cdp_mouse_event", lambda: _strategy_cdp_mouse_event(page, x, y, button)),
@@ -505,6 +574,38 @@ async def resilient_click(
                 pre_url=pre_url,
                 post_url=post_url,
             )
+        
+        # ── V32 VISUAL TRUTH OVERRIDE ──────────────────────────────────────
+        # For toggleable elements (radio buttons, checkboxes, custom toggles),
+        # clicking changes ONLY the element's state attributes (checked,
+        # selected, value, aria-*) — NOT the DOM structure, URL, or element
+        # count. The fingerprint hash is blind to these changes.
+        #
+        # CRITICAL: We check here INSIDE the loop, BEFORE trying the next
+        # strategy. If we let strategy 2 fire on a checkbox that strategy 1
+        # already toggled, it will UNDO the toggle (double-click problem).
+        # ──────────────────────────────────────────────────────────────────
+        if pre_element_state.get("found"):
+            post_element_state = await _capture_element_state(page, x, y)
+            changed, change_list = _element_state_changed(
+                pre_element_state, post_element_state
+            )
+            if changed:
+                logger.info(
+                    "✅ VISUAL TRUTH OVERRIDE via %s at (%d, %d): "
+                    "click appeared to fail but element state changed: %s",
+                    strategy_name, int(x), int(y),
+                    "; ".join(change_list),
+                )
+                return ClickResult(
+                    success=True,
+                    strategy=f"{strategy_name}+state_verified",
+                    navigation=False,
+                    dom_changed=False,
+                    attempts=attempt + 1,
+                    pre_url=pre_url,
+                    post_url=pre_url,
+                )
         
         # Click dispatched but no visible effect — try next strategy
         logger.warning(
