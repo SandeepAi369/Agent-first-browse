@@ -84,17 +84,17 @@ class TestBrowserConfig:
 
     def test_defaults(self) -> None:
         config = BrowserConfig()
-        assert config.mode == BrowserMode.ISOLATED_SERVER
-        assert config.headless is True
-        assert config.cdp_timeout_ms == 15000
+        assert config.mode == BrowserMode.PERSISTENT_CONTEXT
+        assert config.headless is False
+        assert config.viewport_width == 1440
 
-    def test_remote_websocket_mode(self) -> None:
+    def test_persistent_context_mode(self) -> None:
         config = BrowserConfig(
-            mode=BrowserMode.REMOTE_WEBSOCKET,
-            remote_websocket_url="ws://remote:9222/devtools/browser/abc",
+            mode=BrowserMode.PERSISTENT_CONTEXT,
+            headless=True,
         )
-        assert config.mode == BrowserMode.REMOTE_WEBSOCKET
-        assert "ws://" in config.remote_websocket_url
+        assert config.mode == BrowserMode.PERSISTENT_CONTEXT
+        assert config.headless is True
 
 
 class TestAgentState:
