@@ -97,7 +97,8 @@ async def launch_google_stealth_context(profile_name: str) -> BrowserContext:
                 "--disable-features=IsolateOrigins,SitePerProcess",
                 "--disable-blink-features=AutomationControlled"
             ]
-            ps_cmd = f"Start-Process -FilePath '{chrome_exe}' -ArgumentList @('{ \"','\".join(args) }')"
+            args_str = "','".join(args)
+            ps_cmd = f"Start-Process -FilePath '{chrome_exe}' -ArgumentList @('{args_str}')"
             subprocess.Popen(["powershell.exe", "-NoProfile", "-Command", ps_cmd])
         else:
             chrome_cmd = [
