@@ -184,7 +184,6 @@ def _get_supervisor_llm_clients() -> list[Any]:
 
 
 def _ordered_supervisor_llms(clients: list[Any]) -> list[tuple[int, Any]]:
-    global _SUPERVISOR_LLM_CURSOR
     if not clients:
         return []
 

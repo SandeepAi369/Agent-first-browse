@@ -770,7 +770,7 @@ async def task_logging_node(state: AgentState) -> dict[str, Any]:
             )
             conn.commit()
     except Exception as e:
-        log.error(f"Failed to write to completed_tasks: {e}")
+        logger.error(f"Failed to write to completed_tasks: {e}")
 
     updated_routing = state.routing.model_copy(update={"next_hop": "housekeeping_node"})
     return {"routing": updated_routing}
@@ -778,7 +778,7 @@ async def task_logging_node(state: AgentState) -> dict[str, Any]:
 
 async def housekeeping_node(state: AgentState) -> dict[str, Any]:
     """Clean up temp files, drop dynamic tables, and purge ephemeral state."""
-    log.info("housekeeping_node: Beginning system cleanup")
+    logger.info("housekeeping_node: Beginning system cleanup")
     import os
     import sqlite3
     from app.browser_promoter.database import initialize_persistence_database
@@ -791,7 +791,7 @@ async def housekeeping_node(state: AgentState) -> dict[str, Any]:
                 os.remove(fpath)
                 files_removed += 1
         except Exception as e:
-            log.warning(f"Failed to remove temp file {fpath}: {e}")
+            logger.warning(f"Failed to remove temp file {fpath}: {e}")
             
     # 2. Drop dynamic schemas
     tables_dropped = 0
@@ -803,10 +803,10 @@ async def housekeeping_node(state: AgentState) -> dict[str, Any]:
                     conn.execute(f"DROP TABLE IF EXISTS {table_name}")
                     tables_dropped += 1
                 except Exception as e:
-                    log.warning(f"Failed to drop table {table_name}: {e}")
+                    logger.warning(f"Failed to drop table {table_name}: {e}")
             conn.commit()
             
-    log.info(f"housekeeping_node: Cleaned up {files_removed} files and {tables_dropped} dynamic tables.")
+    logger.info(f"housekeeping_node: Cleaned up {files_removed} files and {tables_dropped} dynamic tables.")
     
     updated_routing = state.routing.model_copy(update={"next_hop": "end"})
     return {
