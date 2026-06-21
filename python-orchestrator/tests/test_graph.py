@@ -18,7 +18,7 @@ class TestBuildGraph:
         node_names = set(graph.get_graph().nodes.keys())
         # LangGraph adds __start__ and __end__ pseudo-nodes
         assert "supervisor" in node_names
-        assert "worker" in node_names
+        assert "reasoning_agent" in node_names
         assert "browser_controller" in node_names
         assert "router" in node_names
 
