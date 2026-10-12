@@ -38,7 +38,7 @@ dev = [
 ]
 
 [tool.setuptools.packages.find]
-where = ["python-orchestrator"]
+where = ["src"]
 
 [tool.ruff]
 target-version = "py311"
@@ -60,5 +60,8 @@ warn_unused_configs = true
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]
-testpaths = ["python-orchestrator/tests"]
+testpaths = ["tests"]
+pythonpath = ["src"]
+# tests/live needs real accounts, API keys or network — run explicitly: pytest tests/live/<file>
+norecursedirs = ["live", ".*", "*.egg", "build", "dist", "node_modules", "venv", "__pycache__"]
 asyncio_mode = "auto"
