@@ -251,8 +251,16 @@ _GOD_MODE_JS = r"""
             try {
                 const val = el.value || el.textContent || '';
                 const trimVal = val.trim();
+                /* Secrets (passwords, OTPs, card data) report filled + length only —
+                   their value must never reach prompts, logs or state. */
+                const itype = (el.getAttribute('type') || '').toLowerCase();
+                const iac = (el.getAttribute('autocomplete') || '').toLowerCase();
+                const secret = itype === 'password'
+                    || /(^|\s)(current-password|new-password|one-time-code|cc-number|cc-csc|cc-exp)(\s|$)/.test(iac);
                 inputState = trimVal.length > 0
-                    ? { filled: true, length: trimVal.length, preview: trimVal.slice(0, 250) }
+                    ? (secret
+                        ? { filled: true, length: trimVal.length, secret: true }
+                        : { filled: true, length: trimVal.length, preview: trimVal.slice(0, 250) })
                     : { filled: false, length: 0 };
             } catch(_) { inputState = { filled: false, length: 0 }; }
         }
@@ -352,9 +360,11 @@ _GOD_MODE_JS = r"""
         const eid = 'e' + (i + 1);
         let label = text || top[i].tag.toLowerCase();
         if (inputState) {
-            label += inputState.filled
-                ? ` [filled: "${inputState.preview}"${inputState.length > 250 ? ' ...(' + inputState.length + ' total)' : ''} ${inputState.length}ch]`
-                : ' [empty]';
+            label += !inputState.filled
+                ? ' [empty]'
+                : inputState.secret
+                    ? ` [filled: value hidden, ${inputState.length}ch]`
+                    : ` [filled: "${inputState.preview}"${inputState.length > 250 ? ' ...(' + inputState.length + ' total)' : ''} ${inputState.length}ch]`;
         }
         try { window.__aid[eid] = top[i].el; } catch(_) {}
         elements.push({ id: eid, kind, text: label, x: cx, y: cy, hint: top[i].hint || '' });
@@ -448,7 +458,8 @@ SHADOW_PIERCER_INIT_SCRIPT = r"""
 TLS_STEALTH_ARGS = [
     # Force real Chrome TLS stack (no Playwright-specific modifications)
     "--disable-blink-features=AutomationControlled",
-    "--disable-features=IsolateOrigins,site-per-process",
+    # No --disable-features here: these args are appended to STEALTH_LAUNCH_ARGS,
+    # which owns the single --disable-features switch (a second copy overrides it).
     # HTTP/2 frame order alignment with Chrome
     "--enable-features=NetworkService,NetworkServiceInProcess",
     # Disable automation-revealing headers

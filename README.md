@@ -155,8 +155,8 @@ This is the heart of the system — the mechanism that makes the agent trustwort
 
 ```bash
 # 1. Clone
-git clone https://github.com/SandeepAi369/Agent-first-ide.git
-cd Agent-first-ide
+git clone https://github.com/SandeepAi369/Agent-first-browse.git
+cd Agent-first-browse
 
 # 2. Create and activate a virtual environment
 python3.11 -m venv .venv

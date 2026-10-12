@@ -176,6 +176,39 @@ def test_wiring_guards():
     assert "last_attempted_action" in bs
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Privacy + classification regressions
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def test_failures_mentioning_ok_substrings_are_not_confirmed():
+    # Words containing "ok" used to read as a confirmed success.
+    for outcome in ("→ CLICK INEFFECTIVE: Click timed out on 'Accept Cookies'",
+                    "→ CLICK INEFFECTIVE: 'Book now' not clickable",
+                    "→ TYPE FAILED: token field detached",
+                    "→ FAILED: broken selector",
+                    "→ HOVER FAILED: Facebook widget"):
+        assert ij.classify_status(outcome) != "confirmed", outcome
+    assert ij.classify_status("→ CLICK INEFFECTIVE: Click timed out on 'Cookie'") == "uncertain"
+    assert ij.classify_status("  → OK (typed 5 chars)") == "confirmed"
+
+
+def test_typed_text_never_stored_in_intent(tmp_path):
+    secret = "SuperSecretPassword!"
+    e = ij.make_intent(_proposed(verb="type", text=secret), 0)
+    assert "text" not in e
+    assert secret not in repr(e)
+    p = str(tmp_path / "intent.json")
+    ij.persist_intent(e, p)
+    assert secret not in Path(p).read_text()
+
+
+def test_signature_still_distinguishes_typed_values():
+    e = ij.make_intent(_proposed(verb="type", text="alpha"), 0)
+    assert ij.same_action(e, {"verb": "type", "element_id": "e5", "text": "alpha"})
+    assert not ij.same_action(e, {"verb": "type", "element_id": "e5", "text": "beta"})
+    assert "alpha" not in ij.action_signature("type", "e5", "alpha")
+
+
 if __name__ == "__main__":
     import pytest
     sys.exit(pytest.main([__file__, "-v"]))

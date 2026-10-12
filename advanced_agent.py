@@ -310,12 +310,22 @@ class SessionGuard:
     With native user_data_dir persistence, Chromium handles all cookie/storage
     persistence internally. This guard only ensures the browser context is
     closed cleanly on exit (which flushes pending state to disk).
+
+    Shutdown path: a runner calls bind_task() from inside its main task. The
+    first Ctrl+C / SIGTERM then CANCELS that task, so it unwinds through its own
+    `finally`, which awaits shutdown() — closing the context AND stopping the
+    Playwright driver. A second signal force-quits. Without a bound task (legacy
+    loop) a signal raises KeyboardInterrupt, which that loop already handles.
     """
 
     _instance: "SessionGuard | None" = None
 
     def __init__(self):
         self._context: BrowserContext | None = None
+        self._playwright = None                       # driver handle, stopped by shutdown()
+        self._task: asyncio.Task | None = None        # task cancelled on SIGINT/SIGTERM
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._interrupted = False
         self._installed = False
 
     @classmethod
@@ -324,13 +334,25 @@ class SessionGuard:
             cls._instance = cls()
         return cls._instance
 
-    def attach(self, context: BrowserContext):
-        """Attach a live browser context to guard."""
+    def attach(self, context: BrowserContext, playwright=None):
+        """Attach a live browser context (and the Playwright driver that owns it)."""
         self._context = context
+        if playwright is not None:
+            self._playwright = playwright
+        self._ensure_handlers()
+        logger.info("SessionGuard: attached to browser context")
+
+    def bind_task(self) -> None:
+        """Route SIGINT/SIGTERM to cancelling the CALLING task. Call from inside it."""
+        self._task = asyncio.current_task()
+        self._loop = asyncio.get_running_loop()
+        self._interrupted = False
+        self._ensure_handlers()
+
+    def _ensure_handlers(self):
         if not self._installed:
             self._install_handlers()
             self._installed = True
-        logger.info("SessionGuard: attached to browser context")
 
     def _install_handlers(self):
         """Install signal + atexit handlers (once)."""
@@ -343,12 +365,42 @@ class SessionGuard:
         logger.info("SessionGuard: signal + atexit handlers installed")
 
     def _signal_handler(self, signum, frame):
-        """Called on Ctrl+C or kill — close context then exit."""
+        """Ctrl+C / kill: cancel the bound task for a clean async shutdown.
+
+        Exiting from here (the old sys.exit) skipped context.close() and left the
+        Playwright driver running; cancelling lets the task's `finally` await both.
+        """
         sig_name = signal.Signals(signum).name
-        logger.warning("SessionGuard: caught %s — closing browser...", sig_name)
-        # Context.close() flushes all native state to user_data_dir
-        self.detach()
-        sys.exit(0)
+        task, loop = self._task, self._loop
+        if task is not None and not task.done() and not self._interrupted:
+            self._interrupted = True
+            logger.warning("SessionGuard: caught %s — shutting down the browser cleanly "
+                           "(repeat to force quit)...", sig_name)
+            task.cancel()
+            loop.call_soon_threadsafe(lambda: None)  # wake the selector so the cancel lands now
+            return
+        logger.warning("SessionGuard: caught %s — exiting", sig_name)
+        raise KeyboardInterrupt
+
+    async def shutdown(self) -> None:
+        """Close the browser context, then stop the Playwright driver. Idempotent."""
+        context, pw = self._context, self._playwright
+        self._context = None
+        self._playwright = None
+        self._task = None
+        self._loop = None
+        if context is not None:
+            try:
+                await context.close()  # flushes all native state to user_data_dir
+                logger.info("Browser closed. Profile state persisted.")
+            except Exception as e:
+                logger.warning("Browser close failed: %s", e)
+        if pw is not None:
+            try:
+                await pw.stop()
+                logger.info("Playwright driver stopped.")
+            except Exception as e:
+                logger.warning("Playwright driver stop failed: %s", e)
 
     def _atexit_handler(self):
         """Called on normal interpreter shutdown."""
@@ -399,7 +451,7 @@ async def launch_browser(*, headless: bool = False) -> tuple[BrowserContext, Pag
 
     # ── Attach lifecycle guard ──
     guard = SessionGuard.get()
-    guard.attach(context)
+    guard.attach(context, playwright=pw)  # hand over the driver so shutdown() can stop it
 
     # Get or create page
     if context.pages:
@@ -440,11 +492,7 @@ async def manual_login_mode():
     except (EOFError, KeyboardInterrupt):
         logger.info("Input interrupted — closing browser...")
 
-    try:
-        await context.close()
-    except Exception:
-        pass
-    SessionGuard.get().detach()
+    await SessionGuard.get().shutdown()  # closes the context and stops the driver
 
     print("\n  ✅ Session persisted! Future runs will use your login automatically.\n")
 
@@ -562,9 +610,28 @@ async def run_agent(objective: str):
     Features: ModelRegistry, Mission Planner, CriticV12,
     Action Verifier, Self-Correction Engine, Recovery Advisor,
     Enhanced Failover.
+
+    Owns shutdown: SIGINT/SIGTERM cancel this task (SessionGuard.bind_task) and
+    the `finally` closes the browser AND stops the Playwright driver on every exit
+    path — including a Ctrl+C during warm-up or model probing.
     """
-    context, page = await launch_browser()
     guard = SessionGuard.get()
+    guard.bind_task()
+    try:
+        await _run_agent_session(objective)
+    except asyncio.CancelledError:
+        logger.warning("Interrupted — shutting down the browser cleanly...")
+        raise
+    finally:
+        await guard.shutdown()
+
+
+async def _run_agent_session(objective: str):
+    context, page = await launch_browser()
+    # The V33 actions (select_option, hover, press_combo, drag_and_drop,
+    # upload_file, scroll_to) run through mcp_tools, which needs the page.
+    import mcp_tools
+    mcp_tools.set_page(page)
 
     # ── Human Warm-Up Routine ──
     target_hint = extract_target_url_from_objective(objective)
@@ -598,9 +665,7 @@ async def run_agent(objective: str):
 
     if not failover_chain:
         logger.error("No LLM clients available. Check API keys in .env.")
-        await context.close()
-        guard.detach()
-        return
+        return  # run_agent's finally closes the browser
 
     logger.info("LLM Failover Chain (%d models): %s", len(failover_chain), " → ".join(chain_names))
     logger.info("Objective: %s", objective[:200])
@@ -1601,9 +1666,6 @@ async def run_agent(objective: str):
         if prm_critic:
             logger.info("📊 PRM Critic total LLM calls: %d", prm_critic.total_llm_calls)
 
-    except KeyboardInterrupt:
-        logger.warning("KeyboardInterrupt caught — saving session before exit...")
-
     except Exception as e:
         # ── Structured Crash Context ──
         try:
@@ -1620,20 +1682,12 @@ async def run_agent(objective: str):
         logger.error(traceback.format_exc())
 
     finally:
-        # ════════════════════════════════════════════════════════════════════
-        #  CLEAN SHUTDOWN — context.close() flushes all native state to disk
-        # ════════════════════════════════════════════════════════════════════
+        # Browser close + driver stop happen in run_agent's finally (guard.shutdown).
         mission_success = progress_tracker.mission_success
         if mission_success:
             logger.info("✅ Agent shutting down after successful mission.")
         else:
             logger.info("⚠️  Agent shutting down (mission incomplete — ran out of steps or was interrupted).")
-        try:
-            await context.close()
-            logger.info("Browser closed. Native profile state persisted.")
-        except Exception as e:
-            logger.warning("Browser close failed: %s", e)
-        guard.detach()
 
         if mission_success:
             print("\n" + "═" * 60)
@@ -1663,7 +1717,12 @@ def main():
     if args.command == "login":
         asyncio.run(manual_login_mode())
     elif args.command == "run":
-        asyncio.run(run_agent(args.objective))
+        try:
+            asyncio.run(run_agent(args.objective))
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            # run_agent already closed the browser and stopped the driver.
+            logger.warning("Interrupted by user — exiting.")
+            sys.exit(130)
     else:
         parser.print_help()
 

@@ -60,7 +60,12 @@ def main():
         from brain_graph import run_brain
         logger.info("🧠 True Brain v16.0 — LangGraph Architecture")
         logger.info("Objective: %s", args.objective[:200])
-        asyncio.run(run_brain(args.objective, headless=getattr(args, "headless", False)))
+        try:
+            asyncio.run(run_brain(args.objective, headless=getattr(args, "headless", False)))
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            # run_brain already closed the browser and stopped the driver.
+            logger.warning("Interrupted by user — exiting.")
+            sys.exit(130)
     else:
         parser.print_help()
 

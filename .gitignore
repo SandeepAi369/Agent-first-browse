@@ -33,6 +33,8 @@ coverage.xml
 
 # ─── Persistence (runtime data — never commit) ────────────
 persistence/
+# Files the agent may upload (AGENT_UPLOAD_DIRS default) — personal data
+uploads/
 
 # ─── Environment / Secrets ────────────────────────────────
 .env

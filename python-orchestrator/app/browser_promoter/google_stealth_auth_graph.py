@@ -94,7 +94,6 @@ async def launch_google_stealth_context(profile_name: str) -> BrowserContext:
                 "--no-first-run",
                 "--no-default-browser-check",
                 "--password-store=basic",
-                "--disable-features=IsolateOrigins,SitePerProcess",
                 "--disable-blink-features=AutomationControlled"
             ]
             args_str = "','".join(args)
@@ -108,7 +107,6 @@ async def launch_google_stealth_context(profile_name: str) -> BrowserContext:
                 "--no-first-run",
                 "--no-default-browser-check",
                 "--password-store=basic",
-                "--disable-features=IsolateOrigins,SitePerProcess",
                 "--disable-blink-features=AutomationControlled"
             ]
             subprocess.Popen(chrome_cmd)
@@ -122,10 +120,9 @@ async def launch_google_stealth_context(profile_name: str) -> BrowserContext:
         # MODE 2: Cloud / Remote mode
         args = [
             "--disable-blink-features=AutomationControlled",
-            "--disable-features=IsolateOrigins,SitePerProcess,OptimizeImageLoading",
+            "--disable-features=OptimizeImageLoading,EnableOverscroll",
             "--no-first-run", "--no-default-browser-check",
             "--password-store=basic",
-            "--disable-features=EnableOverscroll",
             f"--fingerprint=marketing-agent-{profile_name}",
         ]
         

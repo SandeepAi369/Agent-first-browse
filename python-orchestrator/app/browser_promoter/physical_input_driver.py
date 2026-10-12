@@ -33,6 +33,7 @@ import asyncio
 import base64
 import math
 import random
+import struct
 import subprocess
 from dataclasses import dataclass
 
@@ -195,9 +196,8 @@ class PhysicalInputDriver:
 
         await self._execute_type(sequence)
 
-        logger.info(
-            "Physical type: %d chars, %d corrections, text=%r",
-            len(text), corrections, text[:60],
+        logger.info(  # length only — the text may be a password
+            "Physical type: %d chars, %d corrections", len(text), corrections,
         )
         return {"typed": len(text), "corrections": corrections}
 
@@ -484,12 +484,10 @@ class PhysicalInputDriver:
                 if not escaped:
                     continue  # Skip null/CR characters
 
-                # Make safe for PowerShell single-quoted string
-                ps_safe = escaped.replace("'", "''")
                 delay = random.randint(30, 120)
 
                 type_lines.append(
-                    f"[System.Windows.Forms.SendKeys]::SendWait('{ps_safe}')"
+                    f"[System.Windows.Forms.SendKeys]::SendWait({self._ps_string_literal(escaped)})"
                 )
                 type_lines.append(f"Start-Sleep -Milliseconds {delay}")
 
@@ -508,6 +506,18 @@ class PhysicalInputDriver:
             )
 
     # ── Helpers ───────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _ps_string_literal(text: str) -> str:
+        """A PowerShell expression evaluating to `text`, built from UTF-16 code units.
+
+        Typed text never appears as source in the script, so no character can end
+        a string and inject code — not ' nor the curly quotes ‘ ’ ‚ ‛ that
+        PowerShell also accepts as single-quote delimiters.
+        """
+        data = text.encode("utf-16-le")
+        units = struct.unpack(f"<{len(data) // 2}H", data)
+        return "[string]::new([char[]]@(" + ",".join(f"0x{u:04X}" for u in units) + "))"
 
     @staticmethod
     def _escape_for_sendkeys(char: str) -> str:
