@@ -61,4 +61,4 @@ echo
 
 # ── 4. Run the agent. No --headless → it auto-picks the stealth headed display.
 #     'exec' hands the terminal to Python so Ctrl-C shuts the browser down cleanly.
-exec "$VENV_PY" run_v16.py run "$TASK"
+exec "$VENV_PY" src/run_v16.py run "$TASK"
