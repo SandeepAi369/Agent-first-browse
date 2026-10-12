@@ -27,8 +27,7 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT))
-sys.path.insert(0, str(ROOT / "python-orchestrator"))
+sys.path.insert(0, str(ROOT / "src"))
 
 from dotenv import load_dotenv
 load_dotenv(ROOT / ".env")

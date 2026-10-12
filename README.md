@@ -40,6 +40,8 @@ In short: it is engineered to be a **critical thinker**, not an obedient parrot 
   - [Vision Models (Optional)](#vision-models-optional)
   - [Graceful Fallback](#graceful-fallback)
 - [Usage](#usage)
+- [Project Structure](#project-structure)
+- [Running Tests](#running-tests)
 - [Project Status](#project-status)
 - [License](#license)
 
@@ -294,19 +296,60 @@ Or call the brain directly:
 
 ```bash
 # Stealth headed mode (default — recommended)
-.venv/bin/python run_v16.py run "Go to github.com/torvalds/linux and star the repository"
+.venv/bin/python src/run_v16.py run "Go to github.com/torvalds/linux and star the repository"
 
 # Force true headless (more bot-detectable)
-.venv/bin/python run_v16.py run "your task here" --headless
+.venv/bin/python src/run_v16.py run "your task here" --headless
 ```
 
 **Persisting a login session** — open a browser to sign in manually once; the session is reused on future runs:
 
 ```bash
-.venv/bin/python run_v16.py login
+.venv/bin/python src/run_v16.py login
 ```
 
 Every run is saved to `logs/run_<timestamp>.log` for later inspection.
+
+---
+
+## Project Structure
+
+```text
+Agent-first-browse/
+├── agent.sh              # one-click launcher → src/run_v16.py
+├── src/                  # all runtime code (the single import root)
+│   ├── run_v16.py        # main entry point — LangGraph brain (canonical)
+│   ├── run.py            # multi-agent orchestrator entry point
+│   ├── advanced_agent.py # legacy V14 loop + browser launch / SessionGuard
+│   ├── brain_graph.py    # LangGraph StateGraph wiring
+│   ├── paths.py          # project-root anchors (.env, persistence/, uploads/)
+│   ├── *.py              # perception, verification, cognition, model layer…
+│   ├── app/              # browser runtime, stealth launcher, config
+│   ├── orchestrator/     # CEO / executor / critic (used by run.py)
+│   ├── workers/          # worker nodes for the brain
+│   └── skills/           # browser skills
+├── tests/                # unit tests (`pytest`)
+│   ├── browser_promoter/ # tests for src/app
+│   └── live/             # need real accounts / API keys / network — run explicitly
+├── scripts/
+│   ├── runners/          # ready-made task scripts (run from anywhere)
+│   ├── diagnostics/      # environment & wiring checks (check_env, wsl_test, …)
+│   └── tools/            # Windows Chrome bridge, article restore
+├── examples/objectives/  # sample task objectives used by the runners
+├── experiments/          # model benchmark
+├── docs/                 # strategy, design and audit notes
+├── pyproject.toml · requirements.txt · .env.example
+└── persistence/ · logs/ · uploads/   # local runtime data (git-ignored)
+```
+
+Runtime data always lives at the project root, whatever directory you run from.
+
+## Running Tests
+
+```bash
+.venv/bin/python -m pytest              # all unit tests (tests/live is skipped)
+.venv/bin/python -m pytest tests/live/test_nvidia.py   # a live test, explicitly
+```
 
 ---
 

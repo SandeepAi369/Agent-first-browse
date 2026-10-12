@@ -69,5 +69,5 @@ scratch/
 *.png
 !README_assets/*.png
 
-# ─── Scripts (one-off launchers) ──────────────────────────
-scripts/
+# ─── Local run logs / archived debug output ───────────────
+logs/

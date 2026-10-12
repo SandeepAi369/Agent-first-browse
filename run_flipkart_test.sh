@@ -1,3 +1,0 @@
-#!/bin/bash
-cd "/home/sandeep/agent first IDE"
-.venv/bin/python run_v16.py run "Navigate to Flipkart (https://www.flipkart.com). If a login popup appears, close it. Search for 'Samsung Galaxy fit 3' in the main search bar and press enter. IMPORTANT: Look carefully at the search results and click ONLY on the actual 'Samsung Galaxy Fit3' smart watch device. Do NOT click on replacement straps, bands, cases, or screen protectors. On the product page, verify you are on the actual watch page, then click the 'Add to Cart' button (or click 'Buy' if Add to Cart is unavailable). Once the item is successfully added to the cart or checkout begins, mark the task as complete."

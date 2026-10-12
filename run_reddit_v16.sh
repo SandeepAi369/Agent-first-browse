@@ -1,3 +1,0 @@
-#!/bin/bash
-cd "/home/sandeep/agent first IDE"
-.venv/bin/python run_v16.py run "Navigate to https://www.reddit.com/r/test. Find the Create Post button. Enter Title: '[Dev Log] Agent First IDE: Squashing 200 Bugs for V20'. Enter Body: 'Hello Reddit! We just fixed around 200 bugs and are gearing up for V20! This autonomous test post is powered by our new robust failover pipeline using Gemma 4 31B. The 40px visual cursor is also tracking my every move perfectly.'. Do not submit until both title and body are filled. Once filled, click Post/Submit and verify the post is successfully published and live."
