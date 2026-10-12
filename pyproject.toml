@@ -1,13 +1,14 @@
 [build-system]
-requires = ["setuptools>=75.0", "wheel"]
-build-backend = "setuptools.backends._legacy:_Backend"
+requires = ["setuptools>=77.0"]
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "agent-first-ide"
 version = "0.1.0"
 description = "Dual-model LangGraph browser automation orchestrator with Supervisor + Worker VLM architecture."
 readme = "README.md"
-license = "MIT"
+license = "GPL-3.0-or-later"
+license-files = ["LICENSE"]
 requires-python = ">=3.11"
 authors = [
     { name = "SandeepAi369" },
@@ -25,6 +26,7 @@ dependencies = [
     "playwright>=1.55.0",
     "playwright-stealth>=2.0.0",
     "python-dotenv>=1.1.0",
+    "httpx>=0.27.0",
 ]
 
 [project.optional-dependencies]

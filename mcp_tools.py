@@ -518,10 +518,13 @@ async def mcp_drag_and_drop(
 
 
 async def mcp_upload_file(element_id: str | None, file_path: str) -> dict:
-    """Upload a file to an <input type='file'> element.
+    """Upload a file through an element: a native <input type=file>, or a custom
+    upload button/dropzone that opens the OS file chooser.
 
-    Uses Playwright's set_input_files() which bypasses the OS file picker.
-    Resolves element via the __aid registry.
+    The path must pass execution_safety.is_upload_allowed() — the model chooses
+    it, and page content can steer the model. The element is resolved via the
+    window.__aid registry (dom_parser stores ids there, NOT as DOM attributes).
+    Playwright supplies the file without showing the OS picker either way.
     """
     page = _get_page()
     if not element_id:
@@ -530,21 +533,28 @@ async def mcp_upload_file(element_id: str | None, file_path: str) -> dict:
         return {"success": False, "error": "upload_file requires a file_path"}
     try:
         import os
-        if not os.path.exists(file_path):
-            return {"success": False, "error": f"File not found: {file_path[:80]}"}
+        from execution_safety import is_upload_allowed
+        allowed, resolved = is_upload_allowed(file_path)
+        if not allowed:
+            return {"success": False, "error": f"Upload refused: {resolved}"}
 
-        # Find the actual input[type=file] element using __aid
-        locator = page.locator(f'[__aid="{element_id}"]')
-        count = await locator.count()
-        if count == 0:
-            # Fallback: try data-eid
-            locator = page.locator(f'[data-eid="{element_id}"]')
-            count = await locator.count()
-        if count == 0:
+        handle = await page.evaluate_handle(
+            "(id) => (window.__aid && window.__aid[id]) || null", element_id)
+        el = handle.as_element()
+        if el is None:
             return {"success": False, "error": f"Element {element_id} not found in DOM"}
 
-        await locator.first.set_input_files(file_path)
-        logger.info("✅ upload_file: '%s' → %s", os.path.basename(file_path), element_id)
+        is_file_input = await el.evaluate(
+            "e => e.tagName === 'INPUT' && (e.type || '').toLowerCase() === 'file'")
+        if is_file_input:
+            await el.set_input_files(resolved)
+        else:
+            # Custom control: clicking it must open a file chooser we can fill.
+            async with page.expect_file_chooser(timeout=5000) as chooser_info:
+                await el.click()
+            chooser = await chooser_info.value
+            await chooser.set_files(resolved)
+        logger.info("✅ upload_file: '%s' → %s", os.path.basename(resolved), element_id)
         return {"success": True, "error": ""}
     except Exception as e:
         logger.warning("mcp_upload_file failed: %s", e)

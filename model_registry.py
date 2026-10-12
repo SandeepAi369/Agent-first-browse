@@ -448,7 +448,7 @@ class CircuitBreaker:
             if self._state == "open":
                 if time.monotonic() - self._opened_at >= self._open_wait_secs:
                     self._state = "half_open"
-                    self._probes_done = 0
+                    self._probes_done = 1  # this request IS the first probe
                     self._probe_failures = 0
                     logger.info("⚡ Circuit breaker → HALF_OPEN (probing)")
                     return True

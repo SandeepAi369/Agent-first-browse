@@ -115,8 +115,6 @@ SUPERVISOR_PRIMARY_BASE_URL: str = os.getenv("SUPERVISOR_PRIMARY_BASE_URL", "htt
 SUPERVISOR_FALLBACK_BASE_URL: str = os.getenv("SUPERVISOR_FALLBACK_BASE_URL", "https://api.groq.com/openai/v1")
 
 # ─── Browser Runtime ─────────────────────────────────────────────────────────
-BROWSER_MODE: str = os.getenv("BROWSER_MODE", "PERSISTENT_CONTEXT")
-BROWSER_STRATEGY: str = os.getenv("BROWSER_STRATEGY", "playwright").strip().lower()
 BROWSER_HEADLESS: bool = os.getenv("BROWSER_HEADLESS", "false").lower() in ("true", "1", "yes")
 FORCE_VISIBLE_LOCAL_BROWSER: bool = os.getenv("FORCE_VISIBLE_LOCAL_BROWSER", "true").lower() in (
     "true",
@@ -159,7 +157,9 @@ VISION_FALLBACK_ENABLED: bool = os.getenv("VISION_FALLBACK_ENABLED", "true").low
 )
 
 # ─── LangSmith / Tracing ─────────────────────────────────────────────────────
-LANGCHAIN_TRACING_V2: bool = os.getenv("LANGCHAIN_TRACING_V2", "true").lower() in (
+# Off by default: traces carry page content (DOM, typed text) to LangSmith. Opt in
+# explicitly with LANGCHAIN_TRACING_V2=true.
+LANGCHAIN_TRACING_V2: bool = os.getenv("LANGCHAIN_TRACING_V2", "false").lower() in (
     "true",
     "1",
     "yes",

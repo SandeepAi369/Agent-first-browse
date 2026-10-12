@@ -82,10 +82,12 @@ STEALTH_LAUNCH_ARGS = [
     # so Chrome thinks it crashed. Both flag spellings for cross-version coverage.
     "--hide-crash-restore-bubble",
     "--disable-session-crashed-bubble",
-    "--disable-features=IsolateOrigins,SitePerProcess,OptimizeImageLoading,EnableOverscroll",
+    # The ONLY --disable-features switch in any launch list: Chromium keeps a single
+    # value for a repeated switch, so a second copy silently drops this one. Add
+    # new features to this comma list. (WebRtcHideLocalIpsWithMdns is intentionally
+    # NOT disabled — real Chrome hides local IPs behind mDNS; disabling it leaks them.)
+    "--disable-features=OptimizeImageLoading,EnableOverscroll",
     "--password-store=basic",
-    # Prevent WebRTC from leaking local IP via mDNS — a common headless tell
-    "--disable-features=WebRtcHideLocalIpsWithMdns",
     # Disable background network service that headless mode handles differently
     "--disable-background-networking",
     # Suppress "Chrome is being controlled by automated software" infobar
