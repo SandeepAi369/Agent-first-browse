@@ -6,7 +6,7 @@ overwatch verifier, commit/rollback/recovery nodes, and the finalizer.
 
 Key architectural properties:
   1. TYPED STATE: BrainState flows through every node
-  2. CHECKPOINTING: SqliteSaver persists state at every super-step
+  2. CHECKPOINTING: an in-memory saver snapshots state at every super-step
   3. CONDITIONAL EDGES: MoE routing + verdict-based branching
   4. CYCLES: retry/rollback/replan loops with bounded iteration
   5. AUDIT TRAIL: every step is logged and replayable
@@ -24,6 +24,7 @@ References:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import re
@@ -33,7 +34,7 @@ from pathlib import Path
 from typing import Any
 
 from langgraph.graph import StateGraph, START, END
-from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+from langgraph.checkpoint.memory import InMemorySaver
 
 # Ensure app imports work
 sys.path.append(str(Path(__file__).parent / "python-orchestrator"))
@@ -898,14 +899,36 @@ def build_brain_graph() -> StateGraph:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 async def run_brain(objective: str, headless: bool = False):
-    """Initialize all modules and execute the brain graph."""
+    """Initialize all modules and execute the brain graph.
+
+    Owns shutdown: SIGINT/SIGTERM cancel this task (SessionGuard.bind_task), and
+    the `finally` closes the browser AND stops the Playwright driver on every exit
+    path — success, crash, early return, or Ctrl+C. The cancellation is re-raised
+    so the caller can exit non-zero.
+    """
+    from advanced_agent import SessionGuard
+    guard = SessionGuard.get()
+    guard.bind_task()
+    try:
+        await _run_brain_session(objective, headless)
+    except asyncio.CancelledError:
+        logger.warning("Interrupted — shutting down the browser cleanly...")
+        raise
+    finally:
+        await guard.shutdown()
+        try:
+            from virtual_display import stop_virtual_display
+            stop_virtual_display()
+        except Exception:
+            pass
+
+
+async def _run_brain_session(objective: str, headless: bool):
     global _PAGE, _CONTEXT, _FAILOVER_CHAIN, _WORKER_CHAIN, _VISION_CHAIN, _BREAKER, _HEALTH_TRACKER
     global _INVOKE_FN, _CRITIC, _DREAMER, _PRM_CRITIC, _SKILL_MEM
 
     # ── Import existing modules ──
-    from advanced_agent import (
-        launch_browser, SessionGuard, _invoke_with_failover,
-    )
+    from advanced_agent import launch_browser, _invoke_with_failover
     from model_registry import ModelRegistry
     from app.browser_promoter.browser_warmup import run_warmup, extract_target_url_from_objective
     from app.browser_promoter.worker_planner import ReasoningAgent
@@ -929,7 +952,6 @@ async def run_brain(objective: str, headless: bool = False):
 
     # ── Launch Browser ──
     _CONTEXT, _PAGE = await launch_browser(headless=launch_headless)
-    guard = SessionGuard.get()
 
     # ── Warmup ──
     target_hint = extract_target_url_from_objective(objective)
@@ -957,9 +979,7 @@ async def run_brain(objective: str, headless: bool = False):
 
     if not _FAILOVER_CHAIN:
         logger.error("No LLM clients available. Check API keys in .env.")
-        await _CONTEXT.close()
-        guard.detach()
-        return
+        return  # run_brain's finally closes the browser
 
     logger.info("LLM Failover Chain (%d models): %s",
                 len(_FAILOVER_CHAIN), " → ".join(chain_names))
@@ -1052,10 +1072,11 @@ async def run_brain(objective: str, headless: bool = False):
     graph_builder = build_brain_graph()
 
     # ── Compile with Checkpointer ──
-    db_path = Path(__file__).parent / "persistence" / "brain_checkpoints.db"
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-
-    async with AsyncSqliteSaver.from_conn_string(str(db_path)) as checkpointer:
+    # In-memory only. Each run uses a fresh thread_id and nothing ever resumes or
+    # reads a past checkpoint, so an on-disk store (the former SQLite
+    # persistence/brain_checkpoints.db) only accumulated every state snapshot —
+    # objective, page content, and typed text incl. passwords — with no reader.
+    async with contextlib.nullcontext(InMemorySaver()) as checkpointer:
         brain = graph_builder.compile(checkpointer=checkpointer)
 
         logger.info("🧠 Brain Graph compiled with %d nodes, checkpointer=%s",
@@ -1088,21 +1109,8 @@ async def run_brain(objective: str, headless: bool = False):
                 print("  ⚠️  Mission incomplete — ran out of steps or was interrupted.")
                 print("═" * 60 + "\n")
 
-        except KeyboardInterrupt:
-            logger.warning("KeyboardInterrupt — saving session...")
         except Exception as e:
             import traceback
             logger.error("💥 Brain crash: %s", e)
             logger.error(traceback.format_exc())
-        finally:
-            try:
-                await _CONTEXT.close()
-                logger.info("Browser closed. Profile state persisted.")
-            except Exception as e:
-                logger.warning("Browser close failed: %s", e)
-            guard.detach()
-            try:
-                from virtual_display import stop_virtual_display
-                stop_virtual_display()
-            except Exception:
-                pass
+        # Browser + driver shutdown happens in run_brain's finally.

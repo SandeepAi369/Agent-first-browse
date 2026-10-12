@@ -8,10 +8,19 @@ The CODE enforces safety constraints the LLM cannot override:
 from __future__ import annotations
 
 import logging
+import os
 import re
+from pathlib import Path
 from urllib.parse import urlparse
 
 logger = logging.getLogger("execution_safety")
+
+# Default folder the agent may upload from (override: AGENT_UPLOAD_DIRS, os.pathsep-separated).
+DEFAULT_UPLOAD_DIR = Path(__file__).resolve().parent / "uploads"
+
+# The user's objective — the one input a page cannot inject into. Files named in
+# it verbatim are user-approved uploads. Set by auto_allow_from_objective().
+_OBJECTIVE_TEXT: str = ""
 
 
 # Dangerous domains that should NEVER be automated
@@ -37,7 +46,12 @@ _RUNTIME_ALLOWED: set[str] = set()
 
 
 def auto_allow_from_objective(objective: str) -> None:
-    """Extract URLs from the objective and add their domains to the runtime allowlist."""
+    """Extract URLs from the objective and add their domains to the runtime allowlist.
+
+    Also records the objective so is_upload_allowed() can honour files it names.
+    """
+    global _OBJECTIVE_TEXT
+    _OBJECTIVE_TEXT = objective or ""
     urls = re.findall(r'https?://([^/\s,)\"\'>]+)', objective)
     for url_host in urls:
         domain = url_host.lower().strip().removeprefix("www.")
@@ -54,17 +68,24 @@ def auto_allow_from_objective(objective: str) -> None:
 
 
 def is_domain_allowed(url: str) -> bool:
-    """Check if the URL's domain is safe to navigate to.
+    """Check if the URL is safe to navigate to.
 
-    Policy: Block dangerous domains. Allow everything else.
-    Returns True for empty/relative URLs (internal navigation).
+    Policy: only http(s) URLs (minus the blocked domains) and about:blank.
+    Every other scheme — file:, javascript:, data:, chrome:, view-source:, … —
+    is refused: a page-injected instruction could otherwise steer the agent to
+    file:///…/.env or ~/.ssh and pull local secrets into the DOM it sends to LLMs.
     """
-    if not url or not url.startswith(("http://", "https://")):
-        return True  # Relative URLs are fine
+    url = (url or "").strip()
+    if url.lower() == "about:blank":
+        return True
     try:
-        host = urlparse(url).hostname
+        parsed = urlparse(url)
+        if parsed.scheme.lower() not in ("http", "https"):
+            logger.warning("🛡️ BLOCKED non-http(s) URL: %s", url[:80])
+            return False
+        host = parsed.hostname
         if not host:
-            return True
+            return False
         host = host.lower()
         # Check blocked list
         for blocked in BLOCKED_DOMAINS:
@@ -81,6 +102,60 @@ def add_allowed_domain(domain: str) -> None:
     """Add a domain to the runtime allowlist."""
     _RUNTIME_ALLOWED.add(domain.lower().strip())
     logger.info("🛡️ Domain added to allowlist: %s", domain)
+
+
+def _named_in_objective(candidates) -> bool:
+    """True if a candidate path appears in the objective as a whole path token
+    (not merely as a substring of another word or path)."""
+    if not _OBJECTIVE_TEXT:
+        return False
+    for c in candidates:
+        if c and len(c) >= 3 and re.search(
+                r"(?<![\w./~-])" + re.escape(c) + r"(?![\w/-])", _OBJECTIVE_TEXT):
+            return True
+    return False
+
+
+def upload_roots() -> list[Path]:
+    """Folders the agent may upload from on its own initiative."""
+    raw = os.getenv("AGENT_UPLOAD_DIRS", "").strip()
+    dirs = [Path(d).expanduser() for d in raw.split(os.pathsep) if d.strip()] if raw else [DEFAULT_UPLOAD_DIR]
+    return [d.resolve() for d in dirs]
+
+
+def is_upload_allowed(file_path: str) -> tuple[bool, str]:
+    """Decide whether the agent may hand `file_path` to a page's file input.
+
+    The model picks the path, and page content can steer the model, so an
+    unchecked upload would let any site exfiltrate local files (~/.ssh, .env…).
+    Allowed only if the file exists and either:
+      • the user's objective names it verbatim (user-approved), or
+      • it lives inside an upload root and no path component is hidden (dot-dir/file).
+    Returns (allowed, resolved_path_or_reason).
+    """
+    raw = (file_path or "").strip()
+    if not raw:
+        return False, "no file path given"
+    p = Path(raw).expanduser()
+    try:
+        real = p.resolve(strict=True)  # follows symlinks — the check is on the real target
+    except (OSError, RuntimeError):
+        return False, f"file not found: {raw[:80]}"
+    if not real.is_file():
+        return False, f"not a regular file: {raw[:80]}"
+
+    if _named_in_objective((raw, str(p), str(real))):
+        return True, str(real)
+
+    for root in upload_roots():
+        if real.is_relative_to(root):
+            if any(part.startswith(".") for part in real.relative_to(root).parts):
+                return False, "hidden files are never uploaded automatically"
+            return True, str(real)
+
+    logger.warning("🛡️ BLOCKED upload outside upload folders: %s", raw[:80])
+    return False, ("file is not in an upload folder (AGENT_UPLOAD_DIRS, default ./uploads) "
+                   "and is not named in the task")
 
 
 def _extract_critical_actions(objective: str) -> list[str]:

@@ -726,7 +726,9 @@ async def invoke_worker(
         logger.debug("Sub-Goal Lock backstop skipped (non-fatal): %s", e)
 
     # ── Action dedup tracking ──
-    current_sig = f"{proposed['verb']}:{(proposed.get('text') or 'none')[:30]}"
+    # Keyed digest, never the raw text: this signature lives in BrainState.
+    from intent_journal import text_fingerprint
+    current_sig = f"{proposed['verb']}:{text_fingerprint(proposed.get('text')) or 'none'}"
     last_sig = state.get("last_action_signature", "")
     if current_sig == last_sig:
         new_consecutive = state.get("consecutive_identical_actions", 0) + 1

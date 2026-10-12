@@ -1,8 +1,32 @@
+"""Launch Windows Chrome with a DevTools (CDP) endpoint for the agent.
+
+Run this with Windows Python (not inside WSL):  python windows_chrome_bridge.py
+
+Security:
+  * The debugging port listens on 127.0.0.1 ONLY. Whoever can reach it fully
+    controls the browser (cookies, sessions, every page), so it is never bound
+    to 0.0.0.0 / the LAN. (Current Chrome/Edge ignore --remote-debugging-address
+    for headed browsers anyway and always bind loopback.)
+  * Chrome 136+ refuses remote debugging on the default profile, so the bridge
+    always uses a dedicated profile folder — your everyday Chrome profile is
+    never exposed.
+
+Reaching it from WSL2: the default NAT networking cannot see Windows' 127.0.0.1.
+Either run the agent with Windows Python (.venv-windows), or enable WSL mirrored
+networking (networkingMode=mirrored in %UserProfile%\\.wslconfig).
+"""
+
 import os
 import subprocess
-import time
 import sys
-import socket
+import time
+
+DEBUG_PORT = 9222
+PROFILE_DIR = os.path.join(
+    os.environ.get("LOCALAPPDATA", os.path.expanduser("~")),
+    "AgentFirstBrowse", "chrome-cdp-profile",
+)
+
 
 def find_chrome():
     paths = [
@@ -15,12 +39,10 @@ def find_chrome():
             return p
     return None
 
+
 def main():
     print("==================================================")
-    print("  AGENT FIRST IDE — LOCAL CHROME BRIDGE (WINDOWS)")
-    print("==================================================")
-    print("This script connects your Windows Chrome directly")
-    print("to the AI Agent running inside WSL.")
+    print("  AGENT FIRST BROWSE — LOCAL CHROME BRIDGE (WINDOWS)")
     print("==================================================\n")
 
     chrome_path = find_chrome()
@@ -29,39 +51,35 @@ def main():
         input("Press Enter to exit...")
         sys.exit(1)
 
+    os.makedirs(PROFILE_DIR, exist_ok=True)
     print(f"[INFO] Found Chrome: {chrome_path}")
-    print("[INFO] Checking if port 9222 is already in use...")
-    
-    # Kill existing chrome if needed, but only if they are using port 9222
-    # For now, let's just launch it. If it fails, we instruct them.
-    
+    print(f"[INFO] Dedicated agent profile: {PROFILE_DIR}")
+
     args = [
         chrome_path,
-        "--remote-debugging-port=9222",
-        "--remote-debugging-address=0.0.0.0",
+        f"--remote-debugging-port={DEBUG_PORT}",  # binds 127.0.0.1 only
+        f"--user-data-dir={PROFILE_DIR}",
         "--no-first-run",
-        "--no-default-browser-check"
+        "--no-default-browser-check",
     ]
-    
-    print("\n[IMPORTANT] A Windows Firewall prompt might appear.")
-    print("[IMPORTANT] You MUST click 'Allow Access' so the WSL AI can connect!")
-    print("\nStarting Local Chrome Bridge...")
-    
+
     try:
-        # Launch independently
         process = subprocess.Popen(args, creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP)
         print(f"[SUCCESS] Chrome launched (PID: {process.pid})")
-        print("[SUCCESS] The AI Agent in WSL can now control this browser window.")
-        print("\nYou can now safely minimize this terminal window (do not close it)")
-        print("and run your AI Agent from WSL as normal: python start_campaign.py")
-        
+        print(f"[SUCCESS] CDP endpoint: http://127.0.0.1:{DEBUG_PORT} (this machine only)")
+        print("\nAttach a CDP client to that endpoint (e.g. Playwright's")
+        print("chromium.connect_over_cdp). Note: ./agent.sh / run_v16.py currently")
+        print("launch their own browser and do not attach to this one.")
+        print("\nYou can minimize this window; close it to stop the bridge.")
+
         # Keep alive
         while True:
             time.sleep(10)
-            
+
     except Exception as e:
         print(f"\n[ERROR] Failed to launch Chrome: {e}")
         input("Press Enter to exit...")
+
 
 if __name__ == "__main__":
     main()

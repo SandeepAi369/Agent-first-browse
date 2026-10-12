@@ -58,8 +58,8 @@ async def _launch_browser():
         viewport=vp,
         user_agent=STEALTH_USER_AGENT,
         args=STEALTH_LAUNCH_ARGS + dom_parser.TLS_STEALTH_ARGS,
-        ignore_https_errors=True,
-        bypass_csp=True,
+        # No ignore_https_errors / bypass_csp: on a logged-in profile they let a
+        # forged certificate (MITM) or an injected script through unchallenged.
         java_script_enabled=True,
         locale="en-US",
         timezone_id="America/New_York",
@@ -74,7 +74,7 @@ async def _launch_browser():
     await apply_page_stealth(page)
 
     logger.info("Browser launched (viewport: %dx%d)", vp["width"], vp["height"])
-    return context, page
+    return pw, context, page
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -87,7 +87,7 @@ async def execute(objective: str) -> None:
     from orchestrator.executor import Executor
 
     # ── Launch Browser ──
-    context, page = await _launch_browser()
+    pw, context, page = await _launch_browser()
 
     try:
         # ── Human Warm-Up ──
@@ -157,6 +157,12 @@ async def execute(objective: str) -> None:
         try:
             await context.close()
             logger.info("Browser closed. Session persisted.")
+        except Exception:
+            pass
+        # Stop the driver too — interactive mode calls execute() once per
+        # objective, so a leaked driver would pile up a process per task.
+        try:
+            await pw.stop()
         except Exception:
             pass
 

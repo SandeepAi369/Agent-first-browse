@@ -53,12 +53,19 @@ async def _verify_typed_text(page: Page, expected_text: str, timeout: float = 3.
     try:
         result = await asyncio.wait_for(page.evaluate("""
         () => {
+            // Password / OTP / card fields: the caller must not echo their value.
+            const isSecret = (el) => {
+                const t = (el.getAttribute && el.getAttribute('type') || '').toLowerCase();
+                const ac = (el.getAttribute && el.getAttribute('autocomplete') || '').toLowerCase().split(' ');
+                return t === 'password' || ['current-password', 'new-password', 'one-time-code',
+                    'cc-number', 'cc-csc', 'cc-exp'].some(k => ac.includes(k));
+            };
             // Strategy 1: Check focused element
             const active = document.activeElement;
             if (active) {
                 // For input/textarea
                 if (active.value !== undefined && active.value.length > 0) {
-                    return { found: true, text: active.value };
+                    return { found: true, text: active.value, secret: isSecret(active) };
                 }
                 // For contenteditable / Lexical / rich text editors
                 if (active.isContentEditable || active.contentEditable === 'true') {
@@ -76,7 +83,7 @@ async def _verify_typed_text(page: Page, expected_text: str, timeout: float = 3.
             for (const el of candidates) {
                 const text = el.value || el.innerText || el.textContent || '';
                 if (text.length > 0) {
-                    return { found: true, text: text };
+                    return { found: true, text: text, secret: isSecret(el) };
                 }
             }
 
@@ -117,7 +124,8 @@ async def _verify_typed_text(page: Page, expected_text: str, timeout: float = 3.
         return {
             "verified": match_ratio >= 0.85,  # 85% match threshold
             "actual_length": actual_len,
-            "actual_preview": actual_text[:100],
+            # Logged on mismatch — never echo a password/OTP/card value.
+            "actual_preview": "(hidden)" if result.get("secret") else actual_text[:100],
             "match_ratio": match_ratio,
         }
 

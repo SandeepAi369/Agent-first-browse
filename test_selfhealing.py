@@ -1,54 +1,88 @@
-"""Smoke test for v8.0 Self-Healing & Anti-Detection modules."""
+"""Self-healing primitives: the model CircuitBreaker and the SessionGuard singleton.
+
+The breaker moved from advanced_agent (v8 request-ceiling design) to
+model_registry (V17 sliding-window, three-state design); these tests cover the
+current CLOSED → OPEN → HALF_OPEN → CLOSED cycle.
+
+Run: .venv/bin/python -m pytest test_selfhealing.py -v
+"""
+
+from __future__ import annotations
+
+import asyncio
 import sys
-sys.path.insert(0, "python-orchestrator")
-from collections import Counter
+from pathlib import Path
 
-# Test 1: Circuit Breaker
-from advanced_agent import CircuitBreaker
+sys.path.insert(0, str(Path(__file__).parent / "python-orchestrator"))
 
-cb = CircuitBreaker(max_requests=5, max_failures=3)
-assert not cb.tripped
-cb.record_success()
-cb.record_success()
-assert cb.request_count == 2
-assert not cb.tripped
+from model_registry import CircuitBreaker
 
-cb.record_failure()
-cb.record_failure()
-cb.record_failure()
-assert cb.tripped
-assert "ceiling" in cb.reason
-print(f"✅ Circuit Breaker: trips correctly — {cb.reason}")
 
-cb2 = CircuitBreaker(max_requests=3, max_failures=10)
-cb2.record_success()
-cb2.record_success()
-cb2.record_success()
-assert cb2.tripped
-assert "Request ceiling" in cb2.reason
-print(f"✅ Circuit Breaker: trips correctly at {cb2.request_count} requests — {cb2.reason}")
+def test_no_trip_below_min_calls():
+    cb = CircuitBreaker(min_calls=5, failure_rate_threshold=0.5)
+    for _ in range(4):
+        cb.record_failure()
+    assert cb.state == "closed" and not cb.tripped
 
-# Test 2: Anti-Loop Watchdog (simulate the Counter logic)
-url_history = [
-    "https://hashnode.com/",
-    "https://hashnode.com/login",
-    "https://hashnode.com/",
-    "https://hashnode.com/login",
-    "https://hashnode.com/",
-    "https://hashnode.com/login",
-]
-recent = url_history[-6:]
-url_counts = Counter(recent)
-most_common_url, visit_count = url_counts.most_common(1)[0]
-assert visit_count >= 3, f"Expected loop detection, got {visit_count}"
-print(f"✅ Anti-Loop Watchdog: detected '{most_common_url}' visited {visit_count}x in 6 steps")
 
-# Test 3: SessionGuard exists and is a singleton
-from advanced_agent import SessionGuard
-g1 = SessionGuard.get()
-g2 = SessionGuard.get()
-assert g1 is g2, "SessionGuard should be a singleton"
-print("✅ SessionGuard: singleton pattern works")
+def test_trips_open_when_failure_rate_crosses_threshold():
+    cb = CircuitBreaker(min_calls=4, failure_rate_threshold=0.5, open_wait_secs=60)
+    cb.record_success()
+    cb.record_success()
+    cb.record_failure()
+    assert cb.state == "closed"
+    cb.record_failure()                       # 2/4 = 50% ≥ threshold
+    assert cb.state == "open" and cb.tripped
+    assert cb.reason.startswith("OPEN")
+    assert "2/4 fails" in cb.status_line()
 
-print()
-print("=== ALL v8.0 SELF-HEALING MODULES VERIFIED ===")
+
+def test_healthy_traffic_never_trips():
+    cb = CircuitBreaker(min_calls=4, failure_rate_threshold=0.5)
+    for _ in range(20):
+        cb.record_success()
+    cb.record_failure()
+    assert cb.state == "closed" and cb.reason == ""
+
+
+def test_open_blocks_then_recovers_through_half_open():
+    async def scenario():
+        cb = CircuitBreaker(min_calls=2, failure_rate_threshold=0.5,
+                            open_wait_secs=0.05, half_open_probes=2)
+        await cb.record(True)
+        await cb.record(True)
+        assert cb.state == "open"
+        assert await cb.allow() is False     # still cooling down
+        await asyncio.sleep(0.06)
+        assert not cb.tripped                 # eligible for probing
+        assert await cb.allow() is True and cb.state == "half_open"
+        assert await cb.allow() is True       # second probe
+        assert await cb.allow() is False      # probe budget spent
+        await cb.record(False)
+        await cb.record(False)
+        assert cb.state == "closed"           # all probes passed → recovered
+
+    asyncio.run(scenario())
+
+
+def test_failed_probe_reopens():
+    async def scenario():
+        cb = CircuitBreaker(min_calls=2, failure_rate_threshold=0.5, open_wait_secs=0.01)
+        await cb.record(True)
+        await cb.record(True)
+        await asyncio.sleep(0.02)
+        assert await cb.allow() is True and cb.state == "half_open"
+        await cb.record(True)
+        assert cb.state == "open"
+
+    asyncio.run(scenario())
+
+
+def test_session_guard_is_singleton():
+    from advanced_agent import SessionGuard
+    assert SessionGuard.get() is SessionGuard.get()
+
+
+if __name__ == "__main__":
+    import pytest
+    sys.exit(pytest.main([__file__, "-v"]))

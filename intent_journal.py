@@ -35,9 +35,12 @@ into the step). Unit-testable without a browser or LLM.
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import logging
 import os
+import secrets
 import time
 from pathlib import Path
 
@@ -48,6 +51,15 @@ JOURNALED_VERBS = ("click", "type", "press_enter", "select_option")
 
 # Outcome substrings that mean "we genuinely don't know if it took effect".
 _UNCERTAIN_MARKERS = ("timed out", "timeout", "crashed", "disconnect")
+
+# Prefix every confirmed-success outcome from Overwatch's `_execute_action` carries.
+_CONFIRMED_PREFIX = "→ OK"
+
+# Per-process key for fingerprinting typed text. The journal never stores what was
+# typed (it may be a password): signatures carry only a keyed digest, which is
+# meaningless outside this process. Cross-run comparison is never needed —
+# run_brain clears any stale ledger at startup.
+_TEXT_DIGEST_KEY = secrets.token_bytes(16)
 
 # State-FLIPPING controls. Repeating one of these blind is the WORST double-apply
 # case — it doesn't duplicate, it inverts (checkbox flips back off, star un-stars,
@@ -63,9 +75,25 @@ _TOGGLE_HINTS = (
 )
 
 
+def text_fingerprint(text: str | None) -> str:
+    """Keyed, per-process digest of typed text ("" for no text).
+
+    Equal inputs give equal fingerprints within one run, but the value cannot be
+    recovered from it — safe to keep in BrainState, signatures and logs.
+    """
+    text = (text or "").strip()
+    if not text:
+        return ""
+    return hmac.new(_TEXT_DIGEST_KEY, text.encode("utf-8"), hashlib.sha256).hexdigest()[:16]
+
+
 def action_signature(verb: str | None, element_id: str | None, text: str | None) -> str:
-    """Stable identity of an action (matches the consensus key shape)."""
-    return f"{(verb or '').strip().lower()}|{(element_id or '').strip()}|{(text or '').strip()[:40]}"
+    """Stable identity of an action: verb | element | keyed digest of the text.
+
+    The text itself is never embedded — only text_fingerprint(), so two proposals
+    typing the same value still match without the value reaching disk or state.
+    """
+    return f"{(verb or '').strip().lower()}|{(element_id or '').strip()}|{text_fingerprint(text)}"
 
 
 def should_journal(verb: str | None) -> bool:
@@ -102,11 +130,16 @@ def hazard_class(verb: str, target_name: str = "", text: str = "",
 
 
 def make_intent(proposed: dict, step_number: int, element_kind: str = "") -> dict:
-    """Build the Intent Payload written BEFORE execution."""
+    """Build the Intent Payload written BEFORE execution.
+
+    Deliberately excludes the typed text (it may be a password): the payload is
+    persisted to disk and kept in BrainState. The text is only read in-memory to
+    derive the hazard hint and the keyed signature.
+    """
     now = time.time()
     verb = proposed.get("verb", "")
     target_name = (proposed.get("target_name", "") or "")[:60]
-    text = (proposed.get("text", "") or "")[:40]
+    text = proposed.get("text", "") or ""
     risk_level = proposed.get("risk_level", "REVERSIBLE")
     return {
         "ts": round(now, 3),
@@ -115,7 +148,6 @@ def make_intent(proposed: dict, step_number: int, element_kind: str = "") -> dic
         "verb": verb,
         "element_id": proposed.get("element_id"),
         "target_name": target_name,
-        "text": text,
         "risk_level": risk_level,
         "hazard": hazard_class(verb, target_name, text, risk_level, element_kind),
         "signature": action_signature(verb, proposed.get("element_id"),
@@ -132,8 +164,12 @@ def is_uncertain_outcome(outcome: str) -> bool:
 
 
 def classify_status(outcome: str) -> str:
-    """confirmed (clean OK) | uncertain (timeout/crash) | executed (ran, no clear OK)."""
-    if "ok" in (outcome or "").lower():
+    """confirmed (clean OK) | uncertain (timeout/crash) | executed (ran, no clear OK).
+
+    Only the explicit "→ OK" prefix counts as confirmed — a bare substring match on
+    "ok" misread failures mentioning "Cookie", "Book now", "token", "broken"…
+    """
+    if (outcome or "").lstrip().startswith(_CONFIRMED_PREFIX):
         return "confirmed"
     if is_uncertain_outcome(outcome):
         return "uncertain"
