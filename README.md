@@ -389,3 +389,9 @@ the terms of the GNU General Public License as published by the Free Software
 Foundation, either version 3 of the License, or (at your option) any later version.
 This program is distributed WITHOUT ANY WARRANTY; see the GNU GPL v3 for details.
 ```
+
+---
+
+## 💖 Sponsor & Support
+
+If you find this project useful, consider supporting my open-source work and systems research via [GitHub Sponsors](https://github.com/sponsors/SandeepAi369).
