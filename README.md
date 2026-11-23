@@ -6,7 +6,7 @@
 [![LangGraph](https://img.shields.io/badge/langgraph-1.x-orange.svg)](https://langchain-ai.github.io/langgraph/)
 [![Playwright](https://img.shields.io/badge/playwright-1.55%2B-green.svg)](https://playwright.dev/python/)
 [![MCP Ready](https://img.shields.io/badge/MCP-stdio%20%2B%20CLI-purple.svg)](docs/EVAL_CONNECTOR.md)
-[![License: GPLv3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
 
 **Agent First Browse** gives AI agents reliable, human-grade control over real Chromium browsers—combining **accessibility-tree-first perception**, a **LangGraph verification loop**, and a **zero-API MCP/CLI connector** so any external AI coding agent (Antigravity, Claude Code, Cursor, VS Code, Gemini CLI) can drive the browser directly.
 
@@ -128,5 +128,5 @@ See [`docs/EVAL_CONNECTOR.md`](docs/EVAL_CONNECTOR.md) for the verified headed b
 
 ## License & Support
 
-- Licensed under the **GNU General Public License v3.0 (GPLv3)** — see [`LICENSE`](LICENSE).
+- Licensed under the **Apache License 2.0** — see [`LICENSE`](LICENSE).
 - If you find this project useful, consider supporting ongoing open-source work via [GitHub Sponsors](https://github.com/sponsors/SandeepAi369).
