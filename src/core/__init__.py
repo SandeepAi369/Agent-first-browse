@@ -10,10 +10,24 @@ evaluation connector, and orchestration layers:
   - `core.redaction`: Cycle-/depth-bounded base64, screenshot, & secret redaction.
   - `core.disposable`: LIFO sync/async disposable stores & listener-isolated `Emitter`.
   - `core.runtime_context`: `ContextVar`-backed per-session DI runtime context.
+  - `core.browser_provider`: `BrowserProvider` seam, per-session locks, & restart tombstones.
 """
 
 from __future__ import annotations
 
+from core.browser_provider import (
+    DEFAULT_BROWSER_SCOPE,
+    DEFAULT_SWEEP_IDLE_S,
+    BrowserHandle,
+    BrowserLaunchConfig,
+    BrowserProvider,
+    BrowserSessionManager,
+    LocalPlaywrightProvider,
+    ResolvedSession,
+    SessionRecord,
+    SessionReport,
+    conversation_scope,
+)
 from core.disposable import (
     AsyncCleanup,
     AsyncDisposable,
@@ -104,6 +118,7 @@ from core.url_policy import (
 __all__ = [
     "BASE64_REDACTION_THRESHOLD",
     "CHARS_PER_TOKEN",
+    "DEFAULT_BROWSER_SCOPE",
     "DEFAULT_MAX_TOKENS",
     "DEFAULT_MAX_URL_LENGTH",
     "DEFAULT_RETRY_BASE_DELAY_MS",
@@ -111,6 +126,7 @@ __all__ = [
     "DEFAULT_RETRY_MAX_ATTEMPTS",
     "DEFAULT_RETRY_MAX_DELAY_MS",
     "DEFAULT_RUNTIME_SCOPE",
+    "DEFAULT_SWEEP_IDLE_S",
     "MAX_REDACTION_DEPTH",
     "MAX_REDACTION_NODES",
     "MIN_SLOT",
@@ -122,24 +138,32 @@ __all__ = [
     "AsyncCleanup",
     "AsyncDisposable",
     "AsyncDisposableStore",
+    "BrowserHandle",
+    "BrowserLaunchConfig",
+    "BrowserProvider",
     "BrowserRuntimeContext",
     "BrowserSessionError",
     "BrowserSessionGoneError",
+    "BrowserSessionManager",
     "ConfigValidationError",
     "Disposable",
     "DisposableStore",
     "Emitter",
     "ErrorCode",
     "ErrorHandler",
+    "LocalPlaywrightProvider",
     "ModelAttempt",
     "ModelProviderError",
     "NonRetryableError",
     "OnRetryFn",
     "PerceptionError",
     "ResolvedRetryConfig",
+    "ResolvedSession",
     "RetryOptions",
     "RngFn",
     "SafetyPolicyError",
+    "SessionRecord",
+    "SessionReport",
     "ShouldRetryFn",
     "SleepFn",
     "SyncCleanup",
@@ -148,6 +172,7 @@ __all__ = [
     "UrlPolicyViolation",
     "UrlValidation",
     "classify_http_status",
+    "conversation_scope",
     "get_current_context",
     "is_error_retryable",
     "is_non_retryable",
