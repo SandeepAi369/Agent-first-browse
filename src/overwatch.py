@@ -216,7 +216,7 @@ async def overwatch_node(state: dict[str, Any], page, critic, action_verifier=No
         logger.debug("Intent journal write-ahead skipped (non-fatal): %s", e)
 
     # Execute the action via MCP tools
-    action_outcome = await _execute_action(proposed, page)
+    action_outcome = await _execute_action(proposed, page, elements_list=state.get("elements_list"))
     updates["action_outcome"] = action_outcome
     updates["page_fsm"] = "ACTION_PENDING"
     updates["total_actions"] = state.get("total_actions", 0) + 1
@@ -739,7 +739,7 @@ def _fmt_fail(clean: bool, verb: str, legacy_prefix: str, error: str) -> str:
     return render_failure(classify_failure(verb, error), error)
 
 
-async def _execute_action(proposed: dict, page) -> str:
+async def _execute_action(proposed: dict, page, elements_list: list | None = None) -> str:
     """Execute a proposed action via MCP tools. Returns an outcome string.
 
     V29 Phase A: asymmetric verbosity — terse on success (observable effect only,
@@ -764,12 +764,25 @@ async def _execute_action(proposed: dict, page) -> str:
             return _fmt_fail(clean, verb, "FAILED", result["error"])
 
         elif verb == "click":
-            from mcp_tools import mcp_click
-            result = await mcp_click(
-                x=proposed.get("x", 0),
-                y=proposed.get("y", 0),
-                element_id=proposed.get("element_id"),
-            )
+            from v2_engine import is_v2_mode
+            if is_v2_mode():
+                from v2_engine.actions import v2_click
+                from v2_engine.metrics import get_active_metrics
+                result = await v2_click(
+                    page,
+                    x=proposed.get("x", 0),
+                    y=proposed.get("y", 0),
+                    element_id=proposed.get("element_id"),
+                    elements_list=elements_list,
+                    metrics=get_active_metrics(),
+                )
+            else:
+                from mcp_tools import mcp_click
+                result = await mcp_click(
+                    x=proposed.get("x", 0),
+                    y=proposed.get("y", 0),
+                    element_id=proposed.get("element_id"),
+                )
             if result["success"]:
                 bits = []
                 if result.get("navigated"):
@@ -784,13 +797,27 @@ async def _execute_action(proposed: dict, page) -> str:
             return _fmt_fail(clean, verb, "CLICK INEFFECTIVE", result["error"])
 
         elif verb == "type":
-            from mcp_tools import mcp_type
-            result = await mcp_type(
-                text=proposed.get("text", ""),
-                x=proposed.get("x", 0),
-                y=proposed.get("y", 0),
-                element_id=proposed.get("element_id"),
-            )
+            from v2_engine import is_v2_mode
+            if is_v2_mode():
+                from v2_engine.actions import v2_type
+                from v2_engine.metrics import get_active_metrics
+                result = await v2_type(
+                    page,
+                    text=proposed.get("text", ""),
+                    x=proposed.get("x", 0),
+                    y=proposed.get("y", 0),
+                    element_id=proposed.get("element_id"),
+                    elements_list=elements_list,
+                    metrics=get_active_metrics(),
+                )
+            else:
+                from mcp_tools import mcp_type
+                result = await mcp_type(
+                    text=proposed.get("text", ""),
+                    x=proposed.get("x", 0),
+                    y=proposed.get("y", 0),
+                    element_id=proposed.get("element_id"),
+                )
             if result["success"]:
                 if clean:
                     return f"→ OK (typed {result['actual_length']} chars)"

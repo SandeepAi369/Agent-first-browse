@@ -205,12 +205,15 @@ async def perceive_node(state: BrainState) -> dict:
     if state.step_number >= state.max_steps:
         return {"next_node": "finalize"}
 
-    # Wait for page load
-    try:
-        await page.wait_for_load_state("domcontentloaded", timeout=10000)
-        await page.wait_for_timeout(1500)
-    except Exception:
-        pass
+    # Wait for page load (V2 replaces static 1500ms sleep with adaptive DOM settle)
+    from v2_engine import is_v2_mode as _is_v2_mode
+    _v2_active = _is_v2_mode()
+    if not _v2_active:
+        try:
+            await page.wait_for_load_state("domcontentloaded", timeout=10000)
+            await page.wait_for_timeout(1500)
+        except Exception:
+            pass
 
     current_url = page.url
     logger.info("━━━ Step %d/%d ━━━", state.step_number + 1, state.max_steps)
@@ -225,22 +228,47 @@ async def perceive_node(state: BrainState) -> dict:
         return await mcp_tools.mcp_snapshot()
 
     snapshot = None
-    try:
-        from feature_flags import adaptive_perception_enabled
-        if adaptive_perception_enabled():
-            from perception_engine import perceive as _perceive
-            pr = await _perceive(page, ctx={
-                "objective": state.objective,
-                "bound_target": state.bound_target,
-                "step_number": state.step_number,
-            })
+    if _v2_active:
+        try:
+            from v2_engine.metrics import get_active_metrics as _get_v2_metrics
+            from v2_engine.perception import perceive_v2 as _perceive_v2
+            pr = await _perceive_v2(
+                page,
+                ctx={
+                    "objective": state.objective,
+                    "bound_target": state.bound_target,
+                    "step_number": state.step_number,
+                },
+                metrics=_get_v2_metrics(),
+                do_settle=True,
+                use_mcp_snapshot=True,
+            )
+            current_url = page.url
             snapshot = {
                 "elements": pr.elements, "markdown": pr.markdown,
                 "selector_map": pr.selector_map, "element_count": pr.element_count,
             }
-    except Exception as e:
-        logger.warning("Adaptive perception failed (%s) — using direct snapshot", e)
-        snapshot = None
+        except Exception as e:
+            logger.warning("V2 perception failed (%s) — falling back to legacy perception", e)
+            snapshot = None
+
+    if snapshot is None:
+        try:
+            from feature_flags import adaptive_perception_enabled
+            if adaptive_perception_enabled():
+                from perception_engine import perceive as _perceive
+                pr = await _perceive(page, ctx={
+                    "objective": state.objective,
+                    "bound_target": state.bound_target,
+                    "step_number": state.step_number,
+                })
+                snapshot = {
+                    "elements": pr.elements, "markdown": pr.markdown,
+                    "selector_map": pr.selector_map, "element_count": pr.element_count,
+                }
+        except Exception as e:
+            logger.warning("Adaptive perception failed (%s) — using direct snapshot", e)
+            snapshot = None
     if snapshot is None:
         snapshot = await _direct_snapshot()
 
@@ -798,19 +826,32 @@ async def finalize_node(state: BrainState) -> dict:
 #  Graph Construction
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def build_brain_graph() -> StateGraph:
-    """Construct and return the compiled LangGraph StateGraph."""
+def build_brain_graph(mode: str | None = None) -> StateGraph:
+    """Construct and return the LangGraph StateGraph.
+
+    In `legacy` mode (default), builds the exact untouched legacy graph.
+    In `v2` mode, attaches native LangGraph `RetryPolicy` to transient I/O nodes
+    (`planner`, `perceive`, `overwatch`) for bounded exponential-backoff recovery.
+    """
+    from v2_engine import ENGINE_MODE_V2, get_engine_mode, normalize_engine_mode
+
+    effective_mode = normalize_engine_mode(mode) if mode else get_engine_mode()
+    retry_policy = None
+    if effective_mode == ENGINE_MODE_V2:
+        from v2_engine.graph_policy import v2_retry_policy
+        retry_policy = v2_retry_policy()
+
     g = StateGraph(BrainState)
 
     # ── Add Nodes ──
     g.add_node("goal_compiler", goal_compiler_node)
-    g.add_node("planner", planner_node)
-    g.add_node("perceive", perceive_node)
+    g.add_node("planner", planner_node, retry_policy=retry_policy)
+    g.add_node("perceive", perceive_node, retry_policy=retry_policy)
     g.add_node("router", router_node)
     g.add_node("navigator", navigator_worker)
     g.add_node("interactor", interactor_worker)
     g.add_node("extractor", extractor_worker)
-    g.add_node("overwatch", overwatch_wrapper)
+    g.add_node("overwatch", overwatch_wrapper, retry_policy=retry_policy)
     g.add_node("done_check", done_check_node)
     g.add_node("commit", commit_node)
     g.add_node("retry", retry_node)
@@ -893,8 +934,13 @@ def build_brain_graph() -> StateGraph:
 #  Runner — Initialize modules and execute the graph
 # ═══════════════════════════════════════════════════════════════════════════════
 
-async def run_brain(objective: str, headless: bool = False):
+async def run_brain(objective: str, headless: bool = False, mode: str | None = None):
     """Initialize all modules and execute the brain graph.
+
+    Args:
+        objective: Natural-language task objective.
+        headless: Force true headless mode instead of Xvfb headed stealth.
+        mode: Optional engine mode ('legacy' or 'v2'); defaults to AGENT_ENGINE_MODE.
 
     Owns shutdown: SIGINT/SIGTERM cancel this task (SessionGuard.bind_task), and
     the `finally` closes the browser AND stops the Playwright driver on every exit
@@ -902,6 +948,16 @@ async def run_brain(objective: str, headless: bool = False):
     so the caller can exit non-zero.
     """
     from advanced_agent import SessionGuard
+    from v2_engine import get_engine_mode, set_engine_mode
+    from v2_engine.metrics import reset_active_metrics
+    from v2_engine.perception import get_shared_compressor
+
+    if mode is not None:
+        set_engine_mode(mode)
+    active_mode = get_engine_mode()
+    metrics = reset_active_metrics(active_mode)
+    get_shared_compressor().invalidate()
+
     guard = SessionGuard.get()
     guard.bind_task()
     try:
@@ -910,6 +966,8 @@ async def run_brain(objective: str, headless: bool = False):
         logger.warning("Interrupted — shutting down the browser cleanly...")
         raise
     finally:
+        if metrics.steps:
+            logger.info("📊 [%s mode] Telemetry summary: %s", active_mode, metrics.summary())
         await guard.shutdown()
         try:
             from virtual_display import stop_virtual_display
@@ -1063,8 +1121,14 @@ async def _run_brain_session(objective: str, headless: bool):
     except Exception as e:
         logger.warning("SkillMemory init failed: %s", e)
 
-    # ── Build Graph ──
-    graph_builder = build_brain_graph()
+    # ── Build Graph (mode-aware: legacy untouched vs v2 with RetryPolicy) ──
+    from v2_engine import get_engine_mode as _active_mode
+    from v2_engine.graph_policy import detect_stealth_driver
+    _mode_now = _active_mode()
+    _drv = detect_stealth_driver()
+    logger.info("⚙️ Engine mode: %s | driver=%s (cdp_leak_patched=%s)",
+                _mode_now.upper(), _drv["driver"], _drv["cdp_runtime_leak_patched"])
+    graph_builder = build_brain_graph(mode=_mode_now)
 
     # ── Compile with Checkpointer ──
     # In-memory only. Each run uses a fresh thread_id and nothing ever resumes or

@@ -30,7 +30,36 @@ if [[ ! -x "$VENV_PY" ]]; then
   exit 1
 fi
 
-# ── 2. Get the task: from the command line, or ask for it ──
+# ── 2. Parse optional --mode {legacy,v2} / --headless flags, then task ──
+EXTRA_FLAGS=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --mode)
+      if [[ $# -lt 2 ]]; then
+        echo "❌ --mode requires a value: legacy or v2"
+        exit 2
+      fi
+      EXTRA_FLAGS+=(--mode "$2")
+      shift 2
+      ;;
+    --mode=*)
+      EXTRA_FLAGS+=("$1")
+      shift
+      ;;
+    --headless)
+      EXTRA_FLAGS+=(--headless)
+      shift
+      ;;
+    --)
+      shift
+      break
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
+
 if [[ $# -gt 0 ]]; then
   TASK="$*"
 else
@@ -61,4 +90,4 @@ echo
 
 # ── 4. Run the agent. No --headless → it auto-picks the stealth headed display.
 #     'exec' hands the terminal to Python so Ctrl-C shuts the browser down cleanly.
-exec "$VENV_PY" src/run_v16.py run "$TASK"
+exec "$VENV_PY" src/run_v16.py run "${EXTRA_FLAGS[@]}" "$TASK"
