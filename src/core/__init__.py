@@ -8,10 +8,24 @@ evaluation connector, and orchestration layers:
   - `core.url_policy`: Defense-in-depth URL & RFC 6890 SSRF validator.
   - `core.truncate`: Structural water-filling JSON & text payload truncation.
   - `core.redaction`: Cycle-/depth-bounded base64, screenshot, & secret redaction.
+  - `core.disposable`: LIFO sync/async disposable stores & listener-isolated `Emitter`.
+  - `core.runtime_context`: `ContextVar`-backed per-session DI runtime context.
 """
 
 from __future__ import annotations
 
+from core.disposable import (
+    AsyncCleanup,
+    AsyncDisposable,
+    AsyncDisposableStore,
+    Disposable,
+    DisposableStore,
+    Emitter,
+    ErrorHandler,
+    SyncCleanup,
+    to_async_disposable,
+    to_disposable,
+)
 from core.errors import (
     ActionExecutionError,
     AgentBrowseError,
@@ -57,6 +71,17 @@ from core.retries import (
     try_n,
     validate_retry_options,
 )
+from core.runtime_context import (
+    DEFAULT_RUNTIME_SCOPE,
+    VALID_RUNTIME_MODES,
+    BrowserRuntimeContext,
+    get_current_context,
+    require_current_context,
+    resolve_context_value,
+    run_in_context,
+    scoped_runtime_context,
+    use_runtime_context,
+)
 from core.truncate import (
     CHARS_PER_TOKEN,
     DEFAULT_MAX_TOKENS,
@@ -85,17 +110,27 @@ __all__ = [
     "DEFAULT_RETRY_CONFIG",
     "DEFAULT_RETRY_MAX_ATTEMPTS",
     "DEFAULT_RETRY_MAX_DELAY_MS",
+    "DEFAULT_RUNTIME_SCOPE",
     "MAX_REDACTION_DEPTH",
     "MAX_REDACTION_NODES",
     "MIN_SLOT",
     "SECRET_MASK",
     "TRUNCATION_MARKER",
+    "VALID_RUNTIME_MODES",
     "ActionExecutionError",
     "AgentBrowseError",
+    "AsyncCleanup",
+    "AsyncDisposable",
+    "AsyncDisposableStore",
+    "BrowserRuntimeContext",
     "BrowserSessionError",
     "BrowserSessionGoneError",
     "ConfigValidationError",
+    "Disposable",
+    "DisposableStore",
+    "Emitter",
     "ErrorCode",
+    "ErrorHandler",
     "ModelAttempt",
     "ModelProviderError",
     "NonRetryableError",
@@ -107,11 +142,13 @@ __all__ = [
     "SafetyPolicyError",
     "ShouldRetryFn",
     "SleepFn",
+    "SyncCleanup",
     "TruncateOptions",
     "UrlPolicy",
     "UrlPolicyViolation",
     "UrlValidation",
     "classify_http_status",
+    "get_current_context",
     "is_error_retryable",
     "is_non_retryable",
     "is_private_or_local_host",
@@ -122,12 +159,19 @@ __all__ = [
     "redact_base64_string",
     "redact_inline_secrets",
     "redact_payload",
+    "require_current_context",
     "require_valid_url",
+    "resolve_context_value",
     "resolve_retry_config",
+    "run_in_context",
+    "scoped_runtime_context",
+    "to_async_disposable",
+    "to_disposable",
     "to_error_message",
     "truncate_result",
     "truncate_text",
     "try_n",
+    "use_runtime_context",
     "validate_retry_options",
     "validate_url",
 ]
