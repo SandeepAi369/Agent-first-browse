@@ -41,6 +41,7 @@ from v2_engine.graph_policy import detect_stealth_driver, is_transient_graph_err
 from v2_engine.metrics import RunMetrics, estimate_tokens
 from v2_engine.perception import (
     V2SnapshotCompressor,
+    extract_tier2_a11y_fallback,
     filter_occluded_elements,
     perceive_v2,
     wait_for_dom_settle,
@@ -347,6 +348,103 @@ def test_v2_actions_stale_ref_rebind_state_safety_net_and_retry_live():
             assert type_res["success"] is True
             assert attempts["n"] == 2
             assert metrics.total_action_retries == 1
+        finally:
+            await browser.close()
+            await pw.stop()
+
+    asyncio.run(run())
+
+
+async def test_tier2_a11y_checked_and_disabled_string_truthiness(monkeypatch):
+    import a11y_parser
+
+    async def _fake_extract(page, timeout=3.0):
+        return {
+            "source": "cdp_ax_tree",
+            "refid_text": "",
+            "elements": [
+                {"ref": "e1", "role": "menuitemcheckbox", "name": "Unchecked Str", "properties": {"checked": "false"}},
+                {"ref": "e2", "role": "checkbox", "name": "Unchecked Bool", "properties": {"checked": False}},
+                {"ref": "e3", "role": "checkbox", "name": "Checked Bool", "properties": {"checked": True}},
+                {"ref": "e4", "role": "menuitemcheckbox", "name": "Checked Str", "properties": {"checked": "true"}},
+                {"ref": "e5", "role": "checkbox", "name": "Mixed Str", "properties": {"checked": "mixed"}},
+                {
+                    "ref": "e6", "role": "button", "name": "Enabled Str",
+                    "properties": {"disabled": "false"},
+                },
+                {
+                    "ref": "e7", "role": "button", "name": "Disabled Str",
+                    "properties": {"disabled": "true"},
+                },
+            ],
+        }
+
+    monkeypatch.setattr(a11y_parser, "extract", _fake_extract)
+    pr = await extract_tier2_a11y_fallback(page=None)
+    assert pr is not None
+    by_id = {e["id"]: e["text"] for e in pr.elements}
+    assert by_id["e1"] == "Unchecked Str"
+    assert by_id["e2"] == "Unchecked Bool"
+    assert by_id["e3"] == "Checked Bool [checked]"
+    assert by_id["e4"] == "Checked Str [checked]"
+    assert by_id["e5"] == "Mixed Str [checked]"
+    assert by_id["e6"] == "Enabled Str"
+    assert by_id["e7"] == "Disabled Str [disabled]"
+
+
+def test_v2_click_label_wrapped_and_for_associated_checkbox_live():
+    html = """<!doctype html><html><body>
+      <label id="lbl-nested" style="position:absolute;left:30px;top:30px;">
+        <input id="cb-nested" type="checkbox" /> Enable Canary Rollout
+      </label>
+      <label id="lbl-for" for="cb-ext" style="position:absolute;left:30px;top:90px;">
+        Accept Release Notes
+      </label>
+      <input id="cb-ext" type="checkbox" style="position:absolute;left:220px;top:90px;" />
+    </body></html>"""
+
+    async def run():
+        from playwright.async_api import async_playwright
+        pw = await async_playwright().start()
+        browser = await pw.chromium.launch(headless=True)
+        try:
+            page = await browser.new_page(viewport={"width": 800, "height": 600})
+            await page.set_content(html)
+            snap = await dom_parser.extract(page)
+            els = snap["elements"]
+            nested_lbl = next(e for e in els if "Enable Canary Rollout" in e["text"])
+            for_lbl = next(e for e in els if "Accept Release Notes" in e["text"])
+
+            metrics = RunMetrics(mode="v2")
+
+            async def _false_neg_nested(x=0, y=0, element_id=None):
+                await page.evaluate("() => { document.getElementById('cb-nested').checked = true; }")
+                return {
+                    "success": False, "strategy": "", "navigated": False,
+                    "dom_changed": False, "error": "Click ineffective",
+                }
+
+            r1 = await v2_click(
+                page, x=nested_lbl["x"], y=nested_lbl["y"],
+                element_id=nested_lbl["id"], elements_list=els,
+                metrics=metrics, click_fn=_false_neg_nested,
+            )
+            assert r1["success"] is True and r1["strategy"] == "v2_aid_state_verified"
+
+            async def _false_neg_ext(x=0, y=0, element_id=None):
+                await page.evaluate("() => { document.getElementById('cb-ext').checked = true; }")
+                return {
+                    "success": False, "strategy": "", "navigated": False,
+                    "dom_changed": False, "error": "Click ineffective",
+                }
+
+            r2 = await v2_click(
+                page, x=for_lbl["x"], y=for_lbl["y"],
+                element_id=for_lbl["id"], elements_list=els,
+                metrics=metrics, click_fn=_false_neg_ext,
+            )
+            assert r2["success"] is True and r2["strategy"] == "v2_aid_state_verified"
+            assert metrics.total_state_safety_overrides == 2
         finally:
             await browser.close()
             await pw.stop()

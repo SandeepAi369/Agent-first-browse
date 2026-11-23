@@ -295,6 +295,24 @@ _ROLE_TO_KIND = {
 }
 
 
+def _is_checked_prop(val: Any) -> bool:
+    """True only for genuinely checked/mixed ARIA states (not string 'false')."""
+    if val is True:
+        return True
+    if isinstance(val, str):
+        return val.strip().lower() in ("true", "mixed")
+    return False
+
+
+def _is_true_prop(val: Any) -> bool:
+    """True only for boolean True or string 'true' (not string 'false')."""
+    if val is True:
+        return True
+    if isinstance(val, str):
+        return val.strip().lower() == "true"
+    return False
+
+
 async def extract_tier2_a11y_fallback(page, timeout: float = 3.0) -> PerceptionResult | None:
     """Escalate to `a11y_parser.extract` when Tier-1 DOM extraction is sparse."""
     try:
@@ -320,9 +338,9 @@ async def extract_tier2_a11y_fallback(page, timeout: float = 3.0) -> PerceptionR
             name += " [filled: value hidden]"
         elif props.get("value"):
             name += f' [filled: "{str(props["value"])[:40]}"]'
-        elif props.get("checked"):
+        elif _is_checked_prop(props.get("checked")):
             name += " [checked]"
-        if props.get("disabled"):
+        if _is_true_prop(props.get("disabled")):
             name += " [disabled]"
 
         bbox = item.get("bbox") or {}

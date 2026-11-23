@@ -48,19 +48,43 @@ _INSPECT_REF_JS = r"""
     const el = reg[eid];
     if (!el) return { found: false, reason: 'not_in_registry' };
     if (!el.isConnected) return { found: false, reason: 'detached' };
-    const disabled = !!el.disabled || el.getAttribute('aria-disabled') === 'true';
+    const isLabel = (el.tagName || '').toUpperCase() === 'LABEL';
+    let ctl = null;
+    if (isLabel) {
+        try {
+            ctl = el.control || el.querySelector('input[type="checkbox"], input[type="radio"]');
+        } catch (_) { ctl = null; }
+    }
+    const disabled = !!el.disabled
+        || el.getAttribute('aria-disabled') === 'true'
+        || !!(ctl && (ctl.disabled || ctl.getAttribute('aria-disabled') === 'true'));
     try { el.scrollIntoView({ block: 'center', inline: 'center' }); } catch (_) {}
     let r;
     try { r = el.getBoundingClientRect(); } catch (_) { return { found: false, reason: 'no_rect' }; }
     if (r.width < 1 || r.height < 1) return { found: false, reason: 'zero_size' };
+    let targetRect = r;
+    let useControlCoords = false;
+    if (ctl && ctl.isConnected) {
+        try {
+            const cr = ctl.getBoundingClientRect();
+            const cst = window.getComputedStyle(ctl);
+            if (cr.width >= 4 && cr.height >= 4
+                && cst.display !== 'none' && cst.visibility !== 'hidden'
+                && parseFloat(cst.opacity) > 0.01) {
+                targetRect = cr;
+                useControlCoords = true;
+            }
+        } catch (_) {}
+    }
     return {
         found: true,
         disabled,
-        x: Math.round(r.left + r.width / 2),
-        y: Math.round(r.top + r.height / 2),
-        checked: !!el.checked,
-        selected: !!el.selected,
-        ariaChecked: el.getAttribute('aria-checked') || '',
+        useControlCoords,
+        x: Math.round(targetRect.left + targetRect.width / 2),
+        y: Math.round(targetRect.top + targetRect.height / 2),
+        checked: !!(el.checked || (ctl && ctl.checked)),
+        selected: !!(el.selected || (ctl && ctl.selected)),
+        ariaChecked: el.getAttribute('aria-checked') || (ctl && ctl.getAttribute('aria-checked')) || '',
         ariaExpanded: el.getAttribute('aria-expanded') || '',
         ariaSelected: el.getAttribute('aria-selected') || '',
         ariaPressed: el.getAttribute('aria-pressed') || '',
@@ -250,7 +274,8 @@ async def v2_click(
                         ),
                     }
 
-        last_result = await click_fn(x=cur_x, y=cur_y, element_id=element_id)
+        pass_eid = None if (pre_state and pre_state.get("useControlCoords")) else element_id
+        last_result = await click_fn(x=cur_x, y=cur_y, element_id=pass_eid)
         if last_result.get("success"):
             return last_result
 
