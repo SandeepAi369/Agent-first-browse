@@ -11,6 +11,7 @@ evaluation connector, and orchestration layers:
   - `core.disposable`: LIFO sync/async disposable stores & listener-isolated `Emitter`.
   - `core.runtime_context`: `ContextVar`-backed per-session DI runtime context.
   - `core.browser_provider`: `BrowserProvider` seam, per-session locks, & restart tombstones.
+  - `core.observability`: Schema-versioned typed event bus & pluggable telemetry sinks.
 """
 
 from __future__ import annotations
@@ -56,6 +57,22 @@ from core.errors import (
     is_error_retryable,
     is_non_retryable,
     to_error_message,
+)
+from core.observability import (
+    DEFAULT_OBSERVABILITY_BUS,
+    OBSERVABILITY_SCHEMA_VERSION,
+    EventHandler,
+    EventSink,
+    EventType,
+    JsonlFileSink,
+    LangSmithSink,
+    MemoryEventSink,
+    ObservabilityBus,
+    ObservabilityEvent,
+    RunMetricsSink,
+    build_langsmith_run_payload,
+    build_run_config,
+    get_default_bus,
 )
 from core.redaction import (
     BASE64_REDACTION_THRESHOLD,
@@ -121,6 +138,7 @@ __all__ = [
     "DEFAULT_BROWSER_SCOPE",
     "DEFAULT_MAX_TOKENS",
     "DEFAULT_MAX_URL_LENGTH",
+    "DEFAULT_OBSERVABILITY_BUS",
     "DEFAULT_RETRY_BASE_DELAY_MS",
     "DEFAULT_RETRY_CONFIG",
     "DEFAULT_RETRY_MAX_ATTEMPTS",
@@ -130,6 +148,7 @@ __all__ = [
     "MAX_REDACTION_DEPTH",
     "MAX_REDACTION_NODES",
     "MIN_SLOT",
+    "OBSERVABILITY_SCHEMA_VERSION",
     "SECRET_MASK",
     "TRUNCATION_MARKER",
     "VALID_RUNTIME_MODES",
@@ -151,16 +170,25 @@ __all__ = [
     "Emitter",
     "ErrorCode",
     "ErrorHandler",
+    "EventHandler",
+    "EventSink",
+    "EventType",
+    "JsonlFileSink",
+    "LangSmithSink",
     "LocalPlaywrightProvider",
+    "MemoryEventSink",
     "ModelAttempt",
     "ModelProviderError",
     "NonRetryableError",
+    "ObservabilityBus",
+    "ObservabilityEvent",
     "OnRetryFn",
     "PerceptionError",
     "ResolvedRetryConfig",
     "ResolvedSession",
     "RetryOptions",
     "RngFn",
+    "RunMetricsSink",
     "SafetyPolicyError",
     "SessionRecord",
     "SessionReport",
@@ -171,9 +199,12 @@ __all__ = [
     "UrlPolicy",
     "UrlPolicyViolation",
     "UrlValidation",
+    "build_langsmith_run_payload",
+    "build_run_config",
     "classify_http_status",
     "conversation_scope",
     "get_current_context",
+    "get_default_bus",
     "is_error_retryable",
     "is_non_retryable",
     "is_private_or_local_host",
