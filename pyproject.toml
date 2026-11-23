@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "agent-first-ide"
 version = "0.1.0"
-description = "Dual-model LangGraph browser automation orchestrator with Supervisor + Worker VLM architecture."
+description = "Fast, token-efficient autonomous browser control engine powered by LangGraph, Playwright, accessibility-tree perception, and MCP."
 readme = "README.md"
 license = "GPL-3.0-or-later"
 license-files = ["LICENSE"]

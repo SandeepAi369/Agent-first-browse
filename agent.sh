@@ -5,7 +5,7 @@
 # You do NOT need to know anything about Python or virtual environments.
 # Just give it a task:
 #
-#     ./agent.sh "search Flipkart for a water bottle under 300 rupees and add it to the cart"
+#     ./agent.sh --mode v2 "Open https://news.ycombinator.com and find the top 3 stories"
 #
 # or run it with no task and it will ask you:
 #
@@ -64,7 +64,7 @@ if [[ $# -gt 0 ]]; then
   TASK="$*"
 else
   echo "🤖 What should the agent do?"
-  echo "   e.g.  search Flipkart for a water bottle under ₹300 and add it to the cart"
+  echo "   e.g.  Open https://news.ycombinator.com and find the top 3 stories"
   printf "> "
   read -r TASK || true
 fi
