@@ -1,9 +1,8 @@
 """Structural water-filling JSON & text result truncation.
 
-Adapts Cloudflare's `browser/truncate.ts` (`truncateResult`) to Python 3.11+
-stdlib so oversized browser snapshots, MCP responses, and tool outputs stay
-within strict character/token budgets while remaining valid JSON of the
-original shape with explicit `--- TRUNCATED ---` markers.
+Built on Python 3.11+ stdlib so oversized browser snapshots, MCP responses, and
+tool outputs stay within strict character/token budgets while remaining valid
+JSON of the original shape with explicit `--- TRUNCATED ---` markers.
 
 Water-filling strategy:
   - Small values keep their full size; the largest values absorb cuts first.

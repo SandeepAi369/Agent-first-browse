@@ -1,8 +1,8 @@
 """Composable resource disposal & listener-isolated typed event emission.
 
-Adapts Cloudflare's `core/events.ts` (`Disposable`, `toDisposable`,
-`DisposableStore`, `Emitter<T>`) to Python 3.11+ with first-class `asyncio`
-support (`AsyncDisposable`, `AsyncDisposableStore`).
+Provides synchronous (`Disposable`, `to_disposable`, `DisposableStore`,
+`Emitter[T]`) and first-class `asyncio` (`AsyncDisposable`,
+`AsyncDisposableStore`) cleanup primitives for Python 3.11+.
 
 Key guarantees:
   - Idempotent wrappers (`to_disposable`, `to_async_disposable`) ensure each

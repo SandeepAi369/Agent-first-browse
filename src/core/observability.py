@@ -1,7 +1,7 @@
 """Decoupled, typed observability event bus and pluggable telemetry sinks.
 
-Adapts Cloudflare's `observability/{base,emitter,agent,mcp}.ts` to Python 3.11+
-while remaining completely decoupled from legacy `app/browser_promoter/state.py`:
+Built for Python 3.11+ while remaining completely decoupled from legacy
+`app/browser_promoter/state.py`:
 
   - Independent `OBSERVABILITY_SCHEMA_VERSION = "1"` (never tied to package version).
   - Silent-by-default `ObservabilityBus` backed by `core.disposable.Emitter` so

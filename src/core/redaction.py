@@ -1,8 +1,8 @@
 """Unified base64, screenshot, and V34 secret redaction for logs, MCP, and traces.
 
-Combines Cloudflare's `core/base64-redaction.ts` (cycle-, depth-, and
-node-bounded traversal that preserves binary types) with Agent-first-browse's
-V34 secret-field redaction and raw credential pattern masking.
+Combines cycle-, depth-, and node-bounded traversal (preserving binary types)
+with Agent-first-browse's V34 secret-field redaction and raw credential pattern
+masking.
 """
 
 from __future__ import annotations

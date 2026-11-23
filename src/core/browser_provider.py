@@ -1,8 +1,7 @@
 """Browser provider seam, per-session scoped locks, and restart tombstone tracking.
 
-Adapts Cloudflare's `browser/providers/provider-adapter.ts`, `browser/scope.ts`,
-`browser/session-store.ts`, `browser/browser.ts`, and `browser/session.ts` to
-Python 3.11+ `asyncio`:
+Provides Python 3.11+ `asyncio` lifecycle orchestration with clean provider
+isolation and explicit recovery visibility:
 
   - Closed `BrowserProvider` Protocol seam decoupling browser launch/liveness/
     teardown from session orchestration, locks, and restart detection.

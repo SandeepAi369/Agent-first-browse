@@ -57,7 +57,6 @@ tests/
 
 docs/
   AUDIT_REPORT_agent_first_browse.md      # §6 preservation rules & V27 audit
-  CLOUDFLARE_ARCHITECTURE_COMPARISON.md   # Architectural comparison & chunked upgrade roadmap
   EVAL_CONNECTOR.md                       # Zero-API CLI + MCP evaluation connector guide
   TEST_COVERAGE_MATRIX.md                 # Feature × layer test coverage & tracked debt
   V29_OVERHAUL.md                         # V29 cognitive reliability layers

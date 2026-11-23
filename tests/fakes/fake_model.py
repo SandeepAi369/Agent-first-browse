@@ -1,7 +1,7 @@
 """Content-addressed scripted fake LLM for deterministic zero-API graph tests.
 
-Adapts Cloudflare's `packages/fake-model/src/script.ts` to Python / LangChain /
-LangGraph structured invocations (`ainvoke` + `with_structured_output(schema)`):
+Built for Python / LangChain / LangGraph structured invocations (`ainvoke` +
+`with_structured_output(schema)`):
 
   1. Turn/step content addressing (`[<turn_id>]` marker):
      Selects the reply from the newest user/human message carrying `[<turn_id>]`

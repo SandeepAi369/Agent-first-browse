@@ -1,9 +1,9 @@
 """Defense-in-depth URL safety & SSRF policy validator.
 
-Adapts Cloudflare's `web/url-policy.ts` to Python 3.11+ stdlib (`urllib.parse`
-+ `ipaddress`) with explicit handling of Python-specific URL quirks (legacy
-octal/hex/integer IPv4 forms, IPv4-mapped/6to4/Teredo IPv6 addresses, IPv6
-zone IDs, IDN punycode canonicalization, and control-character smuggling).
+Built on Python 3.11+ stdlib (`urllib.parse` + `ipaddress`) with explicit
+handling of URL smuggling and parser quirks (legacy octal/hex/integer IPv4
+forms, IPv4-mapped/6to4/Teredo IPv6 addresses, IPv6 zone IDs, IDN punycode
+canonicalization, and control-character smuggling).
 
 Design principles:
   - `validate_url()` NEVER throws on untrusted input strings; it returns a

@@ -1,8 +1,8 @@
 """Centralized, eagerly-validated retry primitive with full-jitter backoff.
 
-Adapts Cloudflare's `retries.ts` (`RetryOptions`, `validateRetryOptions`,
-`resolveRetryConfig`, AWS full-jitter `jitterBackoff`, and attempt-aware `tryN`)
-to Python 3.11+ `asyncio`, integrating cleanly with `core.errors`.
+Provides `RetryOptions`, `validate_retry_options`, `resolve_retry_config`,
+AWS full-jitter `jitter_backoff`, and attempt-aware `try_n` for Python 3.11+
+`asyncio`, integrating cleanly with `core.errors`.
 
 Key guarantees:
   - Eager configuration validation: invalid bounds or cross-field mismatches

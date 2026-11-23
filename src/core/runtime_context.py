@@ -1,7 +1,6 @@
 """Explicit `ContextVar`-backed runtime context for concurrency-safe session isolation.
 
-Adapts Cloudflare's ambient host-context pattern (`lifecycle/current-agent.ts`)
-to Python 3.11+ `contextvars.ContextVar` so concurrent `asyncio.Task` sessions
+Uses Python 3.11+ `contextvars.ContextVar` so concurrent `asyncio.Task` sessions
 each carry their own isolated `page`, `selector_map`, `engine_mode`,
 `compressor`, `metrics`, LLM chains, and `AsyncDisposableStore` without mutating
 process-wide module globals (`_PAGE`, `_SELECTOR_MAP`, `AGENT_ENGINE_MODE`).
