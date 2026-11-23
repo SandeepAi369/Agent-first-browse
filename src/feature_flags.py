@@ -150,6 +150,18 @@ def skill_memory_v2_enabled() -> bool:
     return v29_enabled() and _flag("V29_SKILL_MEMORY_V2", False)
 
 
+# ── Dual-Mode Engine Switch (legacy vs v2 live side-by-side testing) ────────────
+def engine_mode() -> str:
+    """Return active engine mode: 'legacy' (default) or 'v2' via AGENT_ENGINE_MODE."""
+    from v2_engine import get_engine_mode
+    return get_engine_mode()
+
+
+def v2_engine_enabled() -> bool:
+    """True when running the upgraded V2 browser engine (`--mode v2`)."""
+    return engine_mode() == "v2"
+
+
 def active_flags() -> dict[str, bool]:
     """Snapshot of every flag — logged once at startup for run-log auditability."""
     return {
@@ -171,4 +183,5 @@ def active_flags() -> dict[str, bool]:
         "V29_WEBDREAMER_SITUATIONAL": webdreamer_situational_enabled(),
         "V29_LATS": lats_enabled(),
         "V29_SKILL_MEMORY_V2": skill_memory_v2_enabled(),
+        "V2_ENGINE": v2_engine_enabled(),
     }
