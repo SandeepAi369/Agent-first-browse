@@ -5,6 +5,9 @@ evaluation connector, and orchestration layers:
   - `core.errors`: Typed domain exception hierarchy with stable `ErrorCode` values,
     explicit `.retryable` metadata, and JSON-safe serialization.
   - `core.retries`: Eagerly-validated full-jitter exponential backoff & async `try_n`.
+  - `core.url_policy`: Defense-in-depth URL & RFC 6890 SSRF validator.
+  - `core.truncate`: Structural water-filling JSON & text payload truncation.
+  - `core.redaction`: Cycle-/depth-bounded base64, screenshot, & secret redaction.
 """
 
 from __future__ import annotations
@@ -26,6 +29,16 @@ from core.errors import (
     is_non_retryable,
     to_error_message,
 )
+from core.redaction import (
+    BASE64_REDACTION_THRESHOLD,
+    MAX_REDACTION_DEPTH,
+    MAX_REDACTION_NODES,
+    SECRET_MASK,
+    is_secret_key,
+    redact_base64_string,
+    redact_inline_secrets,
+    redact_payload,
+)
 from core.retries import (
     DEFAULT_RETRY_BASE_DELAY_MS,
     DEFAULT_RETRY_CONFIG,
@@ -44,12 +57,39 @@ from core.retries import (
     try_n,
     validate_retry_options,
 )
+from core.truncate import (
+    CHARS_PER_TOKEN,
+    DEFAULT_MAX_TOKENS,
+    MIN_SLOT,
+    TRUNCATION_MARKER,
+    TruncateOptions,
+    truncate_result,
+    truncate_text,
+)
+from core.url_policy import (
+    DEFAULT_MAX_URL_LENGTH,
+    UrlPolicy,
+    UrlPolicyViolation,
+    UrlValidation,
+    is_private_or_local_host,
+    require_valid_url,
+    validate_url,
+)
 
 __all__ = [
+    "BASE64_REDACTION_THRESHOLD",
+    "CHARS_PER_TOKEN",
+    "DEFAULT_MAX_TOKENS",
+    "DEFAULT_MAX_URL_LENGTH",
     "DEFAULT_RETRY_BASE_DELAY_MS",
     "DEFAULT_RETRY_CONFIG",
     "DEFAULT_RETRY_MAX_ATTEMPTS",
     "DEFAULT_RETRY_MAX_DELAY_MS",
+    "MAX_REDACTION_DEPTH",
+    "MAX_REDACTION_NODES",
+    "MIN_SLOT",
+    "SECRET_MASK",
+    "TRUNCATION_MARKER",
     "ActionExecutionError",
     "AgentBrowseError",
     "BrowserSessionError",
@@ -67,14 +107,27 @@ __all__ = [
     "SafetyPolicyError",
     "ShouldRetryFn",
     "SleepFn",
+    "TruncateOptions",
+    "UrlPolicy",
+    "UrlPolicyViolation",
+    "UrlValidation",
     "classify_http_status",
     "is_error_retryable",
     "is_non_retryable",
+    "is_private_or_local_host",
+    "is_secret_key",
     "is_transient_error",
     "jitter_backoff_ms",
     "jitter_backoff_s",
+    "redact_base64_string",
+    "redact_inline_secrets",
+    "redact_payload",
+    "require_valid_url",
     "resolve_retry_config",
     "to_error_message",
+    "truncate_result",
+    "truncate_text",
     "try_n",
     "validate_retry_options",
+    "validate_url",
 ]
