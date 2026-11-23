@@ -12,6 +12,7 @@ evaluation connector, and orchestration layers:
   - `core.runtime_context`: `ContextVar`-backed per-session DI runtime context.
   - `core.browser_provider`: `BrowserProvider` seam, per-session locks, & restart tombstones.
   - `core.observability`: Schema-versioned typed event bus & pluggable telemetry sinks.
+  - `core.settings`: Typed, secret-masked env settings decoupled from legacy promoter config.
 """
 
 from __future__ import annotations
@@ -113,6 +114,21 @@ from core.runtime_context import (
     scoped_runtime_context,
     use_runtime_context,
 )
+from core.settings import (
+    AppSettings,
+    EngineSettings,
+    EvalConnectorSettings,
+    FeatureFlagSnapshot,
+    ModelProviderSettings,
+    ObservabilitySettings,
+    SafetySettings,
+    SecretValue,
+    load_settings,
+    parse_env_bool,
+    parse_env_float,
+    parse_env_int,
+    parse_env_list,
+)
 from core.truncate import (
     CHARS_PER_TOKEN,
     DEFAULT_MAX_TOKENS,
@@ -154,6 +170,7 @@ __all__ = [
     "VALID_RUNTIME_MODES",
     "ActionExecutionError",
     "AgentBrowseError",
+    "AppSettings",
     "AsyncCleanup",
     "AsyncDisposable",
     "AsyncDisposableStore",
@@ -168,20 +185,25 @@ __all__ = [
     "Disposable",
     "DisposableStore",
     "Emitter",
+    "EngineSettings",
     "ErrorCode",
     "ErrorHandler",
+    "EvalConnectorSettings",
     "EventHandler",
     "EventSink",
     "EventType",
+    "FeatureFlagSnapshot",
     "JsonlFileSink",
     "LangSmithSink",
     "LocalPlaywrightProvider",
     "MemoryEventSink",
     "ModelAttempt",
     "ModelProviderError",
+    "ModelProviderSettings",
     "NonRetryableError",
     "ObservabilityBus",
     "ObservabilityEvent",
+    "ObservabilitySettings",
     "OnRetryFn",
     "PerceptionError",
     "ResolvedRetryConfig",
@@ -190,6 +212,8 @@ __all__ = [
     "RngFn",
     "RunMetricsSink",
     "SafetyPolicyError",
+    "SafetySettings",
+    "SecretValue",
     "SessionRecord",
     "SessionReport",
     "ShouldRetryFn",
@@ -212,6 +236,11 @@ __all__ = [
     "is_transient_error",
     "jitter_backoff_ms",
     "jitter_backoff_s",
+    "load_settings",
+    "parse_env_bool",
+    "parse_env_float",
+    "parse_env_int",
+    "parse_env_list",
     "redact_base64_string",
     "redact_inline_secrets",
     "redact_payload",
