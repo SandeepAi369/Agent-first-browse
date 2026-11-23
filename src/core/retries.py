@@ -19,8 +19,9 @@ from __future__ import annotations
 import asyncio
 import math
 import random
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Awaitable, Callable, TypeVar
+from typing import TypeVar
 
 from core.errors import (
     AgentBrowseError,

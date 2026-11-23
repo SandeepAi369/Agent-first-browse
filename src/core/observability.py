@@ -19,14 +19,16 @@ while remaining completely decoupled from legacy `app/browser_promoter/state.py`
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import time
 from collections import deque
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
-from enum import Enum
+from enum import StrEnum
 from pathlib import Path
-from typing import Any, Callable, Iterable, Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 from core.disposable import Disposable, Emitter, ErrorHandler
 from core.errors import ConfigValidationError
@@ -39,7 +41,7 @@ logger = logging.getLogger("core.observability")
 OBSERVABILITY_SCHEMA_VERSION: str = "1"
 
 
-class EventType(str, Enum):
+class EventType(StrEnum):
     """Canonical observability event names across perception, actions, MCP, and sessions."""
 
     PERCEPTION_COMPLETED = "perception.completed"
@@ -221,11 +223,12 @@ class MemoryEventSink:
     """In-memory bounded event buffer useful for tests and MCP/CLI diagnostics."""
 
     def __init__(self, *, max_events: int | None = None) -> None:
-        if max_events is not None:
-            if isinstance(max_events, bool) or not isinstance(max_events, int) or max_events <= 0:
-                raise ConfigValidationError(
-                    f"memory_sink.max_events must be an integer > 0, got {max_events!r}"
-                )
+        if max_events is not None and (
+            isinstance(max_events, bool) or not isinstance(max_events, int) or max_events <= 0
+        ):
+            raise ConfigValidationError(
+                f"memory_sink.max_events must be an integer > 0, got {max_events!r}"
+            )
         self._events: deque[ObservabilityEvent] = deque(maxlen=max_events)
 
     @property
@@ -275,10 +278,8 @@ class JsonlFileSink:
         if self._closed:
             return
         self._closed = True
-        try:
+        with contextlib.suppress(OSError):
             self._fh.close()
-        except OSError:
-            pass
 
 
 @runtime_checkable

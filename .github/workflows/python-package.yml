@@ -27,10 +27,19 @@ jobs:
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
-        python -m pip install flake8 pytest pytest-asyncio
+        python -m pip install flake8 ruff mypy pytest pytest-asyncio
         pip install -r requirements.txt
         # Browser-backed unit tests (perception, upload, secret masking) need Chromium
         python -m playwright install --with-deps chromium
+    - name: Check architecture guardrails
+      run: |
+        python scripts/check_guardrails.py --strict-test-hygiene
+    - name: Lint with ruff (scoped modern packages)
+      run: |
+        ruff check src/core src/v2_engine src/eval_connector scripts/check_guardrails.py
+    - name: Type-check with mypy (progressive scope)
+      run: |
+        mypy src/core src/v2_engine src/eval_connector scripts/check_guardrails.py
     - name: Lint with flake8
       run: |
         # stop the build if there are Python syntax errors or undefined names

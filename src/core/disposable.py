@@ -19,7 +19,8 @@ from __future__ import annotations
 
 import inspect
 import logging
-from typing import Awaitable, Callable, Generic, Protocol, TypeVar, runtime_checkable
+from collections.abc import Awaitable, Callable
+from typing import Generic, Protocol, TypeVar, runtime_checkable
 
 logger = logging.getLogger("core.disposable")
 
@@ -45,7 +46,7 @@ class AsyncDisposable(Protocol):
 
 
 class _FnDisposable:
-    __slots__ = ("_fn", "_disposed")
+    __slots__ = ("_disposed", "_fn")
 
     def __init__(self, fn: SyncCleanup) -> None:
         self._fn: SyncCleanup | None = fn
@@ -62,7 +63,7 @@ class _FnDisposable:
 
 
 class _FnAsyncDisposable:
-    __slots__ = ("_fn", "_disposed")
+    __slots__ = ("_disposed", "_fn")
 
     def __init__(self, fn: AsyncCleanup) -> None:
         self._fn: AsyncCleanup | None = fn
@@ -230,7 +231,11 @@ class Emitter(Generic[T]):
         token = self._next_token
         self._next_token += 1
         self._listeners[token] = listener
-        return to_disposable(lambda: self._listeners.pop(token, None))
+
+        def _unsub() -> None:
+            self._listeners.pop(token, None)
+
+        return to_disposable(_unsub)
 
     def fire(self, data: T) -> None:
         """Dispatch `data` to a snapshot of active listeners, isolating exceptions."""

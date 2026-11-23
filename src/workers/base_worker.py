@@ -217,119 +217,83 @@ class WorkerAction(BaseModel):
 #  Worker Invocation (shared by all workers)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-async def invoke_worker(
-    state: dict[str, Any],
-    system_prompt: str,
-    failover_chain: list,
-    breaker,
-    health_tracker,
-    invoke_fn,
-    vision_chain: list | None = None,
-    dreamer=None,
-) -> dict[str, Any]:
-    """Core worker invocation logic shared by all specialists.
+def _build_target_lock_section(state: dict[str, Any], objective: str) -> tuple[Any, str]:
+    try:
+        from feature_flags import target_lock_enabled
+        if not target_lock_enabled():
+            return None, ""
+        from target_lock import extract_target, render_target_lock_block
+        active_sub = next(
+            (s.get("desc", "") for s in (state.get("plan_steps") or [])
+             if s.get("status") in ("active", "in_progress")),
+            "",
+        )
+        bound_target = extract_target(objective, active_sub)
+        return bound_target, render_target_lock_block(bound_target, objective)
+    except Exception as e:  # noqa: BLE001
+        logger.debug("Target Lock skipped (non-fatal): %s", e)
+        return None, ""
 
-    Args:
-        state: Current BrainState dict
-        system_prompt: Specialist-specific system prompt
-        failover_chain: LLM failover chain
-        breaker: CircuitBreaker instance
-        health_tracker: ProviderHealthTracker instance
-        invoke_fn: The _invoke_with_failover function
 
-    Returns:
-        State updates dict with proposed_action, etc.
-    """
-    # ── Build User Prompt ──
+def _build_hesitation_section(pending_intent: Any) -> str:
+    try:
+        from feature_flags import intent_journal_enabled
+        if not (intent_journal_enabled() and pending_intent):
+            return ""
+        from intent_journal import render_hesitation
+        block = render_hesitation(pending_intent)
+        if block:
+            logger.info(
+                "⚠️ HESITATION: predecessor %s on '%s' unconfirmed — "
+                "warning worker not to blindly repeat",
+                pending_intent.get("verb"),
+                pending_intent.get("target_name") or pending_intent.get("element_id") or "",
+            )
+        return block
+    except Exception as e:  # noqa: BLE001
+        logger.debug("Hesitation block skipped (non-fatal): %s", e)
+        return ""
+
+
+def _build_lock_list_section(state: dict[str, Any]) -> str:
+    try:
+        from feature_flags import subgoal_lock_enabled
+        if subgoal_lock_enabled() and state.get("prm_checklist"):
+            from subgoal_lock import render_lock_list
+            return render_lock_list(state.get("prm_checklist"))
+    except Exception as e:  # noqa: BLE001
+        logger.debug("Lock-list block skipped (non-fatal): %s", e)
+    return ""
+
+
+def _assemble_worker_prompt(state: dict[str, Any]) -> tuple[str, Any, Any]:
+    """Assemble the structured user prompt + return `(prompt, bound_target, pending_intent)`."""
+    from cognition import build_guidance, render_strategy_block
+
     objective = state.get("objective", "")
     current_url = state.get("current_url", "")
     step_number = state.get("step_number", 0)
     max_steps = state.get("max_steps", 25)
     dom_markdown = state.get("dom_markdown", "")
-    login_detected = state.get("login_detected", False)
-    correction_context = state.get("correction_context", "")
-    recovery_advice = state.get("recovery_advice", "")
-    consecutive_identical = state.get("consecutive_identical_actions", 0)
-    plan_render = state.get("plan_render", "")
-    facts_render = state.get("facts_render", "")
     history_compressed = state.get("history_compressed", "")
-    skill_context = state.get("skill_context", "")
+    pending_intent = state.get("last_attempted_action")
 
-    # ── V18 Cognition: the agent reasons WITH its persistent strategy + beliefs ──
-    # V27: strategy block is the PERSISTENT context only; the goal_complete_hint
-    # (transient "finish now" nudge) is now owned by the Guidance Bus below.
-    from cognition import render_strategy_block, build_guidance
     strategy_block = render_strategy_block(
         strategy=state.get("strategy", ""),
         confidence=state.get("strategy_confidence", 1.0),
         beliefs=state.get("beliefs", []) or [],
         success_criteria=state.get("success_criteria", ""),
     )
+    bound_target, target_lock_block = _build_target_lock_section(state, objective)
+    hesitation_block = _build_hesitation_section(pending_intent)
+    lock_list_block = _build_lock_list_section(state)
 
-    # ── V29 Target Lock: bind this step to the target item's semantic identity so
-    #    identical-looking distractor controls (a neighbor's 'Add to cart') can
-    #    never steal focus — even when the agent is confused. ──
-    bound_target = None
-    target_lock_block = ""
-    try:
-        from feature_flags import target_lock_enabled
-        if target_lock_enabled():
-            from target_lock import extract_target, render_target_lock_block
-            active_sub = ""
-            for _s in state.get("plan_steps", []) or []:
-                if _s.get("status") in ("active", "in_progress"):
-                    active_sub = _s.get("desc", "")
-                    break
-            bound_target = extract_target(objective, active_sub)
-            target_lock_block = render_target_lock_block(bound_target, objective)
-    except Exception as e:  # noqa: BLE001
-        logger.debug("Target Lock skipped (non-fatal): %s", e)
-
-    # ── V29 Atomic Intent Journal: if the PREVIOUS side-effecting action did not
-    #    return a confirmed success, surface the pending-action ledger here so the
-    #    worker — and EVERY model in the failover chain that answers this same
-    #    prompt — is warned not to blindly repeat it (handoff-amnesia fix). ──
-    pending_intent = state.get("last_attempted_action")
-    hesitation_block = ""
-    try:
-        from feature_flags import intent_journal_enabled
-        if intent_journal_enabled() and pending_intent:
-            from intent_journal import render_hesitation
-            hesitation_block = render_hesitation(pending_intent)
-            if hesitation_block:
-                logger.info("⚠️ HESITATION: predecessor %s on '%s' unconfirmed — "
-                            "warning worker not to blindly repeat",
-                            pending_intent.get("verb"),
-                            pending_intent.get("target_name") or pending_intent.get("element_id") or "")
-    except Exception as e:  # noqa: BLE001
-        logger.debug("Hesitation block skipped (non-fatal): %s", e)
-
-    # ── V29 Sub-Goal Lock: surface the FORBID-list of already-completed (verified)
-    #    sub-goals so the agent never re-does finished work — even after a global
-    #    'done' rejection. This forbids; it adds no pending focus, so it is
-    #    complementary to plan_steps (no competing-checklist regression). ──
-    lock_list_block = ""
-    try:
-        from feature_flags import subgoal_lock_enabled
-        if subgoal_lock_enabled() and state.get("prm_checklist"):
-            from subgoal_lock import render_lock_list
-            lock_list_block = render_lock_list(state.get("prm_checklist"))
-    except Exception as e:  # noqa: BLE001
-        logger.debug("Lock-list block skipped (non-fatal): %s", e)
-
-    # Login hint (informational, non-conflicting — not part of the guidance bus)
-    login_hint = ""
-    if login_detected:
-        login_hint = (
-            "\n\n🔑 LOGIN STATUS: You appear to be LOGGED IN. "
-            "Profile/account indicators detected. "
-            "DO NOT attempt to log in again."
-        )
-
-    # ── V27 Guidance Bus: exactly ONE arbitrated transient directive ──
-    # Replaces the old stacking of correction_context + recovery_advice +
-    # dedup_override + critical_action_hint (the F2 regression). The PRM-checklist
-    # re-injection is GONE — plan_steps (system prompt) is the only sub-goal source.
+    login_hint = (
+        "\n\n🔑 LOGIN STATUS: You appear to be LOGGED IN. "
+        "Profile/account indicators detected. DO NOT attempt to log in again."
+        if state.get("login_detected", False)
+        else ""
+    )
     guidance_block = build_guidance(state)
     if guidance_block:
         logger.info("🧭 GUIDANCE: %s", guidance_block.split("\n", 1)[-1][:120])
@@ -346,7 +310,7 @@ async def invoke_worker(
         + (f"{target_lock_block}\n\n" if target_lock_block else "")
         + f"═══ CURRENT CONTEXT ═══\n"
         f"URL: {current_url}\n"
-        f"Step: {step_number+1}/{max_steps} ({max_steps - step_number - 1} remaining)"
+        f"Step: {step_number + 1}/{max_steps} ({max_steps - step_number - 1} remaining)"
         f"{login_hint}\n\n"
         + (f"{guidance_block}\n\n" if guidance_block else "")
         + (f"{hesitation_block}\n\n" if hesitation_block else "")
@@ -355,31 +319,21 @@ async def invoke_worker(
         f"{history_compressed or '(first step)'}\n\n"
         f"═══ PAGE STRUCTURE ═══\n"
         f"{dom_markdown}\n\n"
-        # V17: Objective anchor at the BOTTOM of the prompt (sandwich pattern).
-        # On pages with large DOM markdown, the objective at the top gets buried
-        # in the context window. Repeating it here ensures the LLM's attention
-        # stays locked on the goal, not on pattern-matching DOM elements.
         f"═══ REMEMBER YOUR MISSION ═══\n"
         f"{objective[:300]}\n"
         f"Now OBSERVE the page structure above, THINK about your situation, and choose your NEXT action."
     )
+    return user_prompt, bound_target, pending_intent
 
-    messages = [SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)]
 
-    # ── Invoke LLM ──
-    try:
-        decision, used_model = await invoke_fn(
-            failover_chain, messages, WorkerAction,
-            breaker, health_tracker=health_tracker,
-        )
-        logger.info("Worker answered by: %s", used_model)
-    except RuntimeError as e:
-        wait_secs = 5.0
-        logger.error("Worker LLM FAILURE: %s — waiting %.1fs", e, wait_secs)
-        await asyncio.sleep(wait_secs)
-        return {}  # Empty update — step will be retried
+def _classify_and_build_proposed(
+    decision: WorkerAction,
+    selector_map: dict[str, Any],
+    current_url: str,
+) -> tuple[dict[str, Any], Any]:
+    """Log the worker's OTA reasoning chain, classify risk, and build ProposedAction dict."""
+    from action_classifier import ActionRisk, classify_action
 
-    # ── Log OTA chain ──
     logger.info("👁️ OBSERVE: %s", decision.screen_state[:200])
     logger.info("🔄 PREVIOUS: %s", decision.previous_action_result[:150])
     logger.info("📊 PROGRESS: %s", decision.goal_progress[:150])
@@ -388,23 +342,15 @@ async def invoke_worker(
         logger.info("🔮 EXPECT: %s", decision.expected_change[:180])
     logger.info("⚡ ACTION: %s", decision.action_type)
 
-    # ── Classify action risk ──
-    from action_classifier import classify_action, ActionRisk
-    target_name = ""
-    selector_map = state.get("selector_map", {})
-    if decision.element_id and decision.element_id in selector_map:
-        el_data = selector_map[decision.element_id]
-        target_name = el_data.get("name", el_data.get("text", ""))[:60]
-
+    el_data = selector_map.get(decision.element_id, {}) if decision.element_id else {}
+    target_name = (el_data.get("name", el_data.get("text", "")) or "")[:60]
     risk = classify_action(
         action_type=decision.action_type,
         target_name=target_name,
         target_text=decision.text[:60] if decision.text else "",
         url=current_url,
-        element_kind=selector_map.get(decision.element_id, {}).get("kind", "") if decision.element_id else "",
+        element_kind=el_data.get("kind", "") if decision.element_id else "",
     )
-
-    # ── Build ProposedAction ──
     proposed = {
         "verb": decision.action_type,
         "element_id": decision.element_id,
@@ -423,24 +369,16 @@ async def invoke_worker(
         "expected_change": getattr(decision, "expected_change", "")[:250],
         "wait_ms": decision.wait_ms,
     }
+    return proposed, risk
 
-    # ══════════════════════════════════════════════════════════════════════
-    #  P2 DYNAMIC CASCADE CONSENSUS — need-based, latency-aware
-    #  IRREVERSIBLE actions can't be retried, so they get a second opinion — but
-    #  via a CASCADE, not an always-on N-voter poll (latency is critical):
-    #    Tier 1  primary confident + structurally sound → execute NOW (0 extra calls)
-    #    Tier 2  else poll the SECONDARY; if it agrees → execute       (1 extra call)
-    #    Tier 3  else poll the TERTIARY → CISC vote                    (2 extra calls)
-    #    Abstain vote still split → vision / safe-wait
-    #  All voting lives in consensus.cascade_consensus (modular — this block only
-    #  triggers it and applies the result; it never touches prompt/guidance state).
-    # ══════════════════════════════════════════════════════════════════════
-    consensus_update: dict[str, Any] = {}
-    force_consult = False
 
-    # ── V29 Clarity Gate: how clear/unambiguous is this action? (drives BOTH the
-    #    broadened pre-action consensus and the vision trigger below). ──
-    clarity_sig = None
+def _compute_clarity_signal(
+    decision: WorkerAction,
+    proposed: dict[str, Any],
+    state: dict[str, Any],
+    bound_target: Any,
+    selector_map: dict[str, Any],
+) -> Any:
     try:
         from clarity import compute_clarity
         clarity_input = {
@@ -448,121 +386,229 @@ async def invoke_worker(
             "confidence": float(getattr(decision, "confidence", 0.7) or 0.7),
             "needs_vision": bool(getattr(decision, "needs_vision", False)),
         }
-        clarity_sig = compute_clarity(clarity_input, state, target=bound_target,
-                                      selector_map=selector_map)
+        clarity_sig = compute_clarity(
+            clarity_input, state, target=bound_target, selector_map=selector_map
+        )
         if clarity_sig.uncertain:
             logger.info("🔎 CLARITY: uncertain (%s)", "; ".join(clarity_sig.reasons[:3]))
+        return clarity_sig
     except Exception as e:  # noqa: BLE001
         logger.debug("Clarity signal skipped (non-fatal): %s", e)
+        return None
 
+
+def _apply_cascade_outcome(
+    cascade: Any,
+    decision: WorkerAction,
+    proposed: dict[str, Any],
+    is_irrev: bool,
+    vision_chain: list | None,
+    selector_map: dict[str, Any],
+    current_url: str,
+    state: dict[str, Any],
+    consensus_update: dict[str, Any],
+) -> tuple[dict[str, Any], bool]:
+    from action_classifier import ActionRisk, classify_action
+
+    if cascade.abstain:
+        consensus_update["abstentions"] = state.get("abstentions", 0) + 1
+        if vision_chain:
+            logger.warning(
+                "🛑 ABSTAIN → consulting vision to disambiguate the ambiguous action before acting."
+            )
+            return proposed, True
+        if is_irrev:
+            logger.warning(
+                "🛑 ABSTAIN (irreversible) → no vision; holding (wait) and re-examining before committing."
+            )
+            proposed = {
+                **proposed,
+                "verb": "wait",
+                "wait_ms": 800,
+                "risk_level": "REVERSIBLE",
+                "reversible": True,
+            }
+            consensus_update["correction_context"] = (
+                "\n\n⚖️ The critical irreversible action is AMBIGUOUS — the "
+                "models disagreed on the target. Re-examine the page and "
+                "identify the SINGLE correct element before committing."
+            )
+        else:
+            logger.info(
+                "⚖️ ABSTAIN (reversible) → proceeding on primary (a retry can recover if wrong)."
+            )
+        return proposed, False
+
+    cd = cascade.decision
+    if cd is not decision and (
+        getattr(cd, "action_type", None) != decision.action_type
+        or getattr(cd, "element_id", None) != decision.element_id
+    ):
+        win_el = selector_map.get(cd.element_id, {}) if cd.element_id else {}
+        win_target = (win_el.get("name", win_el.get("text", "")) or "")[:60]
+        win_risk = classify_action(
+            action_type=cd.action_type,
+            target_name=win_target,
+            target_text=(cd.text or "")[:60],
+            url=current_url,
+            element_kind=win_el.get("kind", ""),
+        )
+        logger.info("🗳️ CASCADE override → %s [%s]", cd.action_type, cd.element_id or "")
+        proposed = {
+            **proposed,
+            "verb": cd.action_type,
+            "element_id": cd.element_id,
+            "text": cd.text,
+            "target_name": win_target,
+            "risk_level": win_risk.name,
+            "reversible": win_risk == ActionRisk.REVERSIBLE,
+        }
+    return proposed, False
+
+
+async def _run_consensus_stage(
+    *,
+    decision: WorkerAction,
+    used_model: str,
+    proposed: dict[str, Any],
+    risk: Any,
+    clarity_sig: Any,
+    pending_intent: Any,
+    messages: list,
+    state: dict[str, Any],
+    failover_chain: list,
+    breaker: Any,
+    health_tracker: Any,
+    invoke_fn: Any,
+    vision_chain: list | None,
+) -> tuple[dict[str, Any], dict[str, Any], bool]:
+    consensus_update: dict[str, Any] = {}
     try:
-        from consensus import (consensus_enabled, count_distinct_base_models,
-                               cascade_consensus)
+        from action_classifier import ActionRisk
         from clarity import needs_consensus
+        from consensus import cascade_consensus, consensus_enabled, count_distinct_base_models
         from feature_flags import clarity_consensus_enabled
 
-        is_irrev = (risk == ActionRisk.IRREVERSIBLE)
+        is_irrev = risk == ActionRisk.IRREVERSIBLE
         if clarity_sig is not None:
             do_vote, vote_reason = needs_consensus(
-                clarity_sig, is_irreversible=is_irrev,
-                broaden=clarity_consensus_enabled())
+                clarity_sig, is_irreversible=is_irrev, broaden=clarity_consensus_enabled()
+            )
         else:
             do_vote, vote_reason = is_irrev, "irreversible action"
 
-        # V29 Intent Journal: re-proposing an UNCONFIRMED prior action is the
-        # double-toggle risk — never fire it blind; force a second opinion first.
         repeating_uncertain = False
         try:
             from intent_journal import same_action
             if pending_intent and same_action(pending_intent, proposed):
                 repeating_uncertain = True
                 do_vote = True
-                vote_reason = ((vote_reason + "; ") if vote_reason else "") + \
+                vote_reason = ((vote_reason + "; ") if vote_reason else "") + (
                     "repeating an UNCONFIRMED prior action (possible double-apply)"
+                )
         except Exception:  # noqa: BLE001
             pass
 
-        if (do_vote and consensus_enabled()
-                and count_distinct_base_models(failover_chain) >= 2):
-            # PRE-action: we get the second opinion BEFORE the action is executed.
-            logger.info("🗳️ PRE-ACTION CONSENSUS — %s", vote_reason)
-            # Hesitation / stuck / any uncertainty forces a real second opinion even
-            # on a confident primary (the zero-risk rule).
-            force_escalate = (state.get("consecutive_identical_actions", 0) >= 2
-                              or bool(state.get("correction_context"))
-                              or repeating_uncertain
-                              or (clarity_sig is not None and clarity_sig.uncertain))
-            cascade = await cascade_consensus(
-                primary_decision=decision, primary_model=used_model,
-                messages=messages, schema=WorkerAction,
-                invoke_fn=invoke_fn, chain=failover_chain,
-                breaker=breaker, health_tracker=health_tracker,
-                selector_map=selector_map, force_escalate=force_escalate)
+        if not (do_vote and consensus_enabled() and count_distinct_base_models(failover_chain) >= 2):
+            return proposed, consensus_update, False
 
-            consensus_update["consensus_votes"] = state.get("consensus_votes", 0) + 1
-            logger.info("🗳️ CASCADE [%s] +%d calls, agreement=%.0f%% — %s",
-                        cascade.path, cascade.extra_calls,
-                        cascade.agreement * 100, cascade.detail)
-
-            if cascade.abstain:
-                consensus_update["abstentions"] = state.get("abstentions", 0) + 1
-                if vision_chain:
-                    logger.warning("🛑 ABSTAIN → consulting vision to disambiguate "
-                                   "the ambiguous action before acting.")
-                    force_consult = True
-                elif is_irrev:
-                    logger.warning("🛑 ABSTAIN (irreversible) → no vision; holding "
-                                   "(wait) and re-examining before committing.")
-                    proposed = {**proposed, "verb": "wait", "wait_ms": 800,
-                                "risk_level": "REVERSIBLE", "reversible": True}
-                    consensus_update["correction_context"] = (
-                        "\n\n⚖️ The critical irreversible action is AMBIGUOUS — the "
-                        "models disagreed on the target. Re-examine the page and "
-                        "identify the SINGLE correct element before committing.")
-                else:
-                    # Reversible + no vision: the voters split, but a wrong reversible
-                    # action is recoverable via the verifier-gated retry, so proceed
-                    # on the primary rather than waste a step waiting.
-                    logger.info("⚖️ ABSTAIN (reversible) → proceeding on primary "
-                                "(a retry can recover if wrong).")
-            else:
-                cd = cascade.decision
-                if (cd is not decision
-                        and (getattr(cd, "action_type", None) != decision.action_type
-                             or getattr(cd, "element_id", None) != decision.element_id)):
-                    # The cascade settled on a DIFFERENT action than the primary pick.
-                    win_el = selector_map.get(cd.element_id, {}) if cd.element_id else {}
-                    win_target = (win_el.get("name", win_el.get("text", "")) or "")[:60]
-                    win_risk = classify_action(
-                        action_type=cd.action_type, target_name=win_target,
-                        target_text=(cd.text or "")[:60], url=current_url,
-                        element_kind=win_el.get("kind", ""))
-                    logger.info("🗳️ CASCADE override → %s [%s]",
-                                cd.action_type, cd.element_id or "")
-                    proposed = {**proposed, "verb": cd.action_type,
-                                "element_id": cd.element_id, "text": cd.text,
-                                "target_name": win_target, "risk_level": win_risk.name,
-                                "reversible": win_risk == ActionRisk.REVERSIBLE}
+        logger.info("🗳️ PRE-ACTION CONSENSUS — %s", vote_reason)
+        force_escalate = (
+            state.get("consecutive_identical_actions", 0) >= 2
+            or bool(state.get("correction_context"))
+            or repeating_uncertain
+            or (clarity_sig is not None and clarity_sig.uncertain)
+        )
+        selector_map = state.get("selector_map", {})
+        cascade = await cascade_consensus(
+            primary_decision=decision,
+            primary_model=used_model,
+            messages=messages,
+            schema=WorkerAction,
+            invoke_fn=invoke_fn,
+            chain=failover_chain,
+            breaker=breaker,
+            health_tracker=health_tracker,
+            selector_map=selector_map,
+            force_escalate=force_escalate,
+        )
+        consensus_update["consensus_votes"] = state.get("consensus_votes", 0) + 1
+        logger.info(
+            "🗳️ CASCADE [%s] +%d calls, agreement=%.0f%% — %s",
+            cascade.path,
+            cascade.extra_calls,
+            cascade.agreement * 100,
+            cascade.detail,
+        )
+        proposed, force_consult = _apply_cascade_outcome(
+            cascade, decision, proposed, is_irrev, vision_chain,
+            selector_map, state.get("current_url", ""), state, consensus_update,
+        )
+        return proposed, consensus_update, force_consult
     except Exception as e:  # noqa: BLE001 — consensus never breaks the step
         logger.debug("Cascade consensus skipped (non-fatal): %s", e)
+        return proposed, consensus_update, False
 
-    # ── Vision-on-demand (V21): the agent works on the a11y DOM by default and
-    #    "opens its eyes" for ONE step only when it cannot resolve the page from
-    #    text — then this update reverts (force_vision cleared) and the next step
-    #    is text-only again. ──
+
+async def _validate_vision_coords_if_needed(
+    proposed: dict[str, Any],
+    objective: str,
+    vision_chain: list,
+    breaker: Any,
+    health_tracker: Any,
+    invoke_fn: Any,
+) -> None:
+    if not (
+        proposed.get("vision_coords")
+        and proposed.get("x") is not None
+        and proposed.get("y") is not None
+    ):
+        return
+    intended = (
+        proposed.get("reasoning", "").replace("[vision] ", "")[:120]
+        or proposed.get("target_name", "unknown target")
+    )
+    try:
+        valid, reason = await _validate_coord_click(
+            invoke_fn, vision_chain, breaker, health_tracker,
+            x=proposed["x"], y=proposed["y"],
+            intended_target=intended, objective=objective,
+        )
+        if valid:
+            logger.info("👁️✅ Coordinate click validated: %s", reason[:80])
+        else:
+            logger.warning("👁️❌ Coordinate click REJECTED: %s — dropping coords", reason[:80])
+            proposed["x"] = None
+            proposed["y"] = None
+            proposed["vision_coords"] = False
+    except Exception as val_err:  # noqa: BLE001
+        logger.warning("coord validation failed (non-fatal): %s", val_err)
+
+
+async def _run_vision_stage(
+    *,
+    decision: WorkerAction,
+    proposed: dict[str, Any],
+    clarity_sig: Any,
+    force_consult: bool,
+    state: dict[str, Any],
+    vision_chain: list | None,
+    breaker: Any,
+    health_tracker: Any,
+    invoke_fn: Any,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    from vision_consult import apply_vision_verdict, consult_vision, should_consult_vision
+
     vision_update: dict[str, Any] = {}
-    from vision_consult import should_consult_vision, consult_vision, apply_vision_verdict
     consult, why = should_consult_vision(
         needs_vision=getattr(decision, "needs_vision", False),
         state=state,
         action_type=decision.action_type,
     )
-    # V29 Clarity Gate: open the eyes to visually disambiguate WHICH of several
-    # identical controls is the bound target (the context-drift guard), within budget.
     if not consult and clarity_sig is not None:
         try:
-            from vision_consult import MAX_VISION_CONSULTS
             from clarity import needs_vision_for_clarity
+            from vision_consult import MAX_VISION_CONSULTS
             cl_v, cl_why = needs_vision_for_clarity(clarity_sig)
             if cl_v and int(state.get("vision_consults", 0) or 0) < MAX_VISION_CONSULTS:
                 consult, why = True, cl_why
@@ -570,177 +616,212 @@ async def invoke_worker(
             pass
     if force_consult:
         consult, why = True, "consensus abstention — disambiguate critical action"
-    if consult and vision_chain:
-        logger.info("🧠→👁️ Escalating to vision: %s", why)
-        verdict, _vm = await consult_vision(
-            invoke_fn, vision_chain, breaker, health_tracker,
-            objective=objective,
-            question=getattr(decision, "vision_question", "") or why,
-            a11y_markdown=dom_markdown,
-            history_tail=history_compressed,
+    if not (consult and vision_chain):
+        return proposed, vision_update
+
+    objective = state.get("objective", "")
+    logger.info("🧠→👁️ Escalating to vision: %s", why)
+    verdict, _vm = await consult_vision(
+        invoke_fn, vision_chain, breaker, health_tracker,
+        objective=objective,
+        question=getattr(decision, "vision_question", "") or why,
+        a11y_markdown=state.get("dom_markdown", ""),
+        history_tail=state.get("history_compressed", ""),
+    )
+    proposed, overridden = apply_vision_verdict(proposed, verdict)
+    vision_update["vision_consults"] = state.get("vision_consults", 0) + 1
+    vision_update["force_vision"] = False
+    if overridden:
+        logger.info("👁️→⚡ Vision refined the action → %s [%s]", proposed["verb"], proposed.get("element_id") or "")
+        await _validate_vision_coords_if_needed(
+            proposed, objective, vision_chain, breaker, health_tracker, invoke_fn
         )
-        proposed, overridden = apply_vision_verdict(proposed, verdict)
-        vision_update["vision_consults"] = state.get("vision_consults", 0) + 1
-        vision_update["force_vision"] = False  # consumed — revert to a11y DOM
-        if overridden:
-            logger.info("👁️→⚡ Vision refined the action → %s [%s]",
-                        proposed["verb"], proposed.get("element_id") or "")
+    return proposed, vision_update
 
-            # ── V30 Coordinate Validation: Look-Before-You-Leap ──
-            # When Vision returned raw coordinates (element not in a11y tree),
-            # verify the target via a second vision check before sending to
-            # Overwatch. This ensures coordinate clicks are precise and safe.
-            if (proposed.get("vision_coords")
-                    and proposed.get("x") is not None
-                    and proposed.get("y") is not None):
-                intended = (
-                    (proposed.get("reasoning", "")
-                     .replace("[vision] ", "")[:120])
-                    or proposed.get("target_name", "unknown target")
-                )
-                try:
-                    valid, reason = await _validate_coord_click(
-                        invoke_fn, vision_chain, breaker, health_tracker,
-                        x=proposed["x"], y=proposed["y"],
-                        intended_target=intended, objective=objective,
-                    )
-                    if valid:
-                        logger.info("👁️✅ Coordinate click validated: %s", reason[:80])
-                    else:
-                        logger.warning(
-                            "👁️❌ Coordinate click REJECTED: %s — dropping coords",
-                            reason[:80],
-                        )
-                        proposed["x"] = None
-                        proposed["y"] = None
-                        proposed["vision_coords"] = False
-                except Exception as val_err:  # noqa: BLE001
-                    logger.warning("coord validation failed (non-fatal): %s", val_err)
-                    # On validation failure, keep coords but log the warning —
-                    # better to attempt a click than to loop.
 
-    # ══════════════════════════════════════════════════════════════════════
-    #  V29 Phase B — WebDreamer: look-before-you-leap on HIGH-STAKES AMBIGUOUS
-    #  steps. It IMAGINES (LLM world-model — no real browser action) the outcome
-    #  of the top-K candidate actions and picks the best. Gated by the Clarity Gate
-    #  (only fires when uncertain) AND a cost gate (should_invoke_dreamer:
-    #  irreversible / stuck / confused) so it never burns compute on obvious steps.
-    # ══════════════════════════════════════════════════════════════════════
+async def _run_webdreamer_stage(
+    *,
+    proposed: dict[str, Any],
+    clarity_sig: Any,
+    state: dict[str, Any],
+    dreamer: Any,
+) -> tuple[dict[str, Any], dict[str, Any]]:
     webdreamer_update: dict[str, Any] = {}
     try:
+        from action_classifier import ActionRisk, classify_action
         from feature_flags import webdreamer_enabled
-        if (webdreamer_enabled() and dreamer is not None and clarity_sig is not None
-                and clarity_sig.uncertain):
-            from web_dreamer import (should_invoke_dreamer, should_override_with_dreamer,
-                                     CandidateAction)
-            if should_invoke_dreamer(
-                    element_count=len(selector_map or {}),
-                    action_risk_level=proposed.get("risk_level", "REVERSIBLE"),
-                    consecutive_no_progress=int(state.get("ineffective_streak", 0) or 0),
-                    step_number=int(state.get("step_number", 0) or 0),
-                    same_url_streak=int(state.get("same_url_streak", 0) or 0)):
-                proposed_ca = CandidateAction(
-                    action_type=proposed["verb"], element_id=proposed.get("element_id"),
-                    text=proposed.get("text"), url=proposed.get("url"),
-                    x=proposed.get("x"), y=proposed.get("y"),
-                    reasoning=proposed.get("reasoning", ""))
-                logger.info("🌙 WebDreamer: simulating candidates before a high-stakes "
-                            "ambiguous action (%s)…", proposed.get("verb"))
-                webdreamer_update["webdreamer_runs"] = state.get("webdreamer_runs", 0) + 1
-                try:
-                    dr = await asyncio.wait_for(
-                        dreamer.plan_and_select(
-                            dom_markdown=dom_markdown, objective=objective,
-                            plan_context=plan_render, action_history=history_compressed,
-                            current_url=current_url, proposed_action=proposed_ca,
-                            situation=state),  # V29: situational tuning (state signals only)
-                        timeout=45.0)
-                    best = dr.best_action
-                    logger.info("🌙 WebDreamer: best=%s score=%.2f (k=%d)",
-                                best.describe(), dr.best_score, dr.candidates_generated)
-                    if should_override_with_dreamer(
-                            dr.best_score, best.action_type, best.element_id,
-                            proposed["verb"], proposed.get("element_id")):
-                        win_el = selector_map.get(best.element_id, {}) if best.element_id else {}
-                        win_target = (win_el.get("name", win_el.get("text", "")) or "")[:60]
-                        win_risk = classify_action(
-                            action_type=best.action_type, target_name=win_target,
-                            target_text=(best.text or "")[:60], url=current_url,
-                            element_kind=win_el.get("kind", ""))
-                        proposed = {**proposed, "verb": best.action_type,
-                                    "element_id": best.element_id, "text": best.text,
-                                    "url": best.url, "target_name": win_target,
-                                    "risk_level": win_risk.name,
-                                    "reversible": win_risk == ActionRisk.REVERSIBLE,
-                                    "reasoning": f"[dreamer] {(best.reasoning or '')[:160]}"}
-                        # V30: Preserve validated vision coordinates through WebDreamer
-                        # override. When WebDreamer's best action has no grounding
-                        # (no element_id, no coords) but the PRIOR proposed action had
-                        # validated vision coordinates, carry them forward. This prevents
-                        # the "bare click" loop where WebDreamer correctly rejects an
-                        # element but loses the coordinate grounding from Vision.
-                        if (not best.element_id and best.x is None and best.y is None
-                                and proposed.get("vision_coords")):
-                            # x/y survive the {**proposed, ...} spread since the
-                            # override dict doesn't set "x" or "y" — but we make
-                            # this explicit for clarity and safety.
-                            logger.info(
-                                "🌙→👁️ WebDreamer inherited validated vision "
-                                "coords (%.0f,%.0f)",
-                                proposed.get("x", 0), proposed.get("y", 0),
-                            )
-                        webdreamer_update["webdreamer_overrides"] = state.get("webdreamer_overrides", 0) + 1
-                        logger.info("🌙 WebDreamer OVERRIDE → %s", best.describe())
-                    else:
-                        logger.info("🌙 WebDreamer confirms the original (best_score=%.2f)",
-                                    dr.best_score)
-                except asyncio.TimeoutError:
-                    logger.warning("🌙 WebDreamer timed out — keeping the original action")
+        if not (webdreamer_enabled() and dreamer is not None and clarity_sig is not None and clarity_sig.uncertain):
+            return proposed, webdreamer_update
+        from web_dreamer import CandidateAction, should_invoke_dreamer, should_override_with_dreamer
+
+        selector_map = state.get("selector_map", {})
+        if not should_invoke_dreamer(
+            element_count=len(selector_map or {}),
+            action_risk_level=proposed.get("risk_level", "REVERSIBLE"),
+            consecutive_no_progress=int(state.get("ineffective_streak", 0) or 0),
+            step_number=int(state.get("step_number", 0) or 0),
+            same_url_streak=int(state.get("same_url_streak", 0) or 0),
+        ):
+            return proposed, webdreamer_update
+
+        proposed_ca = CandidateAction(
+            action_type=proposed["verb"], element_id=proposed.get("element_id"),
+            text=proposed.get("text"), url=proposed.get("url"),
+            x=proposed.get("x"), y=proposed.get("y"),
+            reasoning=proposed.get("reasoning", ""),
+        )
+        logger.info(
+            "🌙 WebDreamer: simulating candidates before a high-stakes ambiguous action (%s)…",
+            proposed.get("verb"),
+        )
+        webdreamer_update["webdreamer_runs"] = state.get("webdreamer_runs", 0) + 1
+        dr = await asyncio.wait_for(
+            dreamer.plan_and_select(
+                dom_markdown=state.get("dom_markdown", ""),
+                objective=state.get("objective", ""),
+                plan_context=state.get("plan_render", ""),
+                action_history=state.get("history_compressed", ""),
+                current_url=state.get("current_url", ""),
+                proposed_action=proposed_ca,
+                situation=state,
+            ),
+            timeout=45.0,
+        )
+        best = dr.best_action
+        logger.info("🌙 WebDreamer: best=%s score=%.2f (k=%d)", best.describe(), dr.best_score, dr.candidates_generated)
+        if should_override_with_dreamer(
+            dr.best_score, best.action_type, best.element_id, proposed["verb"], proposed.get("element_id")
+        ):
+            win_el = selector_map.get(best.element_id, {}) if best.element_id else {}
+            win_target = (win_el.get("name", win_el.get("text", "")) or "")[:60]
+            win_risk = classify_action(
+                action_type=best.action_type, target_name=win_target,
+                target_text=(best.text or "")[:60], url=state.get("current_url", ""),
+                element_kind=win_el.get("kind", ""),
+            )
+            proposed = {
+                **proposed,
+                "verb": best.action_type,
+                "element_id": best.element_id,
+                "text": best.text,
+                "url": best.url,
+                "target_name": win_target,
+                "risk_level": win_risk.name,
+                "reversible": win_risk == ActionRisk.REVERSIBLE,
+                "reasoning": f"[dreamer] {(best.reasoning or '')[:160]}",
+            }
+            if not best.element_id and best.x is None and best.y is None and proposed.get("vision_coords"):
+                logger.info(
+                    "🌙→👁️ WebDreamer inherited validated vision coords (%.0f,%.0f)",
+                    proposed.get("x", 0), proposed.get("y", 0),
+                )
+            webdreamer_update["webdreamer_overrides"] = state.get("webdreamer_overrides", 0) + 1
+            logger.info("🌙 WebDreamer OVERRIDE → %s", best.describe())
+        else:
+            logger.info("🌙 WebDreamer confirms the original (best_score=%.2f)", dr.best_score)
+    except asyncio.TimeoutError:
+        logger.warning("🌙 WebDreamer timed out — keeping the original action")
     except Exception as e:  # noqa: BLE001 — simulation never breaks the step
         logger.debug("WebDreamer skipped (non-fatal): %s", e)
+    return proposed, webdreamer_update
 
-    # ── V29 Sub-Goal Lock — deterministic anti-amnesia backstop ──
-    # Fires ONLY in the post-rejection danger zone (a 'done' was just rejected),
-    # so it never interferes with normal multi-step work. If the worker proposes
-    # RE-DOING an already-locked sub-goal, we don't execute it — hold (wait) and
-    # redirect to the remaining work via the guidance bus.
+
+def _apply_subgoal_lock_backstop(
+    proposed: dict[str, Any],
+    state: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
     subgoal_lock_update: dict[str, Any] = {}
     try:
         from feature_flags import subgoal_lock_enabled
-        if (subgoal_lock_enabled() and state.get("done_blocked", 0) > 0
-                and state.get("prm_checklist")):
-            from subgoal_lock import targets_locked_subgoal, remaining_subgoals
-            hit = targets_locked_subgoal(proposed, state.get("prm_checklist"))
-            if hit is not None:
-                rem = remaining_subgoals(state.get("prm_checklist"))
-                rem_str = "; ".join((d.get("desc") or "")[:60] for d in rem[:2]) or "the remaining work"
-                logger.warning("🔒 Sub-Goal Lock: blocked a RE-DO of completed '%s' — "
-                               "redirecting to remaining work.", (hit.get("desc") or "")[:50])
-                proposed = {**proposed, "verb": "wait", "wait_ms": 600,
-                            "risk_level": "REVERSIBLE", "reversible": True}
-                subgoal_lock_update["correction_context"] = (
-                    f"\n\n🔒 STOP — '{(hit.get('desc') or 'that sub-goal')[:60]}' is ALREADY "
-                    f"DONE and LOCKED. Do NOT repeat it (its control may still be visible). "
-                    f"Work ONLY on what remains: {rem_str}.")
+        if not (subgoal_lock_enabled() and state.get("done_blocked", 0) > 0 and state.get("prm_checklist")):
+            return proposed, subgoal_lock_update
+        from subgoal_lock import remaining_subgoals, targets_locked_subgoal
+
+        hit = targets_locked_subgoal(proposed, state.get("prm_checklist"))
+        if hit is not None:
+            rem = remaining_subgoals(state.get("prm_checklist"))
+            rem_str = "; ".join((d.get("desc") or "")[:60] for d in rem[:2]) or "the remaining work"
+            logger.warning(
+                "🔒 Sub-Goal Lock: blocked a RE-DO of completed '%s' — redirecting to remaining work.",
+                (hit.get("desc") or "")[:50],
+            )
+            proposed = {
+                **proposed,
+                "verb": "wait",
+                "wait_ms": 600,
+                "risk_level": "REVERSIBLE",
+                "reversible": True,
+            }
+            subgoal_lock_update["correction_context"] = (
+                f"\n\n🔒 STOP — '{(hit.get('desc') or 'that sub-goal')[:60]}' is ALREADY "
+                f"DONE and LOCKED. Do NOT repeat it (its control may still be visible). "
+                f"Work ONLY on what remains: {rem_str}."
+            )
     except Exception as e:  # noqa: BLE001 — backstop never breaks the step
         logger.debug("Sub-Goal Lock backstop skipped (non-fatal): %s", e)
+    return proposed, subgoal_lock_update
 
-    # ── Action dedup tracking ──
-    # Keyed digest, never the raw text: this signature lives in BrainState.
+
+async def invoke_worker(
+    state: dict[str, Any],
+    system_prompt: str,
+    failover_chain: list,
+    breaker,
+    health_tracker,
+    invoke_fn,
+    vision_chain: list | None = None,
+    dreamer=None,
+) -> dict[str, Any]:
+    """Core worker invocation logic shared by all specialists."""
+    user_prompt, bound_target, pending_intent = _assemble_worker_prompt(state)
+    messages = [SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)]
+
+    try:
+        decision, used_model = await invoke_fn(
+            failover_chain, messages, WorkerAction,
+            breaker, health_tracker=health_tracker,
+        )
+        logger.info("Worker answered by: %s", used_model)
+    except RuntimeError as e:
+        wait_secs = 5.0
+        logger.error("Worker LLM FAILURE: %s — waiting %.1fs", e, wait_secs)
+        await asyncio.sleep(wait_secs)
+        return {}
+
+    selector_map = state.get("selector_map", {})
+    proposed, risk = _classify_and_build_proposed(
+        decision, selector_map, state.get("current_url", "")
+    )
+    clarity_sig = _compute_clarity_signal(decision, proposed, state, bound_target, selector_map)
+
+    proposed, consensus_update, force_consult = await _run_consensus_stage(
+        decision=decision, used_model=used_model, proposed=proposed, risk=risk,
+        clarity_sig=clarity_sig, pending_intent=pending_intent, messages=messages,
+        state=state, failover_chain=failover_chain, breaker=breaker,
+        health_tracker=health_tracker, invoke_fn=invoke_fn, vision_chain=vision_chain,
+    )
+    proposed, vision_update = await _run_vision_stage(
+        decision=decision, proposed=proposed, clarity_sig=clarity_sig,
+        force_consult=force_consult, state=state, vision_chain=vision_chain,
+        breaker=breaker, health_tracker=health_tracker, invoke_fn=invoke_fn,
+    )
+    proposed, webdreamer_update = await _run_webdreamer_stage(
+        proposed=proposed, clarity_sig=clarity_sig, state=state, dreamer=dreamer,
+    )
+    proposed, subgoal_lock_update = _apply_subgoal_lock_backstop(proposed, state)
+
     from intent_journal import text_fingerprint
     current_sig = f"{proposed['verb']}:{text_fingerprint(proposed.get('text')) or 'none'}"
-    last_sig = state.get("last_action_signature", "")
-    if current_sig == last_sig:
-        new_consecutive = state.get("consecutive_identical_actions", 0) + 1
-    else:
-        new_consecutive = 0
+    new_consecutive = (
+        state.get("consecutive_identical_actions", 0) + 1
+        if current_sig == state.get("last_action_signature", "")
+        else 0
+    )
 
     return {
         "proposed_action": proposed,
         "last_action_signature": current_sig,
         "consecutive_identical_actions": new_consecutive,
-        # V29: expose the bound target so Overwatch (reality note) and the
-        # done-judge can keep the agent locked on the right item.
         "bound_target": (bound_target.phrase if bound_target else ""),
         **consensus_update,
         **vision_update,

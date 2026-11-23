@@ -88,6 +88,421 @@ def _escalate(state: dict, reason: str, updates: dict) -> dict:
     return lad
 
 
+async def _layer_2_ground_action(
+    verb: str,
+    proposed: dict[str, Any],
+    state: dict[str, Any],
+    updates: dict[str, Any],
+) -> bool:
+    """Layer 2: verify click/type coordinates against the active element map."""
+    if verb not in ("click", "type"):
+        return True
+
+    from mcp_tools import mcp_ground_action
+
+    element_id = proposed.get("element_id")
+    ground_result = await mcp_ground_action(
+        element_id=element_id,
+        x=proposed.get("x"),
+        y=proposed.get("y"),
+        selector_map=state.get("selector_map", {}),
+        elements_list=state.get("elements_list", []),
+    )
+
+    if not ground_result["grounded"]:
+        logger.warning(
+            "🎯 Overwatch L2: grounding REJECT — %s",
+            ground_result["reason"],
+        )
+        updates["overwatch_verdict"] = "retry"
+        updates["error_count"] = state.get("error_count", 0) + 1
+        updates["grounding_rejects"] = state.get("grounding_rejects", 0) + 1
+        updates["failures"] = state.get("failures", []) + [{
+            "action": f"{verb}({element_id or ''})",
+            "why": ground_result["reason"],
+            "count": 1,
+        }]
+        return False
+
+    # Update coordinates from grounding
+    proposed["x"] = ground_result["x"]
+    proposed["y"] = ground_result["y"]
+    updates["proposed_action"] = proposed
+    return True
+
+
+async def _snapshot_before_action(critic: Any, state: dict[str, Any]) -> None:
+    """Capture CriticV12 pre-action snapshot from the cached perceive state.
+
+    V19: REUSE the perceive snapshot already in state instead of re-extracting.
+    This saves one full DOM extraction per step and keeps window.__aid intact
+    so the action resolves the exact node the LLM selected.
+    """
+    try:
+        from cognitive_core import dom_data_to_a11y_format
+
+        pre_dom = {
+            "elements": state.get("elements_list", []),
+            "element_count": state.get("element_count", 0),
+            "markdown": state.get("dom_markdown", ""),
+        }
+        pre_a11y = dom_data_to_a11y_format(pre_dom)
+        await critic.snapshot_before(pre_a11y)
+    except Exception as snap_err:
+        logger.warning("Overwatch L3: pre-snapshot failed: %s", snap_err)
+        try:
+            await critic.snapshot_before(None)
+        except Exception:
+            pass
+
+
+def _write_ahead_intent(
+    verb: str,
+    proposed: dict[str, Any],
+    state: dict[str, Any],
+    updates: dict[str, Any],
+) -> dict[str, Any] | None:
+    """V29 Atomic Intent Journal — write-ahead record BEFORE the side-effect."""
+    try:
+        from feature_flags import intent_journal_enabled
+
+        if not intent_journal_enabled():
+            return None
+        from intent_journal import make_intent, persist_intent, should_journal
+
+        if not should_journal(verb):
+            return None
+
+        element_id = proposed.get("element_id")
+        selector_map = state.get("selector_map", {})
+        el_kind = ""
+        if element_id and isinstance(selector_map, dict):
+            el_kind = (selector_map.get(element_id, {}) or {}).get("kind", "") or ""
+        intent_entry = make_intent(
+            proposed,
+            state.get("step_number", 0),
+            element_kind=el_kind,
+        )
+        updates["last_attempted_action"] = intent_entry  # survives node return
+        persist_intent(intent_entry)                      # durable, atomic, pre-exec
+        logger.info(
+            "📝 Intent journaled (pre-exec): %s [%s] hazard=%s",
+            intent_entry["verb"],
+            intent_entry.get("element_id") or "",
+            intent_entry.get("hazard"),
+        )
+        return intent_entry
+    except Exception as e:  # noqa: BLE001 — journaling never blocks the action
+        logger.debug("Intent journal write-ahead skipped (non-fatal): %s", e)
+        return None
+
+
+def _stamp_intent_status(
+    intent_entry: dict[str, Any] | None,
+    action_outcome: str,
+    updates: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Stamp the pre-exec intent journal entry with post-execution status."""
+    if intent_entry is None:
+        return None
+    try:
+        from intent_journal import classify_status
+
+        stamped = {**intent_entry, "status": classify_status(action_outcome)}
+        updates["last_attempted_action"] = stamped
+        return stamped
+    except Exception:  # noqa: BLE001
+        return intent_entry
+
+
+def _clear_intent_journal(updates: dict[str, Any]) -> None:
+    """Clear both in-state and durable intent journal records after confirmation."""
+    updates["last_attempted_action"] = None
+    try:
+        from intent_journal import resolve_intent
+
+        resolve_intent()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _check_smart_scroll_guard(
+    verb: str,
+    action_outcome: str,
+    state: dict[str, Any],
+    updates: dict[str, Any],
+) -> bool:
+    """V29 Smart-Scroll guard — stop scrolling into a wall (Mandate 3).
+
+    Returns True when the guard triggers an early escalation return.
+    """
+    if verb != "scroll":
+        return False
+    try:
+        from feature_flags import smart_scroll_enabled
+
+        if not smart_scroll_enabled():
+            return False
+        ol = action_outcome.lower()
+        unproductive = (
+            "no-op" in ol
+            or "reached page bottom" in ol
+            or "did not move" in ol
+        )
+        if not unproductive:
+            updates["scroll_stuck_streak"] = 0
+            return False
+
+        streak = state.get("scroll_stuck_streak", 0) + 1
+        updates["scroll_stuck_streak"] = streak
+        if streak >= 2:
+            logger.warning(
+                "🧭 Smart-scroll: %d unproductive scrolls — the "
+                "target isn't reachable by scrolling here; "
+                "escalating a different tactic.",
+                streak,
+            )
+            _escalate(
+                state,
+                "Scrolling is not revealing the target (page at bottom / won't move).",
+                updates,
+            )
+            if updates.get("overwatch_verdict") != "rollback":
+                updates["overwatch_verdict"] = "retry"
+            updates["page_fsm"] = "READY"
+            return True
+    except Exception as e:  # noqa: BLE001
+        logger.debug("Smart-scroll guard skipped (non-fatal): %s", e)
+    return False
+
+
+async def _extract_post_action_dom(
+    page: Any,
+    state: dict[str, Any],
+) -> tuple[Any, str, str]:
+    """Extract post-action DOM snapshot for CriticV12 and Reality Monitor."""
+    post_markdown = ""
+    post_url = state.get("current_url", "")
+    try:
+        import dom_parser
+        from cognitive_core import dom_data_to_a11y_format
+
+        post_dom = await dom_parser.extract(page, timeout=3.0)
+        post_a11y = dom_data_to_a11y_format(post_dom)
+        # V29 Reality Monitor inputs (free — we already extracted the post DOM).
+        post_markdown = post_dom.get("markdown", "") or ""
+        try:
+            post_url = page.url or post_url
+        except Exception:
+            pass
+    except Exception:
+        post_a11y = None
+    return post_a11y, post_markdown, post_url
+
+
+def _handle_reality_contradiction(
+    rv: Any,
+    verb: str,
+    state: dict[str, Any],
+    updates: dict[str, Any],
+) -> None:
+    """Populate updates and escalate when live screen contradicts prediction."""
+    logger.warning(
+        "🚨 Overwatch REALITY: screen contradicts the prediction — %s",
+        rv.note[:160],
+    )
+    # Temporal self-questioning + target lock: a contradiction on the
+    # bound target must NOT cause a drift to a neighboring look-alike.
+    note = rv.note[:300]
+    bt = (state.get("bound_target") or "").strip()
+    if bt:
+        note = (
+            note
+            + f" Your bound target is: {bt[:90]}. Do NOT now act "
+            "on a similar control for a DIFFERENT or neighboring item "
+            "— that abandons the goal. Re-examine YOUR target, or halt "
+            "and let the ensemble vote."
+        )
+    updates["reality_note"] = note[:500]
+    updates["critic_no_progress"] = state.get("critic_no_progress", 0) + 1
+    if verb in ("click", "type"):
+        updates["ineffective_streak"] = state.get("ineffective_streak", 0) + 1
+    updates["reflexion_triggers"] = state.get("reflexion_triggers", 0) + 1
+    # Escalate a DISTINCT tactic and re-evaluate the real screen.
+    _escalate(
+        state,
+        "The screen did NOT do what the action predicted.",
+        updates,
+    )
+    if updates.get("overwatch_verdict") != "rollback":
+        updates["overwatch_verdict"] = "retry"
+
+
+async def _reconcile_screen_reality(
+    verb: str,
+    proposed: dict[str, Any],
+    action_outcome: str,
+    state: dict[str, Any],
+    post_markdown: str,
+    post_url: str,
+    critic_success: bool,
+    updates: dict[str, Any],
+) -> bool:
+    """V29 Reality Monitor — compare worker's prediction against the live screen.
+
+    Returns True when CONTRADICTED triggers an early retry/rollback return.
+    """
+    try:
+        from feature_flags import reality_enabled, reality_llm_enabled
+
+        if not (reality_enabled() and verb in ("click", "type", "press_enter")):
+            return False
+
+        from reality import (
+            CONFIRMED,
+            CONTRADICTED,
+            UNCLEAR,
+            classify_reality,
+            reconcile_with_llm,
+        )
+
+        rv = classify_reality(
+            expected_change=proposed.get("expected_change", "") or "",
+            verb=verb,
+            action_outcome=action_outcome,
+            pre_text=state.get("dom_markdown", "") or "",
+            post_text=post_markdown,
+            pre_url=state.get("current_url", ""),
+            post_url=post_url,
+            critic_success=critic_success,
+        )
+        # Deterministic-first: spend a cheap LLM call ONLY on ambiguous deltas.
+        if (
+            rv.status == UNCLEAR
+            and reality_llm_enabled()
+            and _JUDGE_CHAIN
+            and _JUDGE_INVOKE_FN
+        ):
+            rv = await reconcile_with_llm(
+                _JUDGE_INVOKE_FN,
+                _JUDGE_CHAIN,
+                _JUDGE_BREAKER,
+                _JUDGE_HEALTH,
+                objective=state.get("objective", ""),
+                expected_change=proposed.get("expected_change", "") or "",
+                action_outcome=action_outcome,
+                post_text=post_markdown,
+                fallback=rv,
+            )
+        updates["reality_status"] = rv.status
+
+        if rv.status == CONTRADICTED:
+            _handle_reality_contradiction(rv, verb, state, updates)
+            return True
+
+        if rv.status == CONFIRMED:
+            # Positive reconciliation — clear stale discrepancy note and V32
+            # intent journal so HESITATION doesn't false-fire on next step.
+            updates["reality_note"] = ""
+            _clear_intent_journal(updates)
+            if rv.note:
+                logger.info(
+                    "✅ Overwatch REALITY: prediction confirmed — %s",
+                    rv.note[:120],
+                )
+    except Exception as e:  # noqa: BLE001 — reality monitor never breaks the step
+        logger.debug("Reality monitor skipped (non-fatal): %s", e)
+    return False
+
+
+def _evaluate_critic_verdict(
+    verdict: Any,
+    verb: str,
+    state: dict[str, Any],
+    updates: dict[str, Any],
+) -> bool:
+    """Apply CriticV12 progress/no-progress verdict. Returns True if action passed."""
+    if verdict.success:
+        updates["correction_failures"] = 0
+        updates["correction_context"] = ""
+        updates["critic_progress"] = state.get("critic_progress", 0) + 1
+        updates["ineffective_streak"] = 0  # V21: progress clears the visual-trigger
+        logger.info("✓ Overwatch L3: %s [%.0f%%]", verdict.reason[:100], verdict.confidence * 100)
+        return True
+
+    cf = state.get("correction_failures", 0) + 1
+    updates["correction_failures"] = cf
+    updates["critic_no_progress"] = state.get("critic_no_progress", 0) + 1
+    # V21: a click/type that produced no visible effect — count it so that a
+    # short streak escalates to a vision look (the DOM says act, page doesn't).
+    if verb in ("click", "type"):
+        updates["ineffective_streak"] = state.get("ineffective_streak", 0) + 1
+
+    if verdict.circuit_breaker_triggered:
+        logger.warning("🛑 Overwatch L3: circuit breaker — %s", verdict.reason[:100])
+        _escalate(state, "Critic circuit breaker.", updates)
+        updates["overwatch_verdict"] = "rollback"
+        updates["reflexion_triggers"] = state.get("reflexion_triggers", 0) + 1
+        return False
+
+    if cf >= 2:
+        # Escalate through the ladder (distinct tactic each time; never repeats).
+        _escalate(state, f"Last {cf} actions had no visible effect.", updates)
+        updates["reflexion_triggers"] = state.get("reflexion_triggers", 0) + 1
+        # Honor a ladder-forced rollback; otherwise retry until cf exhausts.
+        if updates.get("overwatch_verdict") != "rollback":
+            updates["overwatch_verdict"] = "retry" if cf < 3 else "rollback"
+        return False
+
+    # cf == 1: one free re-decision before we start escalating.
+    updates["overwatch_verdict"] = "retry"
+    return False
+
+
+def _finalize_layer_5_and_commit(
+    verb: str,
+    proposed: dict[str, Any],
+    x_val: int,
+    y_val: int,
+    action_outcome: str,
+    intent_entry: dict[str, Any] | None,
+    state: dict[str, Any],
+    page: Any,
+    updates: dict[str, Any],
+) -> dict[str, Any]:
+    """Layer 5 loop detection and final state commit for a verified action."""
+    element_id = proposed.get("element_id")
+    sig = f"{verb}|{element_id or ''}|{state.get('current_url', '')}"
+    loop_sigs = state.get("loop_signatures", [])
+    sig_count = loop_sigs[-12:].count(sig) if loop_sigs else 0  # sliding window
+
+    if sig_count >= 3:
+        logger.warning("🔄 Overwatch L5: loop detected — sig '%s' x%d", sig[:60], sig_count)
+        _escalate(state, "Loop detected (same action repeating).", updates)
+        updates["overwatch_verdict"] = "rollback"
+        updates["loop_signatures"] = [sig]
+        return updates
+
+    # ── All layers passed ──
+    updates["overwatch_verdict"] = "pass"
+    updates["page_fsm"] = "VALIDATED"
+    updates["loop_signatures"] = [sig]
+
+    # V29: action is VERIFIED-effective → resolve the intent journal.
+    if intent_entry is not None:
+        _clear_intent_journal(updates)
+
+    px = proposed.get("x")
+    updates["history"] = [{
+        "step": state.get("step_number", 0) + 1,
+        "action": f"{verb}" + (f"({x_val},{y_val})" if px is not None else ""),
+        "outcome": action_outcome,
+        "screen": proposed.get("screen_state", "")[:80],
+        "url": page.url if page else "",
+    }]
+    return updates
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #  Overwatch Node — The verification gate
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -110,350 +525,84 @@ async def overwatch_node(state: dict[str, Any], page, critic, action_verifier=No
         return {"overwatch_verdict": "pass"}
 
     verb = proposed.get("verb", "")
-    element_id = proposed.get("element_id")
-    selector_map = state.get("selector_map", {})
-    step_number = state.get("step_number", 0)
-
     updates: dict[str, Any] = {}
 
-    # ═══════════════════════════════════════════════════════════════════
-    #  Layer 1: Deterministic State Validation (~0ms)
-    # ═══════════════════════════════════════════════════════════════════
-
-    page_fsm = state.get("page_fsm", "READY")
-    if page_fsm == "ERROR":
+    # Layer 1: Deterministic State Validation (~0ms)
+    if state.get("page_fsm", "READY") == "ERROR":
         logger.warning("⚠️ Overwatch L1: page FSM in ERROR state")
         updates["overwatch_verdict"] = "rollback"
         updates["error_count"] = state.get("error_count", 0) + 1
         return updates
 
     if verb == "done":
-        # Done actions skip to Layer 4 (CoVe check)
         return await _layer_4_cove_check(state, page, updates)
 
-    # ═══════════════════════════════════════════════════════════════════
-    #  Layer 2: Grounding Validation (~5ms)
-    # ═══════════════════════════════════════════════════════════════════
+    # Layer 2: Grounding Validation (~5ms)
+    if not await _layer_2_ground_action(verb, proposed, state, updates):
+        return updates
 
-    if verb in ("click", "type"):
-        from mcp_tools import mcp_ground_action
-        ground_result = await mcp_ground_action(
-            element_id=element_id,
-            x=proposed.get("x"),
-            y=proposed.get("y"),
-            selector_map=selector_map,
-            elements_list=state.get("elements_list", []),
-        )
+    # Layer 3: Execute + DOM Ground-Truth Check (CriticV12)
+    await _snapshot_before_action(critic, state)
+    intent_entry = _write_ahead_intent(verb, proposed, state, updates)
 
-        if not ground_result["grounded"]:
-            logger.warning(
-                "🎯 Overwatch L2: grounding REJECT — %s",
-                ground_result["reason"]
-            )
-            updates["overwatch_verdict"] = "retry"
-            updates["error_count"] = state.get("error_count", 0) + 1
-            updates["grounding_rejects"] = state.get("grounding_rejects", 0) + 1
-            updates["failures"] = state.get("failures", []) + [{
-                "action": f"{verb}({element_id or ''})",
-                "why": ground_result["reason"],
-                "count": 1,
-            }]
-            return updates
-
-        # Update coordinates from grounding
-        proposed["x"] = ground_result["x"]
-        proposed["y"] = ground_result["y"]
-        updates["proposed_action"] = proposed
-
-    # ═══════════════════════════════════════════════════════════════════
-    #  Layer 3: Execute + DOM Ground-Truth Check (CriticV12)
-    # ═══════════════════════════════════════════════════════════════════
-
-    # Pre-action snapshot — V19: REUSE the perceive snapshot already in state
-    # instead of re-extracting. This (a) saves one full DOM extraction per step,
-    # and (b) crucially keeps window.__aid (the element-handle registry) exactly
-    # as the LLM saw it, so the action resolves the SAME node the LLM chose
-    # (a re-extract here would rebuild the registry right before the click).
-    try:
-        from cognitive_core import dom_data_to_a11y_format
-        pre_dom = {
-            "elements": state.get("elements_list", []),
-            "element_count": state.get("element_count", 0),
-            "markdown": state.get("dom_markdown", ""),
-        }
-        pre_a11y = dom_data_to_a11y_format(pre_dom)
-        await critic.snapshot_before(pre_a11y)
-    except Exception as snap_err:
-        logger.warning("Overwatch L3: pre-snapshot failed: %s", snap_err)
-        try:
-            await critic.snapshot_before(None)
-        except Exception:
-            pass
-
-    # ═══════════════════════════════════════════════════════════════════
-    #  V29 Atomic Intent Journal — WRITE-AHEAD record BEFORE the side-effect.
-    #  If the action times out / crashes mid-execution, this record survives so the
-    #  NEXT decision knows the action was attempted (and may have partially applied)
-    #  and must NOT blindly repeat it. The in-state write rides the node's atomic
-    #  super-step commit; the durable file is written immediately (pre-execution).
-    # ═══════════════════════════════════════════════════════════════════
-    intent_entry = None
-    try:
-        from feature_flags import intent_journal_enabled
-        if intent_journal_enabled():
-            from intent_journal import make_intent, should_journal, persist_intent
-            if should_journal(verb):
-                el_kind = ""
-                if element_id and isinstance(selector_map, dict):
-                    el_kind = (selector_map.get(element_id, {}) or {}).get("kind", "") or ""
-                intent_entry = make_intent(proposed, step_number, element_kind=el_kind)
-                updates["last_attempted_action"] = intent_entry  # survives node return
-                persist_intent(intent_entry)                      # durable, atomic, pre-exec
-                logger.info("📝 Intent journaled (pre-exec): %s [%s] hazard=%s",
-                            intent_entry["verb"], intent_entry.get("element_id") or "",
-                            intent_entry.get("hazard"))
-    except Exception as e:  # noqa: BLE001 — journaling never blocks the action
-        logger.debug("Intent journal write-ahead skipped (non-fatal): %s", e)
-
-    # Execute the action via MCP tools
-    action_outcome = await _execute_action(proposed, page, elements_list=state.get("elements_list"))
+    action_outcome = await _execute_action(
+        proposed,
+        page,
+        elements_list=state.get("elements_list"),
+    )
     updates["action_outcome"] = action_outcome
     updates["page_fsm"] = "ACTION_PENDING"
     updates["total_actions"] = state.get("total_actions", 0) + 1
+    intent_entry = _stamp_intent_status(intent_entry, action_outcome, updates)
 
-    # Stamp the journal with the post-execution status so every downstream return
-    # path (contradiction / ineffective / retry) carries an accurate ledger. The
-    # verified-success path below clears it entirely.
-    if intent_entry is not None:
-        try:
-            from intent_journal import classify_status
-            intent_entry = {**intent_entry, "status": classify_status(action_outcome)}
-            updates["last_attempted_action"] = intent_entry
-        except Exception:  # noqa: BLE001
-            pass
+    if _check_smart_scroll_guard(verb, action_outcome, state, updates):
+        return updates
 
-    # ═══════════════════════════════════════════════════════════════════
-    #  V29 Smart-Scroll guard — stop scrolling into a wall (Mandate 3)
-    #  A scroll that doesn't move the page, or that has reached the bottom, is not
-    #  going to reveal the target. Track the streak and escalate a DIFFERENT tactic
-    #  instead of looping the scroll. Flag-gated; off ⇒ identical to V28.
-    # ═══════════════════════════════════════════════════════════════════
-    if verb == "scroll":
-        try:
-            from feature_flags import smart_scroll_enabled
-            if smart_scroll_enabled():
-                ol = action_outcome.lower()
-                unproductive = ("no-op" in ol or "reached page bottom" in ol
-                                or "did not move" in ol)
-                if unproductive:
-                    streak = state.get("scroll_stuck_streak", 0) + 1
-                    updates["scroll_stuck_streak"] = streak
-                    if streak >= 2:
-                        logger.warning("🧭 Smart-scroll: %d unproductive scrolls — the "
-                                       "target isn't reachable by scrolling here; "
-                                       "escalating a different tactic.", streak)
-                        _escalate(state, "Scrolling is not revealing the target "
-                                  "(page at bottom / won't move).", updates)
-                        if updates.get("overwatch_verdict") != "rollback":
-                            updates["overwatch_verdict"] = "retry"
-                        updates["page_fsm"] = "READY"
-                        return updates
-                else:
-                    updates["scroll_stuck_streak"] = 0
-        except Exception as e:  # noqa: BLE001
-            logger.debug("Smart-scroll guard skipped (non-fatal): %s", e)
-
-    # Post-action DOM check
-    post_markdown = ""
-    post_url = state.get("current_url", "")
-    try:
-        import dom_parser
-        from cognitive_core import dom_data_to_a11y_format
-        post_dom = await dom_parser.extract(page, timeout=3.0)
-        post_a11y = dom_data_to_a11y_format(post_dom)
-        # V29 Reality Monitor inputs (free — we already extracted the post DOM).
-        post_markdown = post_dom.get("markdown", "") or ""
-        try:
-            post_url = page.url or post_url
-        except Exception:
-            pass
-    except Exception:
-        post_a11y = None
-
-    px = proposed.get("x")
-    py = proposed.get("y")
-    x_val = int(px) if px is not None else 0
-    y_val = int(py) if py is not None else 0
-    target_ref = element_id or f"({x_val},{y_val})"
+    post_a11y, post_markdown, post_url = await _extract_post_action_dom(page, state)
+    x_val = int(proposed["x"]) if proposed.get("x") is not None else 0
+    y_val = int(proposed["y"]) if proposed.get("y") is not None else 0
+    target_ref = proposed.get("element_id") or f"({x_val},{y_val})"
+    target_name = (
+        proposed["text"][:30]
+        if proposed.get("text")
+        else proposed.get("target_name", "")
+    )
     verdict = await critic.evaluate(
         action=verb,
         target_ref=target_ref,
-        target_name=proposed.get("text", "")[:30] if proposed.get("text") else proposed.get("target_name", ""),
+        target_name=target_name,
         a11y_data_after=post_a11y,
     )
     # V29 Phase A: surface the unified state-change score (CriticV12 diffing).
     updates["state_change_score"] = float(getattr(verdict, "state_change_score", 0.0) or 0.0)
 
-    # ═══════════════════════════════════════════════════════════════════
-    #  V29 Reality Monitor — did the page do what the worker PREDICTED?
-    #  CriticV12 above only answers "did *anything* change?". This compares the
-    #  worker's pre-committed `expected_change` against the LIVE screen. A
-    #  CONTRADICTED screen (error / rejection / wrong redirect / out-of-stock)
-    #  must NOT be committed as progress just because the DOM mutated — that is
-    #  exactly the "blind execution" failure. We block it, note the discrepancy,
-    #  and feed it back to the worker (via the guidance bus) to re-evaluate.
-    #  Fully additive + flag-gated (V29_REALITY) — off ⇒ identical to V28.
-    # ═══════════════════════════════════════════════════════════════════
-    try:
-        from feature_flags import reality_enabled, reality_llm_enabled
-        if reality_enabled() and verb in ("click", "type", "press_enter"):
-            from reality import (classify_reality, reconcile_with_llm,
-                                 CONTRADICTED, CONFIRMED, UNCLEAR)
-            rv = classify_reality(
-                expected_change=proposed.get("expected_change", "") or "",
-                verb=verb,
-                action_outcome=action_outcome,
-                pre_text=state.get("dom_markdown", "") or "",
-                post_text=post_markdown,
-                pre_url=state.get("current_url", ""),
-                post_url=post_url,
-                critic_success=verdict.success,
-            )
-            # Deterministic-first: spend a cheap LLM call ONLY on ambiguous deltas.
-            if (rv.status == UNCLEAR and reality_llm_enabled()
-                    and _JUDGE_CHAIN and _JUDGE_INVOKE_FN):
-                rv = await reconcile_with_llm(
-                    _JUDGE_INVOKE_FN, _JUDGE_CHAIN, _JUDGE_BREAKER, _JUDGE_HEALTH,
-                    objective=state.get("objective", ""),
-                    expected_change=proposed.get("expected_change", "") or "",
-                    action_outcome=action_outcome,
-                    post_text=post_markdown,
-                    fallback=rv,
-                )
-            updates["reality_status"] = rv.status
-
-            if rv.status == CONTRADICTED:
-                logger.warning("🚨 Overwatch REALITY: screen contradicts the "
-                               "prediction — %s", rv.note[:160])
-                # Temporal self-questioning + target lock: a contradiction on the
-                # bound target must NOT cause a drift to a neighboring look-alike.
-                note = rv.note[:300]
-                bt = (state.get("bound_target") or "").strip()
-                if bt:
-                    note = (note + f" Your bound target is: {bt[:90]}. Do NOT now act "
-                            "on a similar control for a DIFFERENT or neighboring item "
-                            "— that abandons the goal. Re-examine YOUR target, or halt "
-                            "and let the ensemble vote.")
-                updates["reality_note"] = note[:500]
-                updates["critic_no_progress"] = state.get("critic_no_progress", 0) + 1
-                if verb in ("click", "type"):
-                    updates["ineffective_streak"] = state.get("ineffective_streak", 0) + 1
-                updates["reflexion_triggers"] = state.get("reflexion_triggers", 0) + 1
-                # Escalate a DISTINCT tactic and re-evaluate the real screen.
-                _escalate(state,
-                          "The screen did NOT do what the action predicted.",
-                          updates)
-                if updates.get("overwatch_verdict") != "rollback":
-                    updates["overwatch_verdict"] = "retry"
-                return updates
-
-            if rv.status == CONFIRMED:
-                # Positive reconciliation — clear any stale discrepancy note.
-                updates["reality_note"] = ""
-                # V32: Reality confirmed the action worked → clear the intent
-                # journal so HESITATION doesn't fire on the next step. Without
-                # this, the Worker gets told "predecessor click unconfirmed"
-                # even though Overwatch visually confirmed the click succeeded.
-                # This was the root cause of the "false hesitation" loop on
-                # radio buttons and checkboxes.
-                updates["last_attempted_action"] = None
-                try:
-                    from intent_journal import resolve_intent
-                    resolve_intent()
-                except Exception:  # noqa: BLE001
-                    pass
-                if rv.note:
-                    logger.info("✅ Overwatch REALITY: prediction confirmed — %s",
-                                rv.note[:120])
-    except Exception as e:  # noqa: BLE001 — reality monitor never breaks the step
-        logger.debug("Reality monitor skipped (non-fatal): %s", e)
-
-    if verdict.success:
-        updates["correction_failures"] = 0
-        updates["correction_context"] = ""
-        updates["critic_progress"] = state.get("critic_progress", 0) + 1
-        updates["ineffective_streak"] = 0  # V21: progress clears the visual-trigger
-        logger.info("✓ Overwatch L3: %s [%.0f%%]", verdict.reason[:100], verdict.confidence * 100)
-    else:
-        cf = state.get("correction_failures", 0) + 1
-        updates["correction_failures"] = cf
-        updates["critic_no_progress"] = state.get("critic_no_progress", 0) + 1
-        # V21: a click/type that produced no visible effect — count it so that a
-        # short streak escalates to a vision look (the DOM says act, page doesn't).
-        if verb in ("click", "type"):
-            updates["ineffective_streak"] = state.get("ineffective_streak", 0) + 1
-
-        if verdict.circuit_breaker_triggered:
-            logger.warning("🛑 Overwatch L3: circuit breaker — %s", verdict.reason[:100])
-            _escalate(state, "Critic circuit breaker.", updates)
-            updates["overwatch_verdict"] = "rollback"
-            updates["reflexion_triggers"] = state.get("reflexion_triggers", 0) + 1
-            return updates
-
-        if cf >= 2:
-            # Escalate through the ladder (distinct tactic each time; never repeats).
-            _escalate(state, f"Last {cf} actions had no visible effect.", updates)
-            updates["reflexion_triggers"] = state.get("reflexion_triggers", 0) + 1
-            # Honor a ladder-forced rollback; otherwise retry until cf exhausts.
-            if updates.get("overwatch_verdict") != "rollback":
-                updates["overwatch_verdict"] = "retry" if cf < 3 else "rollback"
-            return updates
-
-        # cf == 1: one free re-decision before we start escalating.
-        updates["overwatch_verdict"] = "retry"
+    if await _reconcile_screen_reality(
+        verb,
+        proposed,
+        action_outcome,
+        state,
+        post_markdown,
+        post_url,
+        verdict.success,
+        updates,
+    ):
         return updates
 
-    # ═══════════════════════════════════════════════════════════════════
-    #  Layer 5: Loop Detection + Circuit Breaker (~0ms)
-    # ═══════════════════════════════════════════════════════════════════
-
-    sig = f"{verb}|{element_id or ''}|{state.get('current_url', '')}"
-    loop_sigs = state.get("loop_signatures", [])
-    sig_count = loop_sigs[-12:].count(sig) if loop_sigs else 0  # sliding window
-
-    if sig_count >= 3:
-        logger.warning("🔄 Overwatch L5: loop detected — sig '%s' x%d", sig[:60], sig_count)
-        _escalate(state, "Loop detected (same action repeating).", updates)
-        updates["overwatch_verdict"] = "rollback"
-        updates["loop_signatures"] = [sig]
+    if not _evaluate_critic_verdict(verdict, verb, state, updates):
         return updates
 
-    # ── All layers passed ──
-    updates["overwatch_verdict"] = "pass"
-    updates["page_fsm"] = "VALIDATED"
-    updates["loop_signatures"] = [sig]
-
-    # V29: the action is VERIFIED-effective → resolve the intent journal. There is
-    # no ambiguity to carry forward, so the next decision starts with a clean slate.
-    if intent_entry is not None:
-        updates["last_attempted_action"] = None
-        try:
-            from intent_journal import resolve_intent
-            resolve_intent()
-        except Exception:  # noqa: BLE001
-            pass
-
-    # Record step in history
-    history_entry = {
-        "step": step_number + 1,
-        "action": f"{verb}" + (f"({x_val},{y_val})" if px is not None else ""),
-        "outcome": action_outcome,
-        "screen": proposed.get("screen_state", "")[:80],
-        "url": page.url if page else "",
-    }
-    updates["history"] = [history_entry]
-
-    return updates
+    # Layer 5: Loop Detection + Commit
+    return _finalize_layer_5_and_commit(
+        verb,
+        proposed,
+        x_val,
+        y_val,
+        action_outcome,
+        intent_entry,
+        state,
+        page,
+        updates,
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

@@ -295,10 +295,8 @@ class DualModeSessionManager:
             out = []
             for s in self._sessions.values():
                 url = ""
-                try:
+                with contextlib.suppress(Exception):
                     url = s.page.url
-                except Exception:
-                    pass
                 out.append({
                     "session": s.name,
                     "mode": s.mode,
@@ -330,16 +328,12 @@ class DualModeSessionManager:
             for name in names:
                 await self._close_session_unlocked(name)
             for browser in list(self._browsers.values()):
-                try:
+                with contextlib.suppress(Exception):
                     await browser.close()
-                except Exception:
-                    pass
             self._browsers.clear()
             if self._pw is not None:
-                try:
+                with contextlib.suppress(Exception):
                     await self._pw.stop()
-                except Exception:
-                    pass
                 self._pw = None
             if self._xvfb_started:
                 try:
@@ -429,17 +423,16 @@ class DualModeSessionManager:
 
         session.step_count += 1
         title = ""
-        try:
+        with contextlib.suppress(Exception):
             title = await page.title()
-        except Exception:
-            pass
 
+        page_url = str(page.url or "")
         payload = {
             "ok": True,
             "session": session.name,
             "mode": session.mode,
             "step": session.step_count,
-            "url": page.url or "",
+            "url": page_url,
             "title": title,
             "markdown": session.last_markdown,
             "elements": session.elements,
@@ -449,7 +442,7 @@ class DualModeSessionManager:
         session.last_perceive = payload
         session.append_transcript(
             "perceive",
-            payload["url"],
+            page_url,
             step_metric.total_perceive_ms,
             {
                 "step": session.step_count,
@@ -537,10 +530,8 @@ class DualModeSessionManager:
 
             duration_ms = round((time.perf_counter() - t0) * 1000.0, 1)
             cur_url = ""
-            try:
+            with contextlib.suppress(Exception):
                 cur_url = session.page.url or ""
-            except Exception:
-                pass
 
             session.append_transcript(
                 "act",

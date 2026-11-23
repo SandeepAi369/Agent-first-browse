@@ -24,6 +24,7 @@ UNIVERSAL-ONLY: zero site/brand/commerce literals anywhere in this module.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import re
 import time
@@ -113,10 +114,8 @@ async def wait_for_dom_settle(
     Returns total settle duration in milliseconds. Never raises.
     """
     t0 = time.perf_counter()
-    try:
+    with contextlib.suppress(Exception):
         await page.wait_for_load_state("domcontentloaded", timeout=load_timeout_ms)
-    except Exception:
-        pass
 
     try:
         await asyncio.wait_for(
@@ -565,10 +564,8 @@ async def perceive_v2(
         settle_ms = await wait_for_dom_settle(page)
 
     url = ""
-    try:
+    with contextlib.suppress(Exception):
         url = page.url or ""
-    except Exception:
-        pass
 
     # Step 2: Tier-1 extraction (reuses proven dom_parser without modifying it)
     t_ext = time.perf_counter()

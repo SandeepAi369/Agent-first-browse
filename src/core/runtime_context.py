@@ -20,10 +20,11 @@ Key guarantees:
 from __future__ import annotations
 
 import inspect
+from collections.abc import AsyncIterator, Callable, Iterator
 from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
-from typing import Any, AsyncIterator, Callable, Iterator, TypeVar
+from typing import Any, TypeVar
 
 from core.disposable import AsyncCleanup, AsyncDisposable, AsyncDisposableStore, Disposable
 from core.errors import BrowserSessionError, ConfigValidationError

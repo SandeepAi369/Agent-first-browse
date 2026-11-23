@@ -177,9 +177,8 @@ def _resolve_act_params(args: argparse.Namespace) -> dict[str, Any]:
             direction = pos.pop(0)
         if pos:
             amount = int(pos[0])
-    elif verb == "wait":
-        if pos and wait_ms == 800:
-            wait_ms = int(pos[0])
+    elif verb == "wait" and pos and wait_ms == 800:
+        wait_ms = int(pos[0])
 
     return {
         "name": args.session,

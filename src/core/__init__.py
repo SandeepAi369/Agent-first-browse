@@ -114,6 +114,11 @@ from core.runtime_context import (
     scoped_runtime_context,
     use_runtime_context,
 )
+from core.session_bootstrap import (
+    SessionGuard,
+    invoke_with_failover_compat,
+    launch_browser,
+)
 from core.settings import (
     AppSettings,
     EngineSettings,
@@ -214,6 +219,7 @@ __all__ = [
     "SafetyPolicyError",
     "SafetySettings",
     "SecretValue",
+    "SessionGuard",
     "SessionRecord",
     "SessionReport",
     "ShouldRetryFn",
@@ -229,6 +235,7 @@ __all__ = [
     "conversation_scope",
     "get_current_context",
     "get_default_bus",
+    "invoke_with_failover_compat",
     "is_error_retryable",
     "is_non_retryable",
     "is_private_or_local_host",
@@ -236,6 +243,7 @@ __all__ = [
     "is_transient_error",
     "jitter_backoff_ms",
     "jitter_backoff_s",
+    "launch_browser",
     "load_settings",
     "parse_env_bool",
     "parse_env_float",

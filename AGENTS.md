@@ -22,7 +22,7 @@ It also ships a zero-API **"Agent-as-LLM" Evaluation Connector** (`src/eval_conn
 src/
   v2_engine/            # Dual-mode V2 perception, resilient actions, LangGraph policy, metrics
   eval_connector/       # Zero-API DualModeSessionManager, Unix-socket daemon, CLI, MCP stdio server
-  core/                 # (Planned Chunks 2–7) Shared contracts: errors, retries, URL policy, DI, observability
+  core/                 # Shared primitives: errors, retries, url_policy, truncate, redaction, disposable, runtime_context, browser_provider, session_bootstrap, observability, settings
   workers/              # Specialized worker prompts & action selection (base_worker.py)
   skills/               # Browser skill wrappers (navigate, interact, extract)
   orchestrator/         # Legacy/auxiliary critic (critic_v12.py) & orchestrator models
@@ -41,7 +41,7 @@ src/
   cdp_input.py          # [FROZEN §6] CDP typing & React-reversion detection
   ghost_input.py        # [FROZEN §6] Bézier cursor & humanized scroll/input
   virtual_display.py    # [FROZEN §6] Xvfb headed display lifecycle
-  advanced_agent.py     # Legacy monolithic loop (being decoupled from brain_graph.py)
+  advanced_agent.py     # Deprecated legacy monolithic loop (decoupled from brain_graph.py; aliases core.session_bootstrap)
 
 scripts/
   check_guardrails.py   # Automated guardrail & contract verifier (frozen files, universal-only, exports, secrets, test hygiene)
@@ -72,12 +72,13 @@ Every modern package exposes an explicit `__all__` barrel in `__init__.py`. Keep
 
 | Surface | Path / Entry Point | Stability |
 |---|---|---|
+| Core Shared Primitives | `src/core/__init__.py` | Public (`__all__` enforced) |
 | V2 Engine API | `src/v2_engine/__init__.py` | Public (`__all__` enforced) |
 | Eval Connector API | `src/eval_connector/__init__.py` | Public (`__all__` enforced) |
 | CLI Script: `agent-eval` | `eval_connector.cli:main` (`scripts/agent_eval.py`) | Public (`pyproject.toml`) |
 | MCP Script: `agent-eval-mcp` | `eval_connector.mcp_server:main` | Public (`pyproject.toml`) |
 | LangGraph Brain CLI | `src/run_v16.py` | Active entrypoint |
-| Legacy Runners | `src/run.py`, `src/run_objective.py`, `src/run_prompt.py` | Legacy / maintenance-only |
+| Legacy Gen-1/Gen-2 Runners | `src/run.py`, `src/run_objective.py`, `src/run_prompt.py`, `src/advanced_agent.py` | **Deprecated / Legacy** (maintenance-only; prefer `src/run_v16.py` or `agent-eval` / `agent-eval-mcp`) |
 
 ---
 
@@ -87,8 +88,10 @@ All commands run inside WSL from `/home/sandeep/agent first IDE` using `.venv/bi
 
 | Command | Purpose |
 |---|---|
-| `.venv/bin/python scripts/check_guardrails.py` | Run all automated architectural & safety guardrail checks |
-| `.venv/bin/python scripts/check_guardrails.py --base-ref main` | Also assert zero edits to §6 frozen files relative to `main` |
+| `.venv/bin/python scripts/check_guardrails.py --strict-test-hygiene` | Run all automated architectural, secret, export, and test-hygiene guardrail checks (CI gate) |
+| `.venv/bin/python scripts/check_guardrails.py --base-ref main --strict-test-hygiene` | Also assert zero edits to §6 frozen files relative to `main` |
+| `.venv/bin/ruff check src/core src/v2_engine src/eval_connector scripts/check_guardrails.py` | Modern lint & import-order gate for scoped packages (CI gate) |
+| `.venv/bin/mypy src/core src/v2_engine src/eval_connector scripts/check_guardrails.py` | Progressive static type-check gate for scoped packages (CI gate) |
 | `.venv/bin/pytest -q` | Full offline unit + local-Chromium test suite (excludes `tests/live/`) |
 | `.venv/bin/pytest tests/test_v2_engine.py tests/test_eval_connector_mcp.py -q` | Fast V2 + MCP smoke tests |
 | `.venv/bin/flake8 src scripts tests --count --select=E9,F63,F7,F82 --show-source --statistics` | Hard CI syntax / undefined-name lint gate (excludes local venv/scratch dirs) |
@@ -102,7 +105,7 @@ For headed desktop Chromium runs under WSLg, ensure `DISPLAY=:0` is set.
 ## 5. Non-Negotiable Boundaries
 
 ### Always
-- Run `scripts/check_guardrails.py`, `flake8` (CI gate), and `pytest -q` before finishing any task.
+- Run `scripts/check_guardrails.py --strict-test-hygiene`, `ruff check`, `mypy`, `flake8` (CI gate), and `pytest -q` before finishing any task.
 - Keep new shared modules modular, typed (Python 3.11+ syntax, `from __future__ import annotations`), and backed by focused unit tests.
 - Maintain dual-mode compatibility (`--mode legacy` and `--mode v2`) and keep all 350+ baseline tests green.
 - Use feature branches for architectural work (never develop experimental changes directly on `main`).

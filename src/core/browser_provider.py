@@ -25,9 +25,10 @@ import asyncio
 import importlib.util
 import math
 import time
-from contextlib import asynccontextmanager
+from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
-from typing import Any, AsyncIterator, Callable, Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 from core.errors import BrowserSessionGoneError, ConfigValidationError
 from core.runtime_context import (
@@ -221,10 +222,8 @@ class LocalPlaywrightProvider:
     async def close(self, handle: BrowserHandle) -> None:
         ctx = handle.browser_context
         if ctx is not None:
-            try:
+            with suppress(Exception):
                 await ctx.close()
-            except Exception:
-                pass
 
     def driver_info(self) -> dict[str, Any]:
         has_patchright = importlib.util.find_spec("patchright") is not None
@@ -238,16 +237,12 @@ class LocalPlaywrightProvider:
         """Close all shared browser instances and stop the Playwright driver."""
         async with self._launch_lock:
             for browser in list(self._browsers.values()):
-                try:
+                with suppress(Exception):
                     await browser.close()
-                except Exception:
-                    pass
             self._browsers.clear()
             if self._pw is not None:
-                try:
+                with suppress(Exception):
                     await self._pw.stop()
-                except Exception:
-                    pass
                 self._pw = None
 
 
@@ -306,10 +301,8 @@ class BrowserSessionManager:
         if ctx is not None:
             await ctx.aclose()
         if handle is not None:
-            try:
+            with suppress(Exception):
                 await self._provider.close(handle)
-            except Exception:
-                pass
 
         if record is None:
             return None

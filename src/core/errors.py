@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import asdict, dataclass
-from enum import Enum
+from enum import StrEnum
 from typing import Any
 
 _MAX_CAUSE_WALK_DEPTH = 5
@@ -36,7 +36,7 @@ _NON_RETRYABLE_BUILTINS: tuple[type[BaseException], ...] = (
 )
 
 
-class ErrorCode(str, Enum):
+class ErrorCode(StrEnum):
     """Stable machine-readable error classifications across Agent-first-browse."""
 
     INTERNAL = "internal"

@@ -947,7 +947,7 @@ async def run_brain(objective: str, headless: bool = False, mode: str | None = N
     path — success, crash, early return, or Ctrl+C. The cancellation is re-raised
     so the caller can exit non-zero.
     """
-    from advanced_agent import SessionGuard
+    from core.session_bootstrap import SessionGuard
     from v2_engine import get_engine_mode, set_engine_mode
     from v2_engine.metrics import reset_active_metrics
     from v2_engine.perception import get_shared_compressor
@@ -969,84 +969,27 @@ async def run_brain(objective: str, headless: bool = False, mode: str | None = N
         if metrics.steps:
             logger.info("📊 [%s mode] Telemetry summary: %s", active_mode, metrics.summary())
         await guard.shutdown()
-        try:
+        with contextlib.suppress(Exception):
             from virtual_display import stop_virtual_display
             stop_virtual_display()
-        except Exception:
-            pass
 
 
-async def _run_brain_session(objective: str, headless: bool):
-    global _PAGE, _CONTEXT, _FAILOVER_CHAIN, _WORKER_CHAIN, _VISION_CHAIN, _BREAKER, _HEALTH_TRACKER
-    global _INVOKE_FN, _CRITIC, _DREAMER, _PRM_CRITIC, _SKILL_MEM
-
-    # ── Import existing modules ──
-    from advanced_agent import launch_browser, _invoke_with_failover
-    from model_registry import ModelRegistry
-    from app.browser_promoter.browser_warmup import run_warmup, extract_target_url_from_objective
-    from app.browser_promoter.worker_planner import ReasoningAgent
-    from orchestrator.critic_v12 import CriticV12
-    from prm_critic import PRMCritic
-    from web_dreamer import WebDreamer
-    from skill_memory import SkillMemory
-
-    # ── Display mode: prefer a REAL headed browser under a (virtual) display —
-    #    far less bot-detectable than --headless (no "HeadlessChrome" UA, real
-    #    window/compositor). Falls back to --headless if Xvfb isn't available.
-    #    Pass --headless to force true headless. ──
+def _resolve_launch_headless(headless: bool) -> bool:
+    """Prefer a headed stealth display (or Xvfb) unless headless was forced."""
     from virtual_display import start_virtual_display
+
     launch_headless = headless
     if not headless:
-        if start_virtual_display(1920, 1080):
-            launch_headless = False
-        else:
-            launch_headless = True  # no display available → headless fallback
+        launch_headless = not start_virtual_display(1920, 1080)
     logger.info("🌐 Browser mode: %s", "HEADLESS" if launch_headless else "HEADED (stealth)")
+    return launch_headless
 
-    # ── Launch Browser ──
-    _CONTEXT, _PAGE = await launch_browser(headless=launch_headless)
 
-    # ── Warmup ──
-    target_hint = extract_target_url_from_objective(objective)
-    try:
-        await run_warmup(_PAGE, target_url=target_hint)
-    except Exception as e:
-        logger.warning("Warmup failed (non-fatal): %s", e)
-
-    # ── ModelRegistry ──
-    registry = ModelRegistry.get_instance()
-    _BREAKER = registry.breaker
-    _HEALTH_TRACKER = registry.health
-
-    # V17.0: Probe once — prune dead models (404/401), seed latency estimates.
-    # Must run BEFORE ReasoningAgent() snapshots the chain.
-    try:
-        await registry.probe_and_prune()
-    except Exception as e:
-        logger.warning("Model probe failed (non-fatal): %s", e)
-
-    reasoning_agent = ReasoningAgent()
-    _FAILOVER_CHAIN = reasoning_agent.get_failover_chain()
-    chain_names = reasoning_agent.get_chain_names()
-    _INVOKE_FN = _invoke_with_failover
-
-    if not _FAILOVER_CHAIN:
-        logger.error("No LLM clients available. Check API keys in .env.")
-        return  # run_brain's finally closes the browser
-
-    logger.info("LLM Failover Chain (%d models): %s",
-                len(_FAILOVER_CHAIN), " → ".join(chain_names))
-
-    # ── V24 role separation: the worker (action decisions, the critical path)
-    #    uses only the top-tier capable models; auxiliary calls use the full chain.
-    _WORKER_CHAIN = registry.get_worker_chain()
-    logger.info("🎯 [%s mode] Worker chain (%d top models): %s",
-                registry.mode, len(_WORKER_CHAIN),
-                " → ".join(registry.get_worker_chain_names()))
-
-    # ── V29 Cognitive Overhaul — log the active feature switches (auditability) ──
+def _log_v29_flags_and_clear_journal() -> None:
+    """Log active V29 switches for run auditability and clear stale crash journals."""
     try:
         from feature_flags import active_flags, v29_enabled
+
         flags = active_flags()
         if v29_enabled():
             on = [k for k, v in flags.items() if v and k != "V29_ENABLED"]
@@ -1056,40 +999,78 @@ async def _run_brain_session(objective: str, headless: bool):
     except Exception as e:
         logger.debug("V29 flag log skipped (non-fatal): %s", e)
 
-    # Clear any durable intent ledger left behind by a previously-crashed run, so a
-    # stale write-ahead record can never contaminate this fresh task's audit trail.
-    try:
+    with contextlib.suppress(Exception):
         from intent_journal import resolve_intent
         resolve_intent()
-    except Exception:
-        pass
 
-    # ── V21 Vision chain (for on-demand consults; a11y DOM stays the default) ──
+
+async def _init_llm_pipelines() -> tuple[Any, Any, list, list, list] | None:
+    """Initialize ModelRegistry, probe dead models, and build role-separated LLM chains."""
+    from app.browser_promoter.worker_planner import ReasoningAgent
+    from model_registry import ModelRegistry
+
+    registry = ModelRegistry.get_instance()
     try:
-        _VISION_CHAIN = registry.get_vision_chain()
-        if _VISION_CHAIN:
-            logger.info("👁️ Vision chain ready for on-demand consults (%d models): %s",
-                        len(_VISION_CHAIN), " → ".join(registry.get_vision_chain_names()))
+        await registry.probe_and_prune()
+    except Exception as e:
+        logger.warning("Model probe failed (non-fatal): %s", e)
+
+    reasoning_agent = ReasoningAgent()
+    failover_chain = reasoning_agent.get_failover_chain()
+    chain_names = reasoning_agent.get_chain_names()
+    if not failover_chain:
+        logger.error("No LLM clients available. Check API keys in .env.")
+        return None
+
+    logger.info("LLM Failover Chain (%d models): %s", len(failover_chain), " → ".join(chain_names))
+    worker_chain = registry.get_worker_chain()
+    logger.info(
+        "🎯 [%s mode] Worker chain (%d top models): %s",
+        registry.mode,
+        len(worker_chain),
+        " → ".join(registry.get_worker_chain_names()),
+    )
+
+    try:
+        vision_chain = registry.get_vision_chain()
+        if vision_chain:
+            logger.info(
+                "👁️ Vision chain ready for on-demand consults (%d models): %s",
+                len(vision_chain),
+                " → ".join(registry.get_vision_chain_names()),
+            )
         else:
             logger.info("👁️ No vision models configured — agent runs a11y-DOM only")
     except Exception as e:
-        _VISION_CHAIN = []
+        vision_chain = []
         logger.warning("Vision chain unavailable (a11y-DOM only): %s", e)
 
-    # ── MCP Tools ──
-    mcp_tools.set_page(_PAGE)
+    return registry.breaker, registry.health, failover_chain, worker_chain, vision_chain
 
-    # ── CriticV12 ──
-    _CRITIC = CriticV12(_PAGE)
+
+def _init_brain_auxiliaries(
+    page: Any,
+    invoke_fn: Any,
+    failover_chain: list,
+    breaker: Any,
+    health_tracker: Any,
+) -> tuple[Any, Any, Any, Any]:
+    """Initialize CriticV12, WebDreamer, PRMCritic, OutcomeJudge, and SkillMemory."""
+    from orchestrator.critic_v12 import CriticV12
+    from prm_critic import PRMCritic
+    from skill_memory import SkillMemory
+    from web_dreamer import WebDreamer
+
+    critic = CriticV12(page)
     logger.info("🧠 CriticV12 initialized")
 
-    # ── WebDreamer ──
+    dreamer = None
     try:
-        _DREAMER = WebDreamer(
-            invoke_fn=_INVOKE_FN,
-            failover_chain=_FAILOVER_CHAIN,
-            breaker=_BREAKER,
-            health_tracker=_HEALTH_TRACKER,
+        dreamer = WebDreamer(
+            invoke_fn=invoke_fn,
+            failover_chain=failover_chain,
+            breaker=breaker,
+            health_tracker=health_tracker,
             num_candidates=3,
             num_simulations=1,
         )
@@ -1097,79 +1078,112 @@ async def _run_brain_session(objective: str, headless: bool):
     except Exception as e:
         logger.warning("WebDreamer init failed: %s", e)
 
-    # ── PRM Critic ──
+    prm_critic = None
     try:
-        _PRM_CRITIC = PRMCritic(_INVOKE_FN, _FAILOVER_CHAIN, _BREAKER, _HEALTH_TRACKER)
+        prm_critic = PRMCritic(invoke_fn, failover_chain, breaker, health_tracker)
         logger.info("📊 PRMCritic initialized")
     except Exception as e:
         logger.warning("PRMCritic init failed: %s", e)
 
-    # ── V20 Outcome Judge (evidence-grounded done-gate) ──
     try:
         from overwatch import configure_outcome_judge
-        configure_outcome_judge(_INVOKE_FN, _FAILOVER_CHAIN, _BREAKER, _HEALTH_TRACKER)
+        configure_outcome_judge(invoke_fn, failover_chain, breaker, health_tracker)
         logger.info("⚖️ Outcome judge wired into the done-gate")
     except Exception as e:
         logger.warning("Outcome judge config failed (heuristic fallback): %s", e)
 
-    # ── SkillMemory ──
+    skill_mem = None
     try:
-        _SKILL_MEM = SkillMemory()
-        stats = _SKILL_MEM.get_stats()
-        logger.info("🧠 SkillMemory: %d workflows, %d reliable",
-                    stats['total_workflows'], stats['reliable_workflows'])
+        skill_mem = SkillMemory()
+        stats = skill_mem.get_stats()
+        logger.info(
+            "🧠 SkillMemory: %d workflows, %d reliable",
+            stats["total_workflows"],
+            stats["reliable_workflows"],
+        )
     except Exception as e:
         logger.warning("SkillMemory init failed: %s", e)
 
-    # ── Build Graph (mode-aware: legacy untouched vs v2 with RetryPolicy) ──
+    return critic, dreamer, prm_critic, skill_mem
+
+
+async def _stream_brain_run(brain: Any, objective: str) -> None:
+    """Execute compiled LangGraph stream and print final completion summary."""
+    config = {"configurable": {"thread_id": f"brain_{int(time.time())}"}}
+    initial_state = BrainState(objective=objective)
+    try:
+        mission_success = False
+        async for event in brain.astream(initial_state, config):
+            for node_name, node_output in event.items():
+                if node_name != "__end__":
+                    logger.debug(
+                        "Node '%s' → %d updates",
+                        node_name,
+                        len(node_output) if isinstance(node_output, dict) else 0,
+                    )
+                if isinstance(node_output, dict) and node_output.get("mission_success"):
+                    mission_success = True
+
+        if mission_success:
+            print("\n" + "═" * 60)
+            print("  ✅  MISSION COMPLETE — Task finished successfully!")
+            print("═" * 60 + "\n")
+        else:
+            print("\n" + "═" * 60)
+            print("  ⚠️  Mission incomplete — ran out of steps or was interrupted.")
+            print("═" * 60 + "\n")
+    except Exception as e:
+        import traceback
+        logger.error("💥 Brain crash: %s", e)
+        logger.error(traceback.format_exc())
+
+
+async def _run_brain_session(objective: str, headless: bool):
+    global _PAGE, _CONTEXT, _FAILOVER_CHAIN, _WORKER_CHAIN, _VISION_CHAIN, _BREAKER, _HEALTH_TRACKER
+    global _INVOKE_FN, _CRITIC, _DREAMER, _PRM_CRITIC, _SKILL_MEM
+
+    from app.browser_promoter.browser_warmup import extract_target_url_from_objective, run_warmup
+    from core.session_bootstrap import invoke_with_failover_compat, launch_browser
     from v2_engine import get_engine_mode as _active_mode
     from v2_engine.graph_policy import detect_stealth_driver
-    _mode_now = _active_mode()
-    _drv = detect_stealth_driver()
-    logger.info("⚙️ Engine mode: %s | driver=%s (cdp_leak_patched=%s)",
-                _mode_now.upper(), _drv["driver"], _drv["cdp_runtime_leak_patched"])
-    graph_builder = build_brain_graph(mode=_mode_now)
 
-    # ── Compile with Checkpointer ──
-    # In-memory only. Each run uses a fresh thread_id and nothing ever resumes or
-    # reads a past checkpoint, so an on-disk store (the former SQLite
-    # persistence/brain_checkpoints.db) only accumulated every state snapshot —
-    # objective, page content, and typed text incl. passwords — with no reader.
+    launch_headless = _resolve_launch_headless(headless)
+    _CONTEXT, _PAGE = await launch_browser(headless=launch_headless)
+
+    target_hint = extract_target_url_from_objective(objective)
+    try:
+        await run_warmup(_PAGE, target_url=target_hint)
+    except Exception as e:
+        logger.warning("Warmup failed (non-fatal): %s", e)
+
+    llm_setup = await _init_llm_pipelines()
+    if llm_setup is None:
+        return  # run_brain's finally closes the browser
+
+    _BREAKER, _HEALTH_TRACKER, _FAILOVER_CHAIN, _WORKER_CHAIN, _VISION_CHAIN = llm_setup
+    _INVOKE_FN = invoke_with_failover_compat
+    _log_v29_flags_and_clear_journal()
+
+    mcp_tools.set_page(_PAGE)
+    _CRITIC, _DREAMER, _PRM_CRITIC, _SKILL_MEM = _init_brain_auxiliaries(
+        _PAGE, _INVOKE_FN, _FAILOVER_CHAIN, _BREAKER, _HEALTH_TRACKER
+    )
+
+    mode_now = _active_mode()
+    drv = detect_stealth_driver()
+    logger.info(
+        "⚙️ Engine mode: %s | driver=%s (cdp_leak_patched=%s)",
+        mode_now.upper(),
+        drv["driver"],
+        drv["cdp_runtime_leak_patched"],
+    )
+    graph_builder = build_brain_graph(mode=mode_now)
+
     async with contextlib.nullcontext(InMemorySaver()) as checkpointer:
         brain = graph_builder.compile(checkpointer=checkpointer)
-
-        logger.info("🧠 Brain Graph compiled with %d nodes, checkpointer=%s",
-                    len(graph_builder.nodes), type(checkpointer).__name__)
-
-        # ── Execute ──
-        config = {"configurable": {"thread_id": f"brain_{int(time.time())}"}}
-        initial_state = BrainState(objective=objective)
-
-        try:
-            # Latch mission_success across the stream: each event is ONE node's
-            # partial output (finalize returns {}), so reading only the last
-            # event misses the success flag set earlier by overwatch/commit.
-            mission_success = False
-            async for event in brain.astream(initial_state, config):
-                # Log each node execution
-                for node_name, node_output in event.items():
-                    if node_name != "__end__":
-                        logger.debug("Node '%s' → %d updates",
-                                    node_name, len(node_output) if isinstance(node_output, dict) else 0)
-                    if isinstance(node_output, dict) and node_output.get("mission_success"):
-                        mission_success = True
-
-            if mission_success:
-                print("\n" + "═" * 60)
-                print("  ✅  MISSION COMPLETE — Task finished successfully!")
-                print("═" * 60 + "\n")
-            else:
-                print("\n" + "═" * 60)
-                print("  ⚠️  Mission incomplete — ran out of steps or was interrupted.")
-                print("═" * 60 + "\n")
-
-        except Exception as e:
-            import traceback
-            logger.error("💥 Brain crash: %s", e)
-            logger.error(traceback.format_exc())
-        # Browser + driver shutdown happens in run_brain's finally.
+        logger.info(
+            "🧠 Brain Graph compiled with %d nodes, checkpointer=%s",
+            len(graph_builder.nodes),
+            type(checkpointer).__name__,
+        )
+        await _stream_brain_run(brain, objective)

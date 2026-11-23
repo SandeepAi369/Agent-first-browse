@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import json
 import logging
 import signal
@@ -338,10 +339,10 @@ class EvalMCPServer:
             return rep
 
         if name == "eval_stop":
-            session = args.get("session")
-            if args.get("all") or not session:
+            stop_session = args.get("session")
+            if args.get("all") or not stop_session:
                 return await self.manager.close_all()
-            return await self.manager.close_session(str(session))
+            return await self.manager.close_session(str(stop_session))
 
         raise KeyError(f"Unknown tool '{name}'")
 
@@ -423,10 +424,8 @@ class EvalMCPServer:
         stop_event = asyncio.Event()
 
         for sig in (signal.SIGINT, signal.SIGTERM):
-            try:
+            with contextlib.suppress(NotImplementedError, RuntimeError):
                 loop.add_signal_handler(sig, stop_event.set)
-            except (NotImplementedError, RuntimeError):
-                pass
 
         logger.info("MCP stdio server '%s' ready (%d tools)", SERVER_NAME, len(TOOL_DEFINITIONS))
 

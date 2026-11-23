@@ -20,8 +20,8 @@ from __future__ import annotations
 import ipaddress
 import re
 from dataclasses import dataclass
-from enum import Enum
-from urllib.parse import urlsplit, urlunsplit
+from enum import StrEnum
+from urllib.parse import SplitResult, urlsplit, urlunsplit
 
 from core.errors import ConfigValidationError, SafetyPolicyError
 
@@ -50,7 +50,7 @@ _LOCAL_SUFFIXES: tuple[str, ...] = (
 _CONTROL_OR_WHITESPACE_RE = re.compile(r"[\x00-\x20\x7f]")
 
 
-class UrlPolicyViolation(str, Enum):
+class UrlPolicyViolation(StrEnum):
     """Machine-readable reason why `validate_url()` rejected a URL."""
 
     INVALID_URL = "invalid_url"
@@ -244,7 +244,7 @@ def _matches_any_pattern(host: str, patterns: tuple[str, ...]) -> bool:
     return any(_matches_host_pattern(host, pat) for pat in patterns)
 
 
-def _validate_authority(parsed) -> str | UrlValidation:
+def _validate_authority(parsed: SplitResult) -> str | UrlValidation:
     if not parsed.netloc or "\\" in parsed.netloc:
         return _reject(UrlPolicyViolation.INVALID_URL, "URL is missing a valid host.")
     if parsed.username is not None or parsed.password is not None or "@" in parsed.netloc:
@@ -267,7 +267,7 @@ def _validate_authority(parsed) -> str | UrlValidation:
     return canonical_host
 
 
-def _validate_structure(raw_url: str, active_policy: UrlPolicy) -> tuple[object, str] | UrlValidation:
+def _validate_structure(raw_url: str, active_policy: UrlPolicy) -> tuple[SplitResult, str] | UrlValidation:
     if len(raw_url) > active_policy.max_url_length:
         return _reject(
             UrlPolicyViolation.TOO_LONG,

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -71,10 +72,8 @@ class EvalDaemonServer:
 
     def _prepare_socket_path(self) -> None:
         self.sock_path.parent.mkdir(parents=True, exist_ok=True)
-        try:
+        with contextlib.suppress(OSError):
             os.chmod(self.sock_path.parent, 0o700)
-        except OSError:
-            pass
 
         if self.sock_path.exists():
             # Probe whether an active daemon is already listening on this socket
@@ -85,10 +84,8 @@ class EvalDaemonServer:
                 raise RuntimeError(f"Eval daemon already running at {self.sock_path}")
             except (ConnectionRefusedError, FileNotFoundError, OSError):
                 # Stale socket left over from an unclean exit — safe to remove
-                try:
+                with contextlib.suppress(FileNotFoundError):
                     self.sock_path.unlink()
-                except FileNotFoundError:
-                    pass
             finally:
                 probe.close()
 
@@ -245,20 +242,16 @@ class EvalDaemonServer:
             path=str(self.sock_path),
             limit=_STREAM_LIMIT,
         )
-        try:
+        with contextlib.suppress(OSError):
             os.chmod(self.sock_path, 0o600)
-        except OSError:
-            pass
         self.pid_path.write_text(str(os.getpid()), encoding="utf-8")
         logger.info("Eval daemon listening on %s (pid=%d, idle=%.0fs)",
                     self.sock_path, os.getpid(), self.idle_timeout)
 
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):
-            try:
+            with contextlib.suppress(NotImplementedError, RuntimeError):
                 loop.add_signal_handler(sig, self._stop_event.set)
-            except (NotImplementedError, RuntimeError):
-                pass
 
         watchdog = asyncio.create_task(self._idle_watchdog())
         try:
@@ -319,7 +312,10 @@ def send_daemon_request(
         raw = b"".join(chunks).decode("utf-8").strip()
         if not raw:
             return {"ok": False, "error": "Empty response from eval daemon"}
-        return json.loads(raw)
+        parsed = json.loads(raw)
+        if not isinstance(parsed, dict):
+            return {"ok": False, "error": "Invalid non-object response from eval daemon"}
+        return parsed
     finally:
         sock.close()
 
@@ -381,10 +377,8 @@ def ensure_daemon_running(
             return alive
         if proc.poll() is not None:
             tail = ""
-            try:
+            with contextlib.suppress(OSError):
                 tail = log_file.read_text(encoding="utf-8", errors="replace")[-400:]
-            except OSError:
-                pass
             raise RuntimeError(f"Eval daemon exited early (rc={proc.returncode}): {tail}")
         time.sleep(0.1)
 

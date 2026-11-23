@@ -260,209 +260,17 @@ async def _ask_recovery_advisor(
 # (v14.0: Campaign logger removed — task history recorded at end of run only)
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  Persistence Paths (all inside WSL)
+#  Persistence Paths, SessionGuard & Browser Launch (delegated to core.session_bootstrap)
 # ═══════════════════════════════════════════════════════════════════════════════
-from paths import PERSISTENCE_DIR as PERSISTENCE_ROOT
-PROFILE_DIR = PERSISTENCE_ROOT / "browser_sessions" / "agent_main"
-
-
-def _ensure_dirs():
-    PERSISTENCE_ROOT.mkdir(parents=True, exist_ok=True)
-    PROFILE_DIR.mkdir(parents=True, exist_ok=True)
-
-
-def _mark_profile_clean_exit() -> None:
-    """Tell Chrome the previous session ended cleanly so it never shows the
-    "Restore pages / Chrome didn't shut down correctly" crash bubble.
-
-    We hard-terminate sessions (pkill / Ctrl-C), so Chrome thinks it crashed and
-    renders that bubble top-right — directly overlapping page controls such as
-    GitHub's Star button, which blinds the agent into clicking the wrong spot.
-    Patched before EVERY launch (Chrome is not running yet, so the write sticks);
-    combined with --hide-crash-restore-bubble for belt-and-suspenders.
-    """
-    prefs_path = PROFILE_DIR / "Default" / "Preferences"
-    try:
-        if prefs_path.exists():
-            data = json.loads(prefs_path.read_text(encoding="utf-8"))
-        else:
-            prefs_path.parent.mkdir(parents=True, exist_ok=True)
-            data = {}
-        profile = data.setdefault("profile", {})
-        profile["exit_type"] = "Normal"
-        profile["exited_cleanly"] = True
-        prefs_path.write_text(json.dumps(data), encoding="utf-8")
-        logger.info("Profile marked clean-exit (crash-restore bubble suppressed)")
-    except Exception as e:
-        logger.warning("Could not mark profile clean-exit (non-fatal): %s", e)
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  Browser Lifecycle Guard
-# ═══════════════════════════════════════════════════════════════════════════════
-class SessionGuard:
-    """Lightweight lifecycle guard for the browser context.
-
-    With native user_data_dir persistence, Chromium handles all cookie/storage
-    persistence internally. This guard only ensures the browser context is
-    closed cleanly on exit (which flushes pending state to disk).
-
-    Shutdown path: a runner calls bind_task() from inside its main task. The
-    first Ctrl+C / SIGTERM then CANCELS that task, so it unwinds through its own
-    `finally`, which awaits shutdown() — closing the context AND stopping the
-    Playwright driver. A second signal force-quits. Without a bound task (legacy
-    loop) a signal raises KeyboardInterrupt, which that loop already handles.
-    """
-
-    _instance: "SessionGuard | None" = None
-
-    def __init__(self):
-        self._context: BrowserContext | None = None
-        self._playwright = None                       # driver handle, stopped by shutdown()
-        self._task: asyncio.Task | None = None        # task cancelled on SIGINT/SIGTERM
-        self._loop: asyncio.AbstractEventLoop | None = None
-        self._interrupted = False
-        self._installed = False
-
-    @classmethod
-    def get(cls) -> "SessionGuard":
-        if cls._instance is None:
-            cls._instance = cls()
-        return cls._instance
-
-    def attach(self, context: BrowserContext, playwright=None):
-        """Attach a live browser context (and the Playwright driver that owns it)."""
-        self._context = context
-        if playwright is not None:
-            self._playwright = playwright
-        self._ensure_handlers()
-        logger.info("SessionGuard: attached to browser context")
-
-    def bind_task(self) -> None:
-        """Route SIGINT/SIGTERM to cancelling the CALLING task. Call from inside it."""
-        self._task = asyncio.current_task()
-        self._loop = asyncio.get_running_loop()
-        self._interrupted = False
-        self._ensure_handlers()
-
-    def _ensure_handlers(self):
-        if not self._installed:
-            self._install_handlers()
-            self._installed = True
-
-    def _install_handlers(self):
-        """Install signal + atexit handlers (once)."""
-        for sig in (signal.SIGINT, signal.SIGTERM):
-            try:
-                signal.signal(sig, self._signal_handler)
-            except (OSError, ValueError):
-                pass
-        atexit.register(self._atexit_handler)
-        logger.info("SessionGuard: signal + atexit handlers installed")
-
-    def _signal_handler(self, signum, frame):
-        """Ctrl+C / kill: cancel the bound task for a clean async shutdown.
-
-        Exiting from here (the old sys.exit) skipped context.close() and left the
-        Playwright driver running; cancelling lets the task's `finally` await both.
-        """
-        sig_name = signal.Signals(signum).name
-        task, loop = self._task, self._loop
-        if task is not None and not task.done() and not self._interrupted:
-            self._interrupted = True
-            logger.warning("SessionGuard: caught %s — shutting down the browser cleanly "
-                           "(repeat to force quit)...", sig_name)
-            task.cancel()
-            loop.call_soon_threadsafe(lambda: None)  # wake the selector so the cancel lands now
-            return
-        logger.warning("SessionGuard: caught %s — exiting", sig_name)
-        raise KeyboardInterrupt
-
-    async def shutdown(self) -> None:
-        """Close the browser context, then stop the Playwright driver. Idempotent."""
-        context, pw = self._context, self._playwright
-        self._context = None
-        self._playwright = None
-        self._task = None
-        self._loop = None
-        if context is not None:
-            try:
-                await context.close()  # flushes all native state to user_data_dir
-                logger.info("Browser closed. Profile state persisted.")
-            except Exception as e:
-                logger.warning("Browser close failed: %s", e)
-        if pw is not None:
-            try:
-                await pw.stop()
-                logger.info("Playwright driver stopped.")
-            except Exception as e:
-                logger.warning("Playwright driver stop failed: %s", e)
-
-    def _atexit_handler(self):
-        """Called on normal interpreter shutdown."""
-        if self._context is not None:
-            logger.info("SessionGuard: atexit — detaching context")
-            self.detach()
-
-    def detach(self):
-        """Detach the context reference (called after context.close())."""
-        self._context = None
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  Browser Launch — Pure Native Persistence (v8.0)
-# ═══════════════════════════════════════════════════════════════════════════════
-async def launch_browser(*, headless: bool = False) -> tuple[BrowserContext, Page]:
-    """Launch Playwright with a persistent user_data_dir profile.
-
-    All cookies, localStorage, IndexedDB, and Cache are managed natively
-    by the Chromium engine on disk. No synthetic injection needed.
-    """
-    _ensure_dirs()
-    _mark_profile_clean_exit()  # suppress the crash-restore bubble (overlaps Star button)
-    pw = await async_playwright().start()
-
-    logger.info("Launching Playwright Chromium (native profile: %s)", PROFILE_DIR)
-
-    # Randomize viewport per session to prevent fingerprint linkage
-    session_viewport = get_random_viewport()
-    logger.info("Session viewport: %dx%d", session_viewport["width"], session_viewport["height"])
-
-    context = await pw.chromium.launch_persistent_context(
-        user_data_dir=str(PROFILE_DIR),
-        headless=headless,
-        viewport=session_viewport,
-        locale="en-US",
-        timezone_id="America/New_York",
-        user_agent=STEALTH_USER_AGENT,
-        java_script_enabled=True,
-        device_scale_factor=1,
-        extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
-        args=STEALTH_LAUNCH_ARGS + dom_parser.TLS_STEALTH_ARGS,
-        ignore_default_args=["--enable-automation"],
-    )
-    await context.add_init_script(STEALTH_INIT_SCRIPT)
-    await context.add_init_script(VISUAL_CURSOR_INIT_SCRIPT)
-    await dom_parser.install_shadow_piercer(context)
-
-    # ── Attach lifecycle guard ──
-    guard = SessionGuard.get()
-    guard.attach(context, playwright=pw)  # hand over the driver so shutdown() can stop it
-
-    # Get or create page
-    if context.pages:
-        page = context.pages[0]
-    else:
-        page = await context.new_page()
-
-    await apply_page_stealth(page)
-
-    try:
-        await page.bring_to_front()
-    except Exception:
-        pass
-
-    return context, page
+from core.session_bootstrap import (  # noqa: E402
+    PERSISTENCE_ROOT,
+    PROFILE_DIR,
+    SessionGuard,
+    ensure_profile_dirs as _ensure_dirs,
+    invoke_with_failover_compat as _invoke_with_failover,
+    launch_browser,
+    mark_profile_clean_exit as _mark_profile_clean_exit,
+)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -568,36 +376,8 @@ class AutonomousAction(BaseModel):
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  Main Agent Loop — Enhanced Failover (v9.0)
+#  (_invoke_with_failover re-exported above from core.session_bootstrap)
 # ═══════════════════════════════════════════════════════════════════════════════
-async def _invoke_with_failover(
-    failover_chain: list,
-    messages: list,
-    schema,
-    circuit_breaker=None,
-    base64_image: str | None = None,
-    health_tracker=None,
-) -> tuple:
-    """V17.0 — Model-first failover (delegates to model_registry).
-
-    The chain is re-ordered by (model quality tier, expected cost) so ALL
-    instances of the best model — every API key, every provider hosting it —
-    are exhausted before any weaker model is tried. A 429 on one key jumps
-    to the SAME model on the next key (per-instance cooldown, no
-    provider-wide skip). Adaptive per-model timeouts replace the fixed 30s,
-    and schema-400 errors are rescued via JSON mode on the same model.
-
-    Signature preserved for all callers (prm_critic, web_dreamer, workers,
-    brain_graph, content_critic, github_engagement).
-    """
-    from model_registry import invoke_with_failover
-    return await invoke_with_failover(
-        failover_chain,
-        messages,
-        schema,
-        breaker=circuit_breaker,
-        health_tracker=health_tracker,
-        base64_image=base64_image,
-    )
 
 
 async def run_agent(objective: str):

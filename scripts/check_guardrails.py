@@ -25,9 +25,10 @@ import re
 import subprocess
 import sys
 import tomllib
+from collections.abc import Iterable
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Iterable, Literal
+from typing import Literal
 
 Severity = Literal["error", "warning"]
 
@@ -395,9 +396,12 @@ def _find_all_node(tree: ast.Module) -> ast.AST | None:
             for target in node.targets:
                 if isinstance(target, ast.Name) and target.id == "__all__":
                     all_node = node.value
-        elif isinstance(node, ast.AnnAssign):
-            if isinstance(node.target, ast.Name) and node.target.id == "__all__":
-                all_node = node.value
+        elif (
+            isinstance(node, ast.AnnAssign)
+            and isinstance(node.target, ast.Name)
+            and node.target.id == "__all__"
+        ):
+            all_node = node.value
     return all_node
 
 
