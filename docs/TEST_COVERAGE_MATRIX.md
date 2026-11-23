@@ -26,7 +26,7 @@ Legend: ✅ Covered & passing in default suite | ⚠️ Partial / indirect cover
 | Subsystem / Feature | Pure Unit | Local Chromium (Playwright) | Protocol / IPC (CLI & MCP) | Full Graph E2E (Offline) | Live External | Primary Test Files |
 |---|---|---|---|---|---|---|
 | **Accessibility-Tree Parser & V34 Secret Redaction** (`src/a11y_parser.py`) | ✅ | ✅ | — | — | — | `tests/test_a11y_parser.py` (13), `tests/test_security_v34.py` (37) |
-| **V2 Browser Engine** (`src/v2_engine/`: settle, occlusion, Tier-2 A11y, delta, `v2_click`/`v2_type`, `RetryPolicy`) | ✅ | ✅ | ✅ | ⏳ (Chunk 8) | Manual | `tests/test_v2_engine.py` (9), `tests/test_eval_connector_core.py` (5) |
+| **V2 Browser Engine** (`src/v2_engine/`: settle, occlusion, Tier-2 A11y, delta, `v2_click`/`v2_type`, `RetryPolicy`) | ✅ | ✅ | ✅ | ✅ (`ScriptedFakeLLM`) | Manual | `tests/test_v2_engine.py` (9), `tests/test_eval_connector_core.py` (5), `tests/test_brain_graph_integration.py` (5) |
 | **Zero-API Eval Connector** (`src/eval_connector/`: session manager, `0600` Unix daemon, CLI, JSON-RPC 2.0 MCP stdio) | ✅ | ✅ | ✅ | — | Manual | `tests/test_eval_connector_core.py` (5), `tests/test_eval_connector_cli.py` (3), `tests/test_eval_connector_mcp.py` (2) |
 | **Perception Engine & Viewport Recall** (`src/perception_engine.py`, `src/dom_parser.py`) | ✅ | ✅ | — | — | — | `tests/test_perception_engine_v29.py` (15), `tests/test_perception_v19.py` (10) |
 | **Execution Safety & Upload Guards** (`src/execution_safety.py`) | ✅ | ✅ | — | — | — | `tests/test_security_v34.py` (37) |
@@ -36,27 +36,27 @@ Legend: ✅ Covered & passing in default suite | ⚠️ Partial / indirect cover
 | **Cognition Core, Ladder & Guidance Bus** (`src/cognition.py`, `src/consensus.py`, `src/action_classifier.py`) | ✅ | — | — | — | — | `tests/test_cognition_v18.py` (22), `tests/test_consensus_v27.py` (16), `tests/test_guidance_v27.py` (9) |
 | **Verification, Outcome Judge & Vision Consult** (`src/verification_engine.py`, `src/outcome_judge.py`, `src/vision_consult.py`) | ✅ | — | — | — | — | `tests/test_verification_v20.py` (13), `tests/test_vision_v21.py` (14), `tests/test_handoff_v26.py` (9) |
 | **V29 Cognitive Overhaul** (Reality Monitor, Intent Journal, Sub-Goal Lock, Stagnation, Phase A & B, Self-Healing) | ✅ | — | — | — | — | `tests/test_reality_v29.py` (18), `tests/test_intent_journal_v29.py` (17), `tests/test_subgoal_lock_v29.py` (7), `tests/test_phase_a_v29.py` (18), `tests/test_phase_b_v29.py` (16), `tests/test_phase23_v29.py` (19), `tests/test_selfhealing.py` (6) |
-| **LangGraph Brain Spine** (`src/brain_graph.py`, `src/brain_state.py`) | ⚠️ (import smoke only) | ❌ | — | ⏳ (Chunk 8 `FakeLLM`) | ✅ (`tests/live/`) | `tests/test_brain_v16.py` (0 pytest fns — debt), planned `tests/test_brain_graph_integration.py` |
+| **LangGraph Brain Spine** (`src/brain_graph.py`, `src/brain_state.py`) | ✅ | ✅ | — | ✅ (`ScriptedFakeLLM`, v2 + legacy) | ✅ (`tests/live/`) | `tests/test_brain_v16.py` (4), `tests/test_brain_graph_integration.py` (5) |
+| **Core Shared Primitives** (`src/core/`: errors, retries, url_policy, truncate, redaction, disposable, runtime_context, browser_provider, observability, settings) | ✅ | ✅ (`LocalPlaywrightProvider`) | — | — | — | `tests/test_core_*.py` (141) |
 | **Legacy Browser Promoter** (`src/app/browser_promoter/`) | ✅ | — | — | — | ✅ (`tests/live/test_auth_graph.py`) | `tests/browser_promoter/test_state.py` (21), `test_database.py` (8), `test_graph.py` (5) |
 | **Architectural Guardrails** (`scripts/check_guardrails.py`) | ✅ | — | ✅ (CLI `--json` + exit codes) | — | — | `tests/test_guardrails.py` |
 
 ---
 
-## 3. Tracked Test-Hygiene Debt (Quarantined Legacy Files)
+## 3. Tracked Test-Hygiene Debt (Cleared in Chunk 8)
 
-The 4 files below live under `tests/` with **0 collected `test_*` functions**. They are explicitly allowlisted as **tracked debt** in `scripts/check_guardrails.py` (`KNOWN_LEGACY_SCRIPT_TESTS`) so they stay visible as warnings in normal runs, fail under `--strict-test-hygiene`, and cannot silently mask any *new* empty/script-style test file.
+All 4 legacy zero-test script files were converted into proper pytest test suites in **Chunk 8**, reducing `KNOWN_LEGACY_SCRIPT_TESTS` in `scripts/check_guardrails.py` to empty (`0` warnings under `--strict-test-hygiene`):
 
-| File | Current Behavior | Why It Is Tracked Debt | Planned Resolution |
-|---|---|---|---|
-| `tests/test_brain_v16.py` | Runs top-level import/print checks at module import time during pytest collection (also emits Pydantic `model_fields` deprecation warning) | Zero `def test_*()` functions; executes side effects on import | Convert to proper `def test_*()` functions (Chunk 8) |
-| `tests/test_v151_blacklist.py` | Runs bare top-level `assert` statements at import time | Zero `def test_*()` functions; not individually reported/isolated by pytest | Convert to proper `def test_*()` functions (Chunk 8) |
-| `tests/test_form_fill.py` | Legacy `browser_promoter` standalone async script | Zero `def test_*()` functions; collected as 0 tests | Quarantine or convert/archive (Chunk 8) |
-| `tests/test_read_only.py` | Live Reddit browsing script (`if __name__ == "__main__"`) sitting outside `tests/live/` | Zero `def test_*()` functions; misfiled outside `tests/live/` | Move into `tests/live/test_read_only.py` (Chunk 8) |
+| File | Resolution Completed (Chunk 8) |
+|---|---|
+| `tests/test_brain_v16.py` | Converted into 4 proper `def test_*()` smoke tests (fixed `BrainState.model_fields` Pydantic V2.11 warning) |
+| `tests/test_v151_blacklist.py` | Converted all 5 Patch A+C assertions into 5 isolated `def test_*()` unit tests |
+| `tests/test_form_fill.py` | Converted into 2 offline `def test_*()` tests verifying state serialization & `StateGraph` compilation (manual live runner preserved under `__main__`) |
+| `tests/test_read_only.py` | Converted into 2 offline `def test_*()` tests verifying read-only constraints & domain policy (manual live runner preserved under `__main__`) |
 
 ---
 
 ## 4. Tracked Static & CI Gaps
 
-1. **Offline Full-Graph E2E Testing:** `src/brain_graph.py` currently has no deterministic zero-API multi-step graph integration test (`plan → perceive → route → worker → overwatch → retry/rollback → commit → finalize`). Planned in **Chunk 8** using a content-addressed `ScriptedFakeLLM`.
-2. **CI Static Analysis Alignment:** `pyproject.toml` declares `ruff` and `mypy`, while `.github/workflows/python-package.yml` currently only runs `flake8` (hard-failing on syntax/undefined names, `--exit-zero` on complexity) and `pytest`. Integrating `scripts/check_guardrails.py`, `ruff`, and progressive `mypy` into CI is planned in **Chunk 9**.
-3. **Pydantic V2 Deprecation Warnings:** `src/orchestrator/{actions,event_log,state}.py` still use legacy class-based `class Config:` (4 pytest collection warnings).
+1. **CI Static Analysis Alignment:** `pyproject.toml` declares `ruff` and `mypy`, while `.github/workflows/python-package.yml` currently only runs `flake8` (hard-failing on syntax/undefined names, `--exit-zero` on complexity) and `pytest`. Integrating `scripts/check_guardrails.py --strict-test-hygiene`, `ruff`, and progressive `mypy` into CI is planned in **Chunk 9**.
+2. **Pydantic V2 Deprecation Warnings:** `src/orchestrator/{actions,event_log,state}.py` still use legacy class-based `class Config:` (3 pytest collection warnings).

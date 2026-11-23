@@ -128,12 +128,12 @@ def test_live_repo_all_guardrails_pass():
     assert by_name["secrets"].passed is True
     assert by_name["secrets"].checked_count >= 50
     assert by_name["test_hygiene"].passed is True
-    # Tracked legacy debt must surface as explicit warnings, never silently disappear
+    # After Chunk 8 cleanup, live repo has zero legacy script-test warnings
     warn_paths = {f.path for f in by_name["test_hygiene"].findings if f.severity == "warning"}
     assert warn_paths == set(guardrails.KNOWN_LEGACY_SCRIPT_TESTS)
 
 
-def test_live_repo_cli_json_passes_and_strict_debt_fails():
+def test_live_repo_cli_json_passes_under_normal_and_strict_test_hygiene():
     ok_proc = subprocess.run(
         [sys.executable, str(SCRIPT_PATH), "--base-ref", "main", "--json"],
         cwd=str(REPO_ROOT),
@@ -145,19 +145,20 @@ def test_live_repo_cli_json_passes_and_strict_debt_fails():
     payload = json.loads(ok_proc.stdout)
     assert payload["passed"] is True
     assert payload["error_count"] == 0
-    assert payload["warning_count"] == len(guardrails.KNOWN_LEGACY_SCRIPT_TESTS)
+    assert payload["warning_count"] == 0
 
     strict_proc = subprocess.run(
-        [sys.executable, str(SCRIPT_PATH), "--strict-test-hygiene", "--json"],
+        [sys.executable, str(SCRIPT_PATH), "--base-ref", "main", "--strict-test-hygiene", "--json"],
         cwd=str(REPO_ROOT),
         capture_output=True,
         text=True,
         check=False,
     )
-    assert strict_proc.returncode == 1
+    assert strict_proc.returncode == 0, strict_proc.stderr
     strict_payload = json.loads(strict_proc.stdout)
-    assert strict_payload["passed"] is False
-    assert strict_payload["error_count"] == len(guardrails.KNOWN_LEGACY_SCRIPT_TESTS)
+    assert strict_payload["passed"] is True
+    assert strict_payload["error_count"] == 0
+    assert strict_payload["warning_count"] == 0
 
 
 # ── 2. Frozen §6 File Detection (Real Git Diffs) ───────────────────────────────
@@ -364,6 +365,18 @@ def test_hygiene_warns_on_stale_debt_allowlist_entry(tmp_path):
         f.severity == "warning" and "Stale entry" in f.message and f.path == "tests/test_sample.py"
         for f in res.findings
     )
+
+    # Strict mode turns tracked debt warnings into hard errors
+    (repo / "tests" / "test_tracked_empty.py").write_text("# legacy script\n", encoding="utf-8")
+    res_warn = guardrails.check_test_hygiene(
+        repo, strict=False, known_legacy_debt=("tests/test_tracked_empty.py",)
+    )
+    assert res_warn.passed is True
+    res_strict = guardrails.check_test_hygiene(
+        repo, strict=True, known_legacy_debt=("tests/test_tracked_empty.py",)
+    )
+    assert res_strict.passed is False
+    assert any(f.severity == "error" and f.path == "tests/test_tracked_empty.py" for f in res_strict.findings)
 
 
 # ── 7. End-to-End CLI Failure Exit Code Test ───────────────────────────────────

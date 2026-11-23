@@ -58,15 +58,8 @@ PUBLIC_EXPORT_PACKAGES: tuple[str, ...] = (
 # Future core package automatically verified once src/core/__init__.py exists
 OPTIONAL_EXPORT_PACKAGES: tuple[str, ...] = ("core",)
 
-# Audited pre-existing zero-test legacy script files (scheduled for cleanup in Chunk 8)
-KNOWN_LEGACY_SCRIPT_TESTS: frozenset[str] = frozenset(
-    {
-        "tests/test_brain_v16.py",
-        "tests/test_v151_blacklist.py",
-        "tests/test_form_fill.py",
-        "tests/test_read_only.py",
-    }
-)
+# Legacy zero-test script debt allowlist (cleared in Chunk 8; must stay empty)
+KNOWN_LEGACY_SCRIPT_TESTS: frozenset[str] = frozenset()
 
 # Forbidden site/brand/domain tokens in UNIVERSAL-ONLY perception files
 _FORBIDDEN_BRAND_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
