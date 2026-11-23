@@ -47,6 +47,12 @@ def main():
         action="store_true",
         help="Run browser in headless mode.",
     )
+    run_parser.add_argument(
+        "--mode",
+        choices=["legacy", "v2"],
+        default=None,
+        help="Browser engine mode: 'legacy' (frozen baseline) or 'v2' (2026 upgraded engine).",
+    )
 
     args = parser.parse_args()
 
@@ -55,10 +61,16 @@ def main():
         asyncio.run(manual_login_mode())
     elif args.command == "run":
         from brain_graph import run_brain
-        logger.info("🧠 True Brain v16.0 — LangGraph Architecture")
+        from v2_engine import get_engine_mode, set_engine_mode
+        selected_mode = set_engine_mode(args.mode) if args.mode else get_engine_mode()
+        logger.info("🧠 True Brain — LangGraph Architecture [mode=%s]", selected_mode)
         logger.info("Objective: %s", args.objective[:200])
         try:
-            asyncio.run(run_brain(args.objective, headless=getattr(args, "headless", False)))
+            asyncio.run(run_brain(
+                args.objective,
+                headless=getattr(args, "headless", False),
+                mode=selected_mode,
+            ))
         except (KeyboardInterrupt, asyncio.CancelledError):
             # run_brain already closed the browser and stopped the driver.
             logger.warning("Interrupted by user — exiting.")
