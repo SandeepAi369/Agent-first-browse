@@ -6,12 +6,13 @@
 *Accessibility-tree-first perception · LangGraph verification · Native zero-API MCP & CLI*
 
 <p>
+  <a href="https://pypi.org/project/agent-first-browse/"><img src="https://img.shields.io/pypi/v/agent-first-browse?style=flat-square&color=3776AB&label=PyPI" alt="PyPI"></a>
   <a href="https://python.org"><img src="https://img.shields.io/badge/Python-3.11%2B-3776AB?style=flat-square&logo=python&logoColor=white" alt="Python 3.11+"></a>
   <a href="https://langchain-ai.github.io/langgraph/"><img src="https://img.shields.io/badge/LangGraph-1.x-FF6B35?style=flat-square" alt="LangGraph 1.x"></a>
   <a href="https://playwright.dev/python/"><img src="https://img.shields.io/badge/Playwright-1.55%2B-2EAD33?style=flat-square&logo=playwright&logoColor=white" alt="Playwright 1.55+"></a>
-  <a href="docs/EVAL_CONNECTOR.md"><img src="https://img.shields.io/badge/MCP-stdio%20%2B%20CLI-7C3AED?style=flat-square" alt="MCP Ready"></a>
-  <a href="docs/TEST_COVERAGE_MATRIX.md"><img src="https://img.shields.io/badge/Tests-528%20passing-10B981?style=flat-square" alt="528 Passing Tests"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache--2.0-0EA5E9?style=flat-square" alt="Apache-2.0 License"></a>
+  <a href="https://github.com/SandeepAi369/Agent-first-browse/blob/main/docs/EVAL_CONNECTOR.md"><img src="https://img.shields.io/badge/MCP-stdio%20%2B%20CLI-7C3AED?style=flat-square" alt="MCP Ready"></a>
+  <a href="https://github.com/SandeepAi369/Agent-first-browse/blob/main/docs/TEST_COVERAGE_MATRIX.md"><img src="https://img.shields.io/badge/Tests-528%20passing-10B981?style=flat-square" alt="528 Passing Tests"></a>
+  <a href="https://github.com/SandeepAi369/Agent-first-browse/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-Apache--2.0-0EA5E9?style=flat-square" alt="Apache-2.0 License"></a>
 </p>
 
 <p>
@@ -31,13 +32,13 @@
 
 <div align="center">
 
-[![Agent First Browse — Live Autonomous Checkout Demo](docs/assets/demo.gif)](docs/assets/raw/agent_first_browse_demo_1280x720.webm)
+[![Agent First Browse — Live Autonomous Checkout Demo](https://raw.githubusercontent.com/SandeepAi369/Agent-first-browse/main/docs/assets/demo.gif)](https://github.com/SandeepAi369/Agent-first-browse/blob/main/docs/assets/raw/agent_first_browse_demo_1280x720.webm)
 
 <sub>
   <strong>Prompt:</strong> <em>"Sort products Low → High, add the 2 cheapest items to cart, and complete checkout"</em><br>
   Live <code>perceive_v2</code> perception (<strong>136.9 ms/step</strong> avg · <strong>~119 tokens/step</strong>) · Smooth Bézier cursor · Character-by-character input<br>
-  <a href="docs/assets/raw/agent_first_browse_demo_1280x720.webm">Watch full 1280×720 HD recording (WebM)</a> ·
-  <a href="scripts/record_visual_demo.py">Demo script</a>
+  <a href="https://github.com/SandeepAi369/Agent-first-browse/blob/main/docs/assets/raw/agent_first_browse_demo_1280x720.webm">Watch full 1280×720 HD recording (WebM)</a> ·
+  <a href="https://github.com/SandeepAi369/Agent-first-browse/blob/main/scripts/record_visual_demo.py">Demo script</a>
 </sub>
 
 </div>
@@ -140,6 +141,10 @@ Measured on live **headed Chromium** (`headless=False`, zero external LLM API ke
 Requires **Python 3.11+** on Linux, WSL, or macOS.
 
 ```bash
+# Install from PyPI
+pip install agent-first-browse && python -m playwright install chromium
+
+# Or install from source
 git clone https://github.com/SandeepAi369/Agent-first-browse.git && cd Agent-first-browse
 python3 -m venv .venv && source .venv/bin/activate
 pip install -e . && python -m playwright install chromium
@@ -149,7 +154,7 @@ pip install -e . && python -m playwright install chromium
 
 ```bash
 # Autonomous LangGraph run (configure keys once via: cp .env.example .env)
-./agent.sh --mode v2 "Open https://news.ycombinator.com and find the top 3 stories"
+agent-first-browse run --mode v2 "Open https://news.ycombinator.com and find the top 3 stories"
 ```
 
 Want **zero external API keys**? Connect Antigravity, Claude Code, Cursor, VS Code, or Gemini CLI directly via native MCP or the stateful CLI daemon:
@@ -159,7 +164,7 @@ Want **zero external API keys**? Connect Antigravity, Claude Code, Cursor, VS Co
 
 <br>
 
-Copy [`.mcp.json.example`](.mcp.json.example) into your MCP client config:
+Copy [`.mcp.json.example`](https://github.com/SandeepAi369/Agent-first-browse/blob/main/.mcp.json.example) into your MCP client config:
 
 ```json
 {
@@ -259,15 +264,15 @@ sudo apt-get install -y xvfb
 
 | Guide | Contents |
 |---|---|
-| [`AGENTS.md`](AGENTS.md) | Engineering handbook, package boundaries, frozen-file rules, and verification commands. |
-| [`docs/EVAL_CONNECTOR.md`](docs/EVAL_CONNECTOR.md) | Complete Zero-API MCP + CLI connector guide, scenarios, and headed benchmark results. |
-| [`docs/TEST_COVERAGE_MATRIX.md`](docs/TEST_COVERAGE_MATRIX.md) | Subsystem-by-layer test coverage rollup and CI gate mapping. |
-| [`docs/V2_ECOSYSTEM_AUDIT_2026.md`](docs/V2_ECOSYSTEM_AUDIT_2026.md) | V2 perception & resilient action engine design rationale. |
-| [`docs/V29_OVERHAUL.md`](docs/V29_OVERHAUL.md) | V29 cognitive reliability layers (Reality Monitor, Intent Journal, Sub-Goal Lock). |
+| [`AGENTS.md`](https://github.com/SandeepAi369/Agent-first-browse/blob/main/AGENTS.md) | Engineering handbook, package boundaries, frozen-file rules, and verification commands. |
+| [`docs/EVAL_CONNECTOR.md`](https://github.com/SandeepAi369/Agent-first-browse/blob/main/docs/EVAL_CONNECTOR.md) | Complete Zero-API MCP + CLI connector guide, scenarios, and headed benchmark results. |
+| [`docs/TEST_COVERAGE_MATRIX.md`](https://github.com/SandeepAi369/Agent-first-browse/blob/main/docs/TEST_COVERAGE_MATRIX.md) | Subsystem-by-layer test coverage rollup and CI gate mapping. |
+| [`docs/V2_ECOSYSTEM_AUDIT_2026.md`](https://github.com/SandeepAi369/Agent-first-browse/blob/main/docs/V2_ECOSYSTEM_AUDIT_2026.md) | V2 perception & resilient action engine design rationale. |
+| [`docs/V29_OVERHAUL.md`](https://github.com/SandeepAi369/Agent-first-browse/blob/main/docs/V29_OVERHAUL.md) | V29 cognitive reliability layers (Reality Monitor, Intent Journal, Sub-Goal Lock). |
 
 ---
 
 ## License & Support
 
-- Licensed under the **Apache License 2.0** — see [`LICENSE`](LICENSE).
+- Licensed under the **Apache License 2.0** — see [`LICENSE`](https://github.com/SandeepAi369/Agent-first-browse/blob/main/LICENSE).
 - If you find **Agent First Browse** useful, consider starring the repo or supporting ongoing open-source development via [GitHub Sponsors](https://github.com/sponsors/SandeepAi369).

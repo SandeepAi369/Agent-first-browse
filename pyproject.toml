@@ -3,9 +3,9 @@ requires = ["setuptools>=77.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "agent-first-ide"
+name = "agent-first-browse"
 version = "0.1.0"
-description = "Fast, token-efficient autonomous browser control engine powered by LangGraph, Playwright, accessibility-tree perception, and MCP."
+description = "Fast, token-efficient AI browser agent that sees, clicks, types, and completes real web tasks autonomously - with native MCP & CLI control."
 readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
@@ -35,6 +35,18 @@ keywords = [
     "python",
     "stealth-browser",
 ]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Internet :: WWW/HTTP :: Browsers",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Testing",
+]
 
 dependencies = [
     "pydantic>=2.12.0",
@@ -58,9 +70,70 @@ dev = [
     "ruff>=0.11.0",
 ]
 
+[project.urls]
+Homepage = "https://xel-studio.vercel.app"
+Repository = "https://github.com/SandeepAi369/Agent-first-browse"
+Documentation = "https://github.com/SandeepAi369/Agent-first-browse/blob/main/docs/EVAL_CONNECTOR.md"
+Issues = "https://github.com/SandeepAi369/Agent-first-browse/issues"
+
 [project.scripts]
+agent-first-browse = "run_v16:main"
 agent-eval = "eval_connector.cli:main"
 agent-eval-mcp = "eval_connector.mcp_server:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+py-modules = [
+    "a11y_parser",
+    "action_classifier",
+    "action_feedback",
+    "action_verifier",
+    "advanced_agent",
+    "brain_graph",
+    "brain_state",
+    "campaign_memory",
+    "cdp_click",
+    "cdp_input",
+    "clarity",
+    "cognition",
+    "cognitive_core",
+    "consensus",
+    "content_critic",
+    "content_store",
+    "dom_diff",
+    "dom_parser",
+    "execution_safety",
+    "feature_flags",
+    "form_engine",
+    "ghost_input",
+    "github_engagement",
+    "intent_journal",
+    "mcp_tools",
+    "model_registry",
+    "moe_router",
+    "outcome_judge",
+    "overlay_detector",
+    "overwatch",
+    "paths",
+    "perception_engine",
+    "platform_detect",
+    "prm_critic",
+    "proxy_manager",
+    "reality",
+    "run",
+    "run_objective",
+    "run_prompt",
+    "run_v16",
+    "skill_memory",
+    "stagnation",
+    "subgoal_lock",
+    "target_lock",
+    "twitter_thread",
+    "verification_engine",
+    "virtual_display",
+    "vision_consult",
+    "web_dreamer",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]
