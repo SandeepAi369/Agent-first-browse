@@ -1,0 +1,81 @@
+{
+  "video_path": "/home/sandeep/agent first IDE/docs/assets/raw/agent_first_browse_demo_1280x720.webm",
+  "video_size_bytes": 2199710,
+  "resolution": "1280x720",
+  "task": "Sort products Low \u2192 High, add the 2 cheapest items to cart, and complete checkout",
+  "elapsed_s": 37.27,
+  "avg_perceive_ms": 136.9,
+  "avg_tokens": 118.6,
+  "steps": [
+    {
+      "step": 1,
+      "name": "Login Screen",
+      "url": "https://www.saucedemo.com/",
+      "ms": 146.6,
+      "tokens": 27,
+      "elements": 3,
+      "occluded_pruned": 0,
+      "kind": "full"
+    },
+    {
+      "step": 2,
+      "name": "Store Catalog",
+      "url": "https://www.saucedemo.com/inventory.html",
+      "ms": 135.8,
+      "tokens": 270,
+      "elements": 25,
+      "occluded_pruned": 1,
+      "kind": "full"
+    },
+    {
+      "step": 3,
+      "name": "Sorted Catalog (Low -> High)",
+      "url": "https://www.saucedemo.com/inventory.html",
+      "ms": 136.6,
+      "tokens": 251,
+      "elements": 25,
+      "occluded_pruned": 1,
+      "kind": "delta"
+    },
+    {
+      "step": 4,
+      "name": "Shopping Cart",
+      "url": "https://www.saucedemo.com/cart.html",
+      "ms": 134.3,
+      "tokens": 78,
+      "elements": 10,
+      "occluded_pruned": 0,
+      "kind": "full"
+    },
+    {
+      "step": 5,
+      "name": "Checkout Shipping Form",
+      "url": "https://www.saucedemo.com/checkout-step-one.html",
+      "ms": 133.9,
+      "tokens": 65,
+      "elements": 8,
+      "occluded_pruned": 0,
+      "kind": "full"
+    },
+    {
+      "step": 6,
+      "name": "Order Summary",
+      "url": "https://www.saucedemo.com/checkout-step-two.html",
+      "ms": 136.3,
+      "tokens": 78,
+      "elements": 9,
+      "occluded_pruned": 0,
+      "kind": "full"
+    },
+    {
+      "step": 7,
+      "name": "Order Confirmed",
+      "url": "https://www.saucedemo.com/checkout-complete.html",
+      "ms": 134.8,
+      "tokens": 61,
+      "elements": 8,
+      "occluded_pruned": 0,
+      "kind": "full"
+    }
+  ]
+}

@@ -12,6 +12,15 @@
 
 ---
 
+## Live Demo
+
+[![Agent First Browse — Autonomous Store Checkout Demo](docs/assets/demo.gif)](docs/assets/raw/agent_first_browse_demo_1280x720.webm)
+
+> **Task:** *"Sort products Low → High, add the 2 cheapest items to cart, and complete checkout"* — executed end-to-end with live `perceive_v2` perception (avg **136.9 ms/step**, **~119 tokens/step**), smooth Bézier cursor navigation, and character-by-character form input.
+> [Watch full 1280×720 HD video (`webm`)](docs/assets/raw/agent_first_browse_demo_1280x720.webm) · Re-record locally via `.venv/bin/python scripts/record_visual_demo.py`
+
+---
+
 ## Core V2 Capabilities
 
 | Capability | What It Does |
