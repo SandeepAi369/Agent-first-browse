@@ -6,7 +6,7 @@
 *Accessibility-tree-first perception · LangGraph verification · Native zero-API MCP & CLI*
 
 <p>
-  <a href="https://pypi.org/project/agent-first-browse/"><img src="https://img.shields.io/pypi/v/agent-first-browse?style=flat-square&color=3776AB&label=PyPI" alt="PyPI"></a>
+  <a href="https://pypi.org/project/agent-first-browse/"><img src="https://img.shields.io/pypi/v/agent-first-browse?style=flat-square&logo=pypi&logoColor=white&color=3776AB&label=PyPI" alt="PyPI Version"></a>
   <a href="https://python.org"><img src="https://img.shields.io/badge/Python-3.11%2B-3776AB?style=flat-square&logo=python&logoColor=white" alt="Python 3.11+"></a>
   <a href="https://langchain-ai.github.io/langgraph/"><img src="https://img.shields.io/badge/LangGraph-1.x-FF6B35?style=flat-square" alt="LangGraph 1.x"></a>
   <a href="https://playwright.dev/python/"><img src="https://img.shields.io/badge/Playwright-1.55%2B-2EAD33?style=flat-square&logo=playwright&logoColor=white" alt="Playwright 1.55+"></a>
@@ -141,14 +141,21 @@ Measured on live **headed Chromium** (`headless=False`, zero external LLM API ke
 Requires **Python 3.11+** on Linux, WSL, or macOS.
 
 ```bash
-# Install from PyPI
 pip install agent-first-browse && python -m playwright install chromium
+```
 
-# Or install from source
+<details>
+<summary><strong>🛠️ Install from source (optional developer setup)</strong></summary>
+
+<br>
+
+```bash
 git clone https://github.com/SandeepAi369/Agent-first-browse.git && cd Agent-first-browse
 python3 -m venv .venv && source .venv/bin/activate
-pip install -e . && python -m playwright install chromium
+pip install -e ".[dev]" && python -m playwright install chromium
 ```
+
+</details>
 
 ### Run Your First Task
 
