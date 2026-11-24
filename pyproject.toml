@@ -13,7 +13,28 @@ requires-python = ">=3.11"
 authors = [
     { name = "SandeepAi369" },
 ]
-keywords = ["langgraph", "browser-automation", "playwright", "ai-agent"]
+keywords = [
+    "ai-agents",
+    "browser-automation",
+    "browser-agent",
+    "browser-use",
+    "playwright",
+    "langgraph",
+    "mcp",
+    "mcp-server",
+    "model-context-protocol",
+    "computer-use",
+    "web-agent",
+    "autonomous-agents",
+    "agentic-ai",
+    "llm-agents",
+    "web-automation",
+    "accessibility-tree",
+    "chrome-devtools-protocol",
+    "chromium",
+    "python",
+    "stealth-browser",
+]
 
 dependencies = [
     "pydantic>=2.12.0",
