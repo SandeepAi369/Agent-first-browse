@@ -23,6 +23,7 @@ import json
 import os
 import shutil
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -42,6 +43,10 @@ from v2_engine.perception import V2SnapshotCompressor, perceive_v2  # noqa: E402
 VIEWPORT = {"width": 1280, "height": 720}
 DEFAULT_OUT_DIR = REPO_ROOT / "docs" / "assets" / "raw"
 DEFAULT_VIDEO_NAME = "agent_first_browse_demo_1280x720.webm"
+ALLOWED_OUTPUT_ROOTS: tuple[Path, ...] = (
+    REPO_ROOT.resolve(),
+    Path(tempfile.gettempdir()).resolve(),
+)
 STORE_URL = "https://www.saucedemo.com/"
 USER_TASK = "Sort products Low → High, add the 2 cheapest items to cart, and complete checkout"
 
@@ -507,12 +512,68 @@ async def _read_demo_store_credentials(page: Page) -> tuple[str, str]:
     return str(creds["user"]), str(creds["pass"])
 
 
+def _resolve_confined_out_dir(
+    out_dir: Path,
+    *,
+    allowed_roots: tuple[Path, ...] | None = None,
+) -> Path:
+    """Resolve `out_dir` and enforce confinement within the repository or system temp root."""
+    roots = tuple(r.resolve() for r in (allowed_roots or ALLOWED_OUTPUT_ROOTS))
+    resolved = out_dir.expanduser().resolve(strict=False)
+    if not any(resolved.is_relative_to(root) for root in roots):
+        allowed_str = ", ".join(str(r) for r in roots)
+        raise ValueError(
+            f"Refusing out_dir outside allowed workspace/temp roots: {resolved} (allowed: {allowed_str})"
+        )
+    return resolved
+
+
+def _validate_video_filename(video_name: str) -> str:
+    """Require a single safe filename segment without path separators or traversal."""
+    cleaned = (video_name or "").strip()
+    if (
+        not cleaned
+        or cleaned in (".", "..")
+        or "/" in cleaned
+        or "\\" in cleaned
+        or Path(cleaned).name != cleaned
+    ):
+        raise ValueError(f"Invalid video filename (must be a single filename segment): {video_name!r}")
+    return cleaned
+
+
+def _safe_rmtree_confined(
+    target: Path,
+    *,
+    expected_parent: Path,
+    allowed_roots: tuple[Path, ...] | None = None,
+) -> None:
+    """Safely remove a temporary subdirectory only if strictly confined and non-symlink."""
+    if target.is_symlink():
+        raise ValueError(f"Refusing to remove symlinked temp directory: {target}")
+    if not target.exists():
+        return
+
+    roots = tuple(r.resolve() for r in (allowed_roots or ALLOWED_OUTPUT_ROOTS))
+    resolved_parent = expected_parent.resolve()
+    resolved_target = target.resolve()
+
+    if resolved_target == resolved_parent or not resolved_target.is_relative_to(resolved_parent):
+        raise ValueError(
+            f"Refusing to remove directory outside expected parent {resolved_parent}: {resolved_target}"
+        )
+    if not any(resolved_target.is_relative_to(root) for root in roots):
+        raise ValueError(f"Refusing to remove directory outside allowed roots: {resolved_target}")
+    shutil.rmtree(resolved_target)
+
+
 async def record_demo(*, headless: bool, out_dir: Path, video_name: str) -> tuple[Path, Path]:
     """Run the relatable end-to-end e-commerce demo and save raw 1280x720 `.webm`."""
-    out_dir.mkdir(parents=True, exist_ok=True)
-    tmp_video_dir = out_dir / "_recording_tmp"
-    if tmp_video_dir.exists():
-        shutil.rmtree(tmp_video_dir)
+    confined_out_dir = _resolve_confined_out_dir(out_dir)
+    safe_video_name = _validate_video_filename(video_name)
+    confined_out_dir.mkdir(parents=True, exist_ok=True)
+    tmp_video_dir = confined_out_dir / "_recording_tmp"
+    _safe_rmtree_confined(tmp_video_dir, expected_parent=confined_out_dir)
     tmp_video_dir.mkdir(parents=True, exist_ok=True)
 
     set_engine_mode(ENGINE_MODE_V2)
@@ -732,10 +793,12 @@ async def record_demo(*, headless: bool, out_dir: Path, video_name: str) -> tupl
     if raw_path is None or not raw_path.exists():
         raise RuntimeError("Playwright did not produce a recorded video file.")
 
-    final_video = out_dir / video_name
+    final_video = (confined_out_dir / safe_video_name).resolve(strict=False)
+    if not final_video.is_relative_to(confined_out_dir):
+        raise ValueError(f"Refusing to write video outside confined output dir: {final_video}")
     shutil.move(str(raw_path), str(final_video))
     with contextlib.suppress(OSError):
-        shutil.rmtree(tmp_video_dir)
+        _safe_rmtree_confined(tmp_video_dir, expected_parent=confined_out_dir)
 
     summary = {
         "video_path": str(final_video),
@@ -747,7 +810,7 @@ async def record_demo(*, headless: bool, out_dir: Path, video_name: str) -> tupl
         "avg_tokens": round(sum(s.est_tokens for s in metrics.steps) / max(1, len(metrics.steps)), 1),
         "steps": step_log,
     }
-    metrics_path = out_dir / "demo_metrics.json"
+    metrics_path = confined_out_dir / "demo_metrics.json"
     metrics_path.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
     return final_video, metrics_path
 

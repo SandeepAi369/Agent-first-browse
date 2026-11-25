@@ -43,6 +43,79 @@ if _ENV_PATH.is_file():
 
 logger = logging.getLogger("model_registry")
 
+try:
+    from core.redaction import SECRET_MASK, redact_inline_secrets
+    from core.settings import SecretValue
+except ImportError:  # pragma: no cover — fallback if imported standalone without src/core
+    SECRET_MASK = "[REDACTED]"
+
+    def redact_inline_secrets(text: str) -> str:
+        return text
+
+    class SecretValue:  # type: ignore[no-redef]
+        __slots__ = ("_value",)
+
+        def __init__(self, value: str) -> None:
+            self._value = value
+
+        def get_secret_value(self) -> str:
+            return self._value
+
+        def __repr__(self) -> str:
+            return "SecretValue('***')" if self._value else "SecretValue('')"
+
+        def __str__(self) -> str:
+            return "***" if self._value else ""
+
+        def __bool__(self) -> bool:
+            return bool(self._value)
+
+
+_CREDENTIAL_ENV_VARS: tuple[str, ...] = (
+    "PREMIUM_API_KEY",
+    "PREMIUM_API_KEYS",
+    "GROQ_API_KEY",
+    "GROQ_API_KEYS",
+    "GROQ_VISION_API_KEY",
+    "OPENAI_API_KEY_FALLBACKS",
+    "SUPERVISOR_MODEL_API_KEY_FALLBACKS",
+    "NVIDIA_NIM_API_KEY",
+    "NVIDIA_NIM_API_KEYS",
+    "NVIDIA_VISION_API_KEY",
+    "CEREBRAS_API_KEY",
+    "CEREBRAS_API_KEYS",
+    "GEMINI_API_KEY",
+    "GEMINI_API_KEY_FALLBACKS",
+    "VISION_GOOGLE_API_KEY",
+    "VISION_GOOGLE_API_KEY_FALLBACKS",
+    "GOOGLE_API_KEY",
+)
+
+_QUERY_SECRET_RE = re.compile(r"(?i)([?&](?:api_?key|key|token)=)([^&\s'\"]+)")
+_ASSIGN_SECRET_RE = re.compile(
+    r"(?i)\b(api_?key|google_api_key|x-api-key|authorization)\s*[:=]\s*['\"]?([^\s'\",;}{]{6,})['\"]?"
+)
+
+
+def _redact_secret_text(text: str) -> str:
+    """Scrub raw provider keys, auth headers, and query secrets before logging/raising."""
+    if not text:
+        return ""
+    cleaned = redact_inline_secrets(str(text))
+    cleaned = _QUERY_SECRET_RE.sub(rf"\1{SECRET_MASK}", cleaned)
+    cleaned = _ASSIGN_SECRET_RE.sub(rf"\1={SECRET_MASK}", cleaned)
+
+    # Also mask any verbatim loaded credential value (catches vendor-specific prefixes)
+    active_keys = sorted(
+        (k for k in _collect_keys(*_CREDENTIAL_ENV_VARS) if len(k) >= 6),
+        key=len,
+        reverse=True,
+    )
+    for secret in active_keys:
+        if secret in cleaned:
+            cleaned = cleaned.replace(secret, SECRET_MASK)
+    return cleaned
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  Environment Helpers
@@ -60,6 +133,11 @@ def _collect_keys(*env_vars: str) -> list[str]:
             if k and k not in keys:
                 keys.append(k)
     return keys
+
+
+def _collect_secret_keys(*env_vars: str) -> list[SecretValue]:
+    """Collect API keys wrapped in `SecretValue` so repr/str/logs always mask them."""
+    return [SecretValue(k) for k in _collect_keys(*env_vars)]
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -142,19 +220,19 @@ WORKER_MAX_TIER = 1
 
 def get_agent_mode() -> str:
     """'premium' | 'free'. AGENT_MODE=auto (default) → premium iff a PREMIUM_API_KEY
-    is set; 'premium'/'free' force the respective path."""
+    (or PREMIUM_API_KEYS) is set; 'premium'/'free' force the respective path."""
     mode = os.getenv("AGENT_MODE", "auto").strip().lower()
     if mode == "premium":
         return "premium"
     if mode == "free":
         return "free"
-    return "premium" if os.getenv("PREMIUM_API_KEY", "").strip() else "free"
+    return "premium" if bool(_collect_secret_keys("PREMIUM_API_KEY", "PREMIUM_API_KEYS")) else "free"
 
 
-def _premium_config() -> dict:
-    """Premium single-key/model config — one paid key that does text + vision."""
+def _premium_config() -> dict[str, Any]:
+    """Premium single-key/model config — keys wrapped in `SecretValue` to prevent leaks."""
     return {
-        "keys": _collect_keys("PREMIUM_API_KEY", "PREMIUM_API_KEYS"),
+        "keys": _collect_secret_keys("PREMIUM_API_KEY", "PREMIUM_API_KEYS"),
         "model": os.getenv("PREMIUM_MODEL", "").strip(),
         "vision_model": os.getenv("PREMIUM_VISION_MODEL", "").strip(),
         "base_url": os.getenv("PREMIUM_BASE_URL", "https://api.openai.com/v1").strip(),
@@ -649,7 +727,7 @@ def _build_text_pipeline() -> list[ModelClient]:
         except ImportError:
             logger.warning("TEXT ── langchain-google-genai not installed, skipping Gemini text fallback")
         except Exception as e:
-            logger.error("TEXT ── Gemini text fallback bootstrap failed: %s", e)
+            logger.error("TEXT ── Gemini text fallback bootstrap failed: %s", _redact_secret_text(str(e)))
 
     return clients
 
@@ -709,7 +787,7 @@ def _build_vision_pipeline() -> list[ModelClient]:
         except ImportError:
             logger.warning("VISION ── langchain-google-genai not installed, skipping Gemini")
         except Exception as e:
-            logger.error("VISION ── Gemini bootstrap failed: %s", e)
+            logger.error("VISION ── Gemini bootstrap failed: %s", _redact_secret_text(str(e)))
 
     # ── NVIDIA NIM Vision — SECONDARY (multi-model × ALL NVIDIA keys) ──
     # V16.1: Collect ALL NVIDIA keys so every vision model gets tried on every key
@@ -778,15 +856,16 @@ def _build_premium_pipeline() -> tuple[list["ModelClient"], list["ModelClient"]]
         logger.error("PREMIUM mode needs PREMIUM_API_KEY and PREMIUM_MODEL — none/partial set.")
         return [], []
 
-    def _mk(m: str, key: str, idx: int, pipeline: str) -> "ModelClient":
+    def _mk(m: str, key: SecretValue, idx: int, pipeline: str) -> "ModelClient":
+        raw_key = key.get_secret_value()
         if cfg["provider"] == "google":
             from langchain_google_genai import ChatGoogleGenerativeAI
             client = ChatGoogleGenerativeAI(
-                model=m, google_api_key=key, temperature=0.0, timeout=cfg["timeout"])
+                model=m, google_api_key=raw_key, temperature=0.0, timeout=cfg["timeout"])
         else:
             from langchain_openai import ChatOpenAI
             client = ChatOpenAI(
-                model=m, api_key=key, base_url=cfg["base_url"],
+                model=m, api_key=raw_key, base_url=cfg["base_url"],
                 temperature=0.0, timeout=cfg["timeout"])
         return ModelClient(name=f"premium-{pipeline}:{m}:{idx}", client=client,
                            provider="premium", pipeline=pipeline)
@@ -989,10 +1068,11 @@ class ModelRegistry:
                 return combo_key, time.monotonic() - t0, "timeout", None
             except Exception as exc:
                 k = _kind(exc)
+                safe_exc = _redact_secret_text(str(exc))
                 if k == "dead":
-                    return combo_key, time.monotonic() - t0, "dead", str(exc)[:120]
+                    return combo_key, time.monotonic() - t0, "dead", safe_exc[:120]
                 if k == "transient":
-                    return combo_key, time.monotonic() - t0, "transient", str(exc)[:100]
+                    return combo_key, time.monotonic() - t0, "transient", safe_exc[:100]
                 try:  # 2) strict rejected the schema — does JSON-mode rescue work?
                     await asyncio.wait_for(
                         _invoke_json_mode(mc.client, cap_messages, _CapProbe, timeout),
@@ -1001,10 +1081,11 @@ class ModelRegistry:
                 except asyncio.TimeoutError:
                     return combo_key, time.monotonic() - t0, "timeout", None
                 except Exception as e2:
+                    safe_e2 = _redact_secret_text(str(e2))
                     if _kind(e2) == "transient":
-                        return combo_key, time.monotonic() - t0, "transient", str(e2)[:100]
+                        return combo_key, time.monotonic() - t0, "transient", safe_e2[:100]
                     # Responded but cannot structure via EITHER path → INCAPABLE.
-                    return combo_key, time.monotonic() - t0, "incapable", str(e2)[:100]
+                    return combo_key, time.monotonic() - t0, "incapable", safe_e2[:100]
 
         logger.info("🔬 Capability-probing %d (provider, model) combos (≤%.0fs)...",
                     len(reps), timeout)
@@ -1060,8 +1141,8 @@ def _as_model_clients(chain: list) -> list[ModelClient]:
         if isinstance(item, ModelClient):
             entries.append(item)
         else:
-            name = getattr(item, "model_name", getattr(item, "model", str(item)))
-            entries.append(ModelClient(name=str(name), client=item,
+            raw_name = getattr(item, "model_name", getattr(item, "model", str(item)))
+            entries.append(ModelClient(name=_redact_secret_text(str(raw_name)), client=item,
                                        provider="unknown", pipeline="text"))
     return entries
 
@@ -1253,7 +1334,7 @@ async def invoke_with_failover(
                                attempt_no, total, name, timeout)
 
             except Exception as exc:
-                err = str(exc)
+                err = _redact_secret_text(str(exc))
                 last_error = f"{name} — {err[:150]}"
                 err_l = err.lower()
                 is_rl = "429" in err or "rate_limit" in err_l or "rate limit" in err_l
@@ -1291,9 +1372,10 @@ async def invoke_with_failover(
                             breaker.record_success()
                         return response, name
                     except Exception as json_exc:  # noqa: BLE001
-                        last_error = f"{name} JSON-mode — {str(json_exc)[:120]}"
+                        safe_json_err = _redact_secret_text(str(json_exc))
+                        last_error = f"{name} JSON-mode — {safe_json_err[:120]}"
                         logger.warning("⚠️  JSON-mode rescue failed for %s: %s",
-                                       name, str(json_exc)[:150])
+                                       name, safe_json_err[:150])
                         continue
 
                 if _health:
@@ -1301,4 +1383,4 @@ async def invoke_with_failover(
                 logger.warning("⚠️  FAILOVER [%d/%d]: %s — %s",
                                attempt_no, total, name, err[:200])
 
-    raise RuntimeError(f"ALL {total} models failed. Last: {last_error}")
+    raise RuntimeError(f"ALL {total} models failed. Last: {_redact_secret_text(last_error)}")
