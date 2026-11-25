@@ -11,6 +11,7 @@
   <a href="https://langchain-ai.github.io/langgraph/"><img src="https://img.shields.io/badge/LangGraph-1.x-FF6B35?style=flat-square" alt="LangGraph 1.x"></a>
   <a href="https://playwright.dev/python/"><img src="https://img.shields.io/badge/Playwright-1.55%2B-2EAD33?style=flat-square&logo=playwright&logoColor=white" alt="Playwright 1.55+"></a>
   <a href="https://github.com/SandeepAi369/Agent-first-browse/blob/main/docs/EVAL_CONNECTOR.md"><img src="https://img.shields.io/badge/MCP-stdio%20%2B%20CLI-7C3AED?style=flat-square" alt="MCP Ready"></a>
+  <a href="https://glama.ai/mcp/servers/@SandeepAi369/Agent-first-browse"><img src="https://glama.ai/mcp/servers/@SandeepAi369/Agent-first-browse/badges/score.svg" alt="Glama MCP Server Score"></a>
   <a href="https://github.com/SandeepAi369/Agent-first-browse/blob/main/docs/TEST_COVERAGE_MATRIX.md"><img src="https://img.shields.io/badge/Tests-528%20passing-10B981?style=flat-square" alt="528 Passing Tests"></a>
   <a href="https://github.com/SandeepAi369/Agent-first-browse/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-Apache--2.0-0EA5E9?style=flat-square" alt="Apache-2.0 License"></a>
 </p>
@@ -169,7 +170,9 @@ agent-first-browse run --mode v2 "Open https://news.ycombinator.com and find the
 
 ## MCP Server Setup
 
-Connect **Claude Desktop**, **Claude Code**, **Cursor**, or any MCP host directly over `stdio` — **zero external LLM API keys required** (run `python -m playwright install chromium` once if Chromium is not yet installed).
+[![Agent First Browse MCP server](https://glama.ai/mcp/servers/@SandeepAi369/Agent-first-browse/badges/card.svg)](https://glama.ai/mcp/servers/@SandeepAi369/Agent-first-browse)
+
+Connect **Claude Desktop**, **Claude Code**, **Cursor**, or any MCP host directly over `stdio` — **zero external LLM API keys required** (run `python -m playwright install chromium` once if Chromium is not yet installed). Listed on the [Official MCP Registry](https://registry.modelcontextprotocol.io/v0.1/servers?search=agent-first-browse) and [Glama](https://glama.ai/mcp/servers/@SandeepAi369/Agent-first-browse).
 
 ### Claude Desktop
 
