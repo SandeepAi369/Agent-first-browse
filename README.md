@@ -52,6 +52,10 @@
 | **12.0× faster** | **54.8% fewer tokens** | **Native MCP + CLI** | **528 passing tests** |
 | `96.8 ms` avg vs `1,164 ms` legacy | Up to **95% saved** behind modals | 7 stdio tools + `0600` Unix daemon | `ruff`, `mypy`, guardrails & Chromium CI |
 
+> **Independent Coverage — [MewCP](https://mewcp.com/articles/agent-first-browse-shows-browser-agents-only-what-changed-on-the-page-cf1c7e)**<br>
+> *"Send the model only what changed, hide what cannot be clicked, and never click stale coordinates. By next year that should be table stakes for every browser agent."*<br>
+> — **Rohit Gite**, Co-Founder, MewCP · [*"Agent-first-browse shows browser agents only what changed on the page"*](https://mewcp.com/articles/agent-first-browse-shows-browser-agents-only-what-changed-on-the-page-cf1c7e) *(November 24, 2026)*
+
 ---
 
 ## Why Agent First Browse?
