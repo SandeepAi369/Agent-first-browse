@@ -1,24 +1,30 @@
-"""eval_connector.mcp_server — Pure-Python Native MCP stdio Server (Zero Extra Deps).
+"""eval_connector.mcp_server — Pure-Python Production Browser MCP stdio Server (Zero Extra Deps).
 
 Implements the Model Context Protocol (JSON-RPC 2.0 over newline-delimited stdio)
-using only Python stdlib + `DualModeSessionManager`, exposing 7 lean evaluation
-tools so any MCP host (Antigravity, Claude Code, Cursor, VS Code, Gemini CLI)
-can act directly as the LLM brain to live-test `Agent-first-browse` in `--mode
-legacy` vs `--mode v2` with zero external LLM API keys.
+using only Python stdlib + `DualModeSessionManager`, exposing 7 lean browser control
+and diagnostic tools so any MCP host (Claude Desktop, Claude Code, Cursor, VS Code,
+Antigravity, Gemini CLI) can drive real Chromium browsers directly with zero external
+LLM API keys.
 
-Tools exposed (7):
-  1. `eval_start`      — Start a `legacy`, `v2`, or twin `pair` Chromium session
-  2. `eval_perceive`   — Run real `legacy` or `v2` perception + step telemetry
-  3. `eval_act`        — Execute browser action (`goto`, `click`, `type`, etc.)
-  4. `eval_compare`    — Side-by-side latency/token/occlusion/visibility diff
-  5. `eval_screenshot` — Save PNG screenshot to disk for visual inspection
-  6. `eval_metrics`    — Cumulative Markdown + JSON report, sessions & scenarios
-  7. `eval_stop`       — Close one or all active browser sessions
+Primary production tools exposed via `tools/list` (7):
+  1. `browser_start`      — Launch an isolated Chromium session (`v2`, `legacy`, or `pair`)
+  2. `browser_perceive`   — Capture compact ref-indexed page state + step telemetry
+  3. `browser_act`        — Execute browser action (`goto`, `click`, `type`, etc.)
+  4. `browser_screenshot` — Save PNG screenshot to disk for visual verification
+  5. `browser_stop`       — Close one or all active browser sessions
+  6. `browser_compare`    — Side-by-side latency/token/occlusion/visibility diff
+  7. `browser_metrics`    — Cumulative Markdown + JSON telemetry, sessions & scenarios
 
-Run directly:
+Backwards compatibility:
+  All legacy `eval_*` tool names (`eval_start`, `eval_perceive`, `eval_act`,
+  `eval_screenshot`, `eval_stop`, `eval_compare`, `eval_metrics`) remain fully
+  routed in `tools/call` and `call_tool()`.
+
+Run via console entrypoint:
+    agent-browse-mcp
+    agent-eval-mcp        # backwards-compatible alias
+Or directly from source:
     PYTHONPATH=src python -m eval_connector.mcp_server
-Or via console entrypoint (after `pip install -e .`):
-    agent-eval-mcp
 """
 
 from __future__ import annotations
@@ -38,7 +44,7 @@ from eval_connector.session import DualModeSessionManager
 
 logger = logging.getLogger("eval_connector.mcp_server")
 
-SERVER_NAME = "agent-first-browse-eval"
+SERVER_NAME = "agent-first-browse"
 SERVER_VERSION = "0.1.1"
 DEFAULT_PROTOCOL_VERSION = "2025-03-26"
 SUPPORTED_PROTOCOL_VERSIONS = {
@@ -48,37 +54,39 @@ SUPPORTED_PROTOCOL_VERSIONS = {
 }
 
 SERVER_INSTRUCTIONS = (
-    "Zero-API Agent-as-LLM evaluation connector for Agent-first-browse. "
-    "Use eval_start(mode='pair', url=... or scenario=...) to launch twin legacy "
-    "and v2 Chromium sessions, eval_compare / eval_perceive to inspect rendered "
-    "page state and telemetry, eval_act to drive multi-step workflows, "
-    "eval_screenshot for visual checks, eval_metrics for side-by-side reports, "
-    "and eval_stop when finished."
+    "Production zero-API Browser MCP Server for Agent-first-browse. "
+    "Use browser_start(url=...) to launch an isolated Chromium session (defaults to the fast v2 "
+    "engine; also supports mode='legacy' or twin mode='pair'), browser_perceive to inspect "
+    "compact ref-indexed elements and telemetry, browser_act to execute multi-step workflows, "
+    "browser_screenshot for visual verification, browser_stop when finished, and "
+    "browser_compare / browser_metrics for side-by-side engine diagnostics. "
+    "Legacy eval_* tool aliases remain supported."
 )
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  7 Lean MCP Tool Definitions
+#  7 Production MCP Tool Definitions (+ Legacy eval_* Alias Map)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
-        "name": "eval_start",
+        "name": "browser_start",
         "description": (
-            "Start a live Chromium evaluation session in 'legacy', 'v2', or twin 'pair' "
-            "mode (<name>_legacy + <name>_v2). Accepts any live URL or built-in scenario "
-            "(modal_occlusion, spa_rerender, sparse_aria, multistep_form, a11y_visibility)."
+            "Launch an isolated Chromium browser session (defaults to fast 'v2' engine; "
+            "also supports 'legacy' or twin 'pair' comparison mode). Accepts any live URL "
+            "or built-in stress scenario (modal_occlusion, spa_rerender, sparse_aria, "
+            "multistep_form, a11y_visibility)."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "name": {
                     "type": "string",
-                    "description": "Session name (or prefix when mode='pair'). Default: 'eval'.",
+                    "description": "Session name (or prefix when mode='pair'). Default: 'browser'.",
                 },
                 "mode": {
                     "type": "string",
-                    "enum": ["legacy", "v2", "pair"],
-                    "description": "Engine mode: 'legacy', 'v2', or 'pair' (twin sessions).",
+                    "enum": ["v2", "legacy", "pair"],
+                    "description": "Engine mode: 'v2' (default, fast), 'legacy', or 'pair' (twin sessions).",
                 },
                 "url": {
                     "type": "string",
@@ -93,7 +101,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                         "multistep_form",
                         "a11y_visibility",
                     ],
-                    "description": "Optional built-in deep-test scenario to load.",
+                    "description": "Optional built-in stress-test scenario to load.",
                 },
                 "headless": {
                     "type": "boolean",
@@ -106,10 +114,10 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         },
     },
     {
-        "name": "eval_perceive",
+        "name": "browser_perceive",
         "description": (
-            "Run the active session's real legacy or v2 perception pipeline and return "
-            "rendered element text, structured ref elements, and latency/token telemetry."
+            "Inspect the active browser session with accessibility-tree-first perception and "
+            "return compact ref-indexed elements ([e1], [e2], ...) plus latency/token telemetry."
         ),
         "inputSchema": {
             "type": "object",
@@ -117,16 +125,17 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 "session": {"type": "string", "description": "Active session name."},
                 "objective": {"type": "string", "description": "Optional task objective for goal-relevance recall."},
                 "force_full": {"type": "boolean", "description": "Force full snapshot (bypass V2 delta mode)."},
-                "settle": {"type": "boolean", "description": "Run mode-appropriate page settle first (default true)."},
+                "settle": {"type": "boolean", "description": "Wait for adaptive DOM settle first (default true)."},
             },
             "required": ["session"],
         },
     },
     {
-        "name": "eval_act",
+        "name": "browser_act",
         "description": (
-            "Execute a browser action inside an active session through the real legacy "
-            "(mcp_tools) or v2 (v2_engine.actions) executor."
+            "Execute a browser action inside an active session (navigate, click, type, hover, "
+            "select, key press, scroll, or wait) with stale-ref semantic rebinding and optional "
+            "auto_perceive."
         ),
         "inputSchema": {
             "type": "object",
@@ -160,7 +169,38 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         },
     },
     {
-        "name": "eval_compare",
+        "name": "browser_screenshot",
+        "description": (
+            "Capture a PNG screenshot of an active browser session to disk and return its path, "
+            "dimensions, and byte size."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "session": {"type": "string", "description": "Active session name."},
+                "out_path": {"type": "string", "description": "Optional output PNG path."},
+                "full_page": {"type": "boolean", "description": "Capture full scrollable page (default false)."},
+            },
+            "required": ["session"],
+        },
+    },
+    {
+        "name": "browser_stop",
+        "description": "Close a single named browser session or shut down all active sessions cleanly.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "session": {
+                    "type": "string",
+                    "description": "Session name to close. Omit (or set all=true) to close all sessions.",
+                },
+                "all": {"type": "boolean", "description": "Close all active sessions (default false)."},
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "browser_compare",
         "description": (
             "Compare an active legacy session and v2 session side-by-side: latency speedup, "
             "prompt token savings %, occluded elements pruned, Tier-2 escalation, and visibility diff."
@@ -178,26 +218,10 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         },
     },
     {
-        "name": "eval_screenshot",
+        "name": "browser_metrics",
         "description": (
-            "Capture a PNG screenshot of an active session to disk and return its path, "
-            "dimensions, and byte size."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "session": {"type": "string", "description": "Active session name."},
-                "out_path": {"type": "string", "description": "Optional output PNG path."},
-                "full_page": {"type": "boolean", "description": "Capture full scrollable page (default false)."},
-            },
-            "required": ["session"],
-        },
-    },
-    {
-        "name": "eval_metrics",
-        "description": (
-            "Return cumulative side-by-side Markdown table, structured metrics/transcripts, "
-            "active sessions, and built-in scenario catalog."
+            "Return cumulative session latency/token telemetry, Markdown comparison table, "
+            "active sessions, and built-in stress scenario catalog."
         ),
         "inputSchema": {
             "type": "object",
@@ -215,42 +239,45 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
             "required": [],
         },
     },
-    {
-        "name": "eval_stop",
-        "description": "Close a single named session or all active browser sessions cleanly.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "session": {
-                    "type": "string",
-                    "description": "Session name to close. Omit (or set all=true) to close all sessions.",
-                },
-                "all": {"type": "boolean", "description": "Close all active sessions (default false)."},
-            },
-            "required": [],
-        },
-    },
 ]
 
-_TOOL_NAMES = {t["name"] for t in TOOL_DEFINITIONS}
+TOOL_ALIASES: dict[str, str] = {
+    "eval_start": "browser_start",
+    "eval_perceive": "browser_perceive",
+    "eval_act": "browser_act",
+    "eval_screenshot": "browser_screenshot",
+    "eval_stop": "browser_stop",
+    "eval_compare": "browser_compare",
+    "eval_metrics": "browser_metrics",
+}
+
+_TOOL_NAMES: set[str] = {t["name"] for t in TOOL_DEFINITIONS}
+_ALLOWED_TOOL_NAMES: frozenset[str] = frozenset(_TOOL_NAMES | set(TOOL_ALIASES))
+
+
+def resolve_tool_name(name: str) -> str:
+    """Resolve a primary `browser_*` or legacy `eval_*` tool name to its canonical name."""
+    return TOOL_ALIASES.get(name, name)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  JSON-RPC 2.0 MCP Protocol Server
 # ═══════════════════════════════════════════════════════════════════════════════
 
-class EvalMCPServer:
-    """Pure-Python MCP JSON-RPC 2.0 server backed by `DualModeSessionManager`."""
+class BrowserMCPServer:
+    """Pure-Python MCP JSON-RPC 2.0 browser server backed by `DualModeSessionManager`."""
 
     def __init__(self, screenshot_dir: Path | None = None) -> None:
         self.manager = DualModeSessionManager(screenshot_dir=screenshot_dir)
 
     async def call_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
-        """Dispatch one of the 7 evaluation tools and return structured data."""
+        """Dispatch any primary `browser_*` tool (or legacy `eval_*` alias) and return structured data."""
         args = arguments or {}
+        canonical = resolve_tool_name(name)
 
-        if name == "eval_start":
-            session_name = str(args.get("name") or "eval").strip()
+        if canonical == "browser_start":
+            default_session = "eval" if name == "eval_start" else "browser"
+            session_name = str(args.get("name") or default_session).strip()
             mode = str(args.get("mode") or "v2").strip().lower()
             headless = bool(args.get("headless", True))
             vw = int(args.get("viewport_width") or 1280)
@@ -275,7 +302,7 @@ class EvalMCPServer:
                 viewport=(vw, vh),
             )
 
-        if name == "eval_perceive":
+        if canonical == "browser_perceive":
             session = str(args.get("session") or "").strip()
             if not session:
                 raise ValueError("'session' is required")
@@ -286,7 +313,7 @@ class EvalMCPServer:
                 settle=bool(args.get("settle", True)),
             )
 
-        if name == "eval_act":
+        if canonical == "browser_act":
             session = str(args.get("session") or "").strip()
             verb = str(args.get("verb") or "").strip()
             if not session or not verb:
@@ -307,7 +334,23 @@ class EvalMCPServer:
                 objective=str(args.get("objective") or ""),
             )
 
-        if name == "eval_compare":
+        if canonical == "browser_screenshot":
+            session = str(args.get("session") or "").strip()
+            if not session:
+                raise ValueError("'session' is required")
+            return await self.manager.screenshot(
+                session,
+                out_path=args.get("out_path"),
+                full_page=bool(args.get("full_page", False)),
+            )
+
+        if canonical == "browser_stop":
+            stop_session = args.get("session")
+            if args.get("all") or not stop_session:
+                return await self.manager.close_all()
+            return await self.manager.close_session(str(stop_session))
+
+        if canonical == "browser_compare":
             leg = str(args.get("legacy_session") or "").strip()
             v2 = str(args.get("v2_session") or "").strip()
             if not leg or not v2:
@@ -320,29 +363,13 @@ class EvalMCPServer:
                 settle=bool(args.get("settle", True)),
             )
 
-        if name == "eval_screenshot":
-            session = str(args.get("session") or "").strip()
-            if not session:
-                raise ValueError("'session' is required")
-            return await self.manager.screenshot(
-                session,
-                out_path=args.get("out_path"),
-                full_page=bool(args.get("full_page", False)),
-            )
-
-        if name == "eval_metrics":
+        if canonical == "browser_metrics":
             names = args.get("sessions")
             rep = await self.manager.report(names=names if isinstance(names, list) else None)
             rep["active_sessions"] = await self.manager.list_sessions()
             if args.get("include_scenarios", True):
                 rep["scenarios"] = list_scenarios()
             return rep
-
-        if name == "eval_stop":
-            stop_session = args.get("session")
-            if args.get("all") or not stop_session:
-                return await self.manager.close_all()
-            return await self.manager.close_session(str(stop_session))
 
         raise KeyError(f"Unknown tool '{name}'")
 
@@ -390,7 +417,7 @@ class EvalMCPServer:
         if method == "tools/call":
             tool_name = params.get("name")
             arguments = params.get("arguments") or {}
-            if not isinstance(tool_name, str) or tool_name not in _TOOL_NAMES:
+            if not isinstance(tool_name, str) or tool_name not in _ALLOWED_TOOL_NAMES:
                 return _error_response(req_id, -32602, f"Unknown tool: {tool_name!r}")
             if not isinstance(arguments, dict):
                 return _error_response(req_id, -32602, "Invalid tool arguments: expected JSON object")
@@ -456,6 +483,10 @@ class EvalMCPServer:
             logger.info("MCP stdio server shut down cleanly.")
 
 
+# Backwards-compatible alias for code importing EvalMCPServer directly
+EvalMCPServer = BrowserMCPServer
+
+
 def _ok_response(req_id: Any, result: dict[str, Any]) -> dict[str, Any]:
     return {"jsonrpc": "2.0", "id": req_id, "result": result}
 
@@ -466,9 +497,9 @@ def _error_response(req_id: Any, code: int, message: str) -> dict[str, Any]:
 
 def _redirect_stdout_log_handlers(proto_out: Any, err_stream: Any) -> None:
     """Move any logging.StreamHandler bound to stdout onto stderr."""
-    all_loggers = [logging.getLogger()] + [
-        lg for lg in logging.Logger.manager.loggerDict.values()
-        if isinstance(lg, logging.Logger)
+    all_loggers = [
+        logging.getLogger(),
+        *(lg for lg in logging.Logger.manager.loggerDict.values() if isinstance(lg, logging.Logger)),
     ]
     for lg in all_loggers:
         for handler in lg.handlers:
@@ -482,8 +513,8 @@ def _write_stream(stream: Any, payload: dict[str, Any]) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Agent-first-browse Native MCP stdio Evaluation Server")
-    parser.add_argument("--screenshot-dir", type=str, default=None, help="Directory for eval_screenshot PNGs.")
+    parser = argparse.ArgumentParser(description="Agent-first-browse Production Browser MCP stdio Server")
+    parser.add_argument("--screenshot-dir", type=str, default=None, help="Directory for browser_screenshot PNGs.")
     parser.add_argument("--verbose", action="store_true", help="Enable debug logging to stderr.")
     args = parser.parse_args(argv)
 
@@ -493,7 +524,7 @@ def main(argv: list[str] | None = None) -> int:
         format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     )
 
-    server = EvalMCPServer(
+    server = BrowserMCPServer(
         screenshot_dir=Path(args.screenshot_dir) if args.screenshot_dir else None,
     )
     asyncio.run(server.serve_stdio())

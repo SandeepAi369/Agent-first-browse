@@ -176,8 +176,9 @@ jobs:
             cd /tmp
             PYTHONPATH="$SITE_PKGS" /tmp/release_smoke_venv/bin/python -c "import core, v2_engine, eval_connector, dom_parser, brain_graph, run_v16"
             PYTHONPATH="$SITE_PKGS" /tmp/release_smoke_venv/bin/agent-first-browse --help >/dev/null
-            PYTHONPATH="$SITE_PKGS" /tmp/release_smoke_venv/bin/agent-eval --help >/dev/null
+            PYTHONPATH="$SITE_PKGS" /tmp/release_smoke_venv/bin/agent-browse-mcp --help >/dev/null
             PYTHONPATH="$SITE_PKGS" /tmp/release_smoke_venv/bin/agent-eval-mcp --help >/dev/null
+            PYTHONPATH="$SITE_PKGS" /tmp/release_smoke_venv/bin/agent-eval --help >/dev/null
           )
           rm -rf /tmp/release_smoke_venv
 

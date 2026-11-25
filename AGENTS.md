@@ -12,7 +12,7 @@ It supports two side-by-side execution engines controlled via `--mode {legacy,v2
 - **`legacy`**: The proven V16–V29 baseline pipeline backed by frozen stealth/CDP modules.
 - **`v2`** (`src/v2_engine/`): Adaptive `MutationObserver` DOM settle, paint-order occlusion pruning, Tier-2 A11y escalation, compact RefID delta compression, live `window.__aid` stale-ref semantic rebinding, and LangGraph `RetryPolicy`.
 
-It also ships a zero-API **"Agent-as-LLM" Evaluation Connector** (`src/eval_connector/`) exposing identical live `legacy` and `v2` sessions over a `0600` Unix-socket CLI daemon (`agent-eval`) and a pure-Python JSON-RPC 2.0 MCP stdio server (`agent-eval-mcp`).
+It also ships a zero-API **Production Browser MCP Server & CLI Connector** (`src/eval_connector/`) exposing live `v2` and `legacy` Chromium sessions over a pure-Python JSON-RPC 2.0 MCP stdio server (`agent-browse-mcp`, with backwards-compatible alias `agent-eval-mcp`) and a `0600` Unix-socket CLI daemon (`agent-eval`).
 
 ---
 
@@ -58,7 +58,8 @@ tests/
 
 docs/
   AUDIT_REPORT_agent_first_browse.md      # §6 preservation rules & V27 audit
-  EVAL_CONNECTOR.md                       # Zero-API CLI + MCP evaluation connector guide
+  MCP_SERVER.md                           # Primary production zero-API Browser MCP Server & CLI guide
+  EVAL_CONNECTOR.md                       # Backwards-compatibility stub pointing to docs/MCP_SERVER.md
   RELEASING.md                            # Zero-touch PyPI + GitHub Releases + MCP Registry OIDC automation guide
   TEST_COVERAGE_MATRIX.md                 # Feature × layer test coverage & tracked debt
   V29_OVERHAUL.md                         # V29 cognitive reliability layers
@@ -76,10 +77,11 @@ Every modern package exposes an explicit `__all__` barrel in `__init__.py`. Keep
 | Core Shared Primitives | `src/core/__init__.py` | Public (`__all__` enforced) |
 | V2 Engine API | `src/v2_engine/__init__.py` | Public (`__all__` enforced) |
 | Eval Connector API | `src/eval_connector/__init__.py` | Public (`__all__` enforced) |
+| MCP Script (Primary): `agent-browse-mcp` | `eval_connector.mcp_server:main` | Public (`pyproject.toml`) |
+| MCP Script (Legacy Alias): `agent-eval-mcp` | `eval_connector.mcp_server:main` | Public backwards-compat alias (`pyproject.toml`) |
 | CLI Script: `agent-eval` | `eval_connector.cli:main` (`scripts/agent_eval.py`) | Public (`pyproject.toml`) |
-| MCP Script: `agent-eval-mcp` | `eval_connector.mcp_server:main` | Public (`pyproject.toml`) |
 | LangGraph Brain CLI | `src/run_v16.py` | Active entrypoint |
-| Legacy Gen-1/Gen-2 Runners | `src/run.py`, `src/run_objective.py`, `src/run_prompt.py`, `src/advanced_agent.py` | **Deprecated / Legacy** (maintenance-only; prefer `src/run_v16.py` or `agent-eval` / `agent-eval-mcp`) |
+| Legacy Gen-1/Gen-2 Runners | `src/run.py`, `src/run_objective.py`, `src/run_prompt.py`, `src/advanced_agent.py` | **Deprecated / Legacy** (maintenance-only; prefer `src/run_v16.py` or `agent-browse-mcp` / `agent-eval`) |
 
 ---
 

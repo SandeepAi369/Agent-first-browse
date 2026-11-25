@@ -73,13 +73,14 @@ dev = [
 [project.urls]
 Homepage = "https://xel-studio.vercel.app"
 Repository = "https://github.com/SandeepAi369/Agent-first-browse"
-Documentation = "https://github.com/SandeepAi369/Agent-first-browse/blob/main/docs/EVAL_CONNECTOR.md"
+Documentation = "https://github.com/SandeepAi369/Agent-first-browse/blob/main/docs/MCP_SERVER.md"
 Issues = "https://github.com/SandeepAi369/Agent-first-browse/issues"
 
 [project.scripts]
 agent-first-browse = "run_v16:main"
-agent-eval = "eval_connector.cli:main"
+agent-browse-mcp = "eval_connector.mcp_server:main"
 agent-eval-mcp = "eval_connector.mcp_server:main"
+agent-eval = "eval_connector.cli:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

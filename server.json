@@ -2,7 +2,7 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.SandeepAi369/agent-first-browse",
   "title": "Agent First Browse",
-  "description": "Fast, token-efficient AI browser control MCP server with accessibility-tree perception.",
+  "description": "Fast, token-efficient Browser MCP Server for AI agents with accessibility-tree perception.",
   "version": "0.1.1",
   "websiteUrl": "https://xel-studio.vercel.app",
   "repository": {
@@ -23,7 +23,7 @@
         },
         {
           "type": "positional",
-          "value": "agent-eval-mcp"
+          "value": "agent-browse-mcp"
         }
       ],
       "transport": {

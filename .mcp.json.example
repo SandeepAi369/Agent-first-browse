@@ -1,11 +1,8 @@
 {
   "mcpServers": {
-    "agent-first-browse-eval": {
-      "command": ".venv/bin/python",
-      "args": ["-m", "eval_connector.mcp_server"],
-      "env": {
-        "PYTHONPATH": "src"
-      }
+    "agent-first-browse": {
+      "command": "uvx",
+      "args": ["--from", "agent-first-browse", "agent-browse-mcp"]
     }
   }
 }

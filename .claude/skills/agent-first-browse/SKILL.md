@@ -1,6 +1,6 @@
 ---
 name: agent-first-browse
-description: Drive real Chromium browsers via Agent First Browse's token-efficient accessibility-tree perception and action engine over MCP (`uvx --from agent-first-browse agent-eval-mcp`) or CLI (`agent-first-browse` / `agent-eval`). Use when an AI coding agent needs to open live web pages, fill forms, click SPA controls, handle modals/overlays, capture screenshots, or run end-to-end browser workflows.
+description: Drive real Chromium browsers via Agent First Browse's token-efficient accessibility-tree perception and action engine over MCP (`uvx --from agent-first-browse agent-browse-mcp`) or CLI (`agent-first-browse` / `agent-eval`). Use when an AI coding agent needs to open live web pages, fill forms, click SPA controls, handle modals/overlays, capture screenshots, or run end-to-end browser workflows.
 ---
 
 # Agent First Browse — AI Coding Agent Skill
@@ -18,7 +18,7 @@ pip install agent-first-browse && python -m playwright install chromium
 Or run on demand with `uvx` (no global package install required, provided Playwright Chromium is installed):
 
 ```bash
-uvx --from agent-first-browse agent-eval-mcp
+uvx --from agent-first-browse agent-browse-mcp
 ```
 
 ## 1. Connecting via Native MCP (`stdio`)
@@ -30,7 +30,7 @@ Configure Claude Code, Cursor, Claude Desktop, or any MCP host to launch:
   "mcpServers": {
     "agent-first-browse": {
       "command": "uvx",
-      "args": ["--from", "agent-first-browse", "agent-eval-mcp"]
+      "args": ["--from", "agent-first-browse", "agent-browse-mcp"]
     }
   }
 }
@@ -39,28 +39,30 @@ Configure Claude Code, Cursor, Claude Desktop, or any MCP host to launch:
 For Claude Code CLI:
 
 ```bash
-claude mcp add agent-first-browse -- uvx --from agent-first-browse agent-eval-mcp
+claude mcp add agent-first-browse -- uvx --from agent-first-browse agent-browse-mcp
 ```
+
+*(Backwards compatibility: `agent-eval-mcp` and legacy `eval_*` tool names remain supported aliases.)*
 
 ### MCP Tool Workflow (7 Tools, Zero External LLM API Keys)
 
 | Tool | Purpose |
 |---|---|
-| `eval_start` | Launch a Chromium session (`mode: "v2"` recommended, `"legacy"`, or `"pair"`) on a `url` or built-in `scenario` (`headless: true/false`). |
-| `eval_perceive` | Capture a compact ref-indexed snapshot (`[e1]`, `[e2]`, ...) with latency, token count, and occlusion-pruning telemetry. |
-| `eval_act` | Execute `goto`, `click`, `type`, `hover`, `select_option`, `press_enter`, `press_key`, `scroll`, `scroll_directional`, or `wait` (pass `auto_perceive: true` to receive the updated DOM in one round trip). |
-| `eval_compare` | Diff paired `legacy` vs `v2` sessions side-by-side (speedup, token savings, occluded elements pruned). |
-| `eval_screenshot` | Save a viewport or full-page PNG screenshot to disk for visual verification. |
-| `eval_metrics` | Inspect cumulative latency/token telemetry, active sessions, and built-in scenarios. |
-| `eval_stop` | Close one session (`session: "<name>"`) or all active sessions (`all: true`). |
+| `browser_start` | Launch an isolated Chromium session (`mode: "v2"` default, `"legacy"`, or `"pair"`) on a `url` or built-in `scenario` (`headless: true/false`). |
+| `browser_perceive` | Capture a compact ref-indexed snapshot (`[e1]`, `[e2]`, ...) with latency, token count, and occlusion-pruning telemetry. |
+| `browser_act` | Execute `goto`, `click`, `type`, `hover`, `select_option`, `press_enter`, `press_key`, `scroll`, `scroll_directional`, or `wait` (pass `auto_perceive: true` to receive the updated DOM in one round trip). |
+| `browser_screenshot` | Save a viewport or full-page PNG screenshot to disk for visual verification. |
+| `browser_stop` | Close one session (`session: "<name>"`) or all active sessions (`all: true`). |
+| `browser_compare` | Diff paired `legacy` vs `v2` sessions side-by-side (speedup, token savings, occluded elements pruned). |
+| `browser_metrics` | Inspect cumulative latency/token telemetry, active sessions, and built-in scenarios. |
 
 ### Recommended Agent Loop
 
-1. Call `eval_start(name="work", mode="v2", url="https://example.com", headless=true)` (set `headless=false` to display the browser window on screen).
-2. Call `eval_perceive(session="work", objective="<goal>")` to inspect live interactive ref IDs (`e1`, `e2`, ...).
-3. Call `eval_act(session="work", verb="click"|"type"|"goto"|..., element_id="eN", text="...", auto_perceive=true)` step-by-step until the goal is verified on the live page.
-4. Call `eval_screenshot(session="work")` whenever visual confirmation is needed.
-5. Always finish by calling `eval_stop(all=true)` so Chromium shuts down cleanly.
+1. Call `browser_start(name="work", url="https://example.com", headless=true)` (defaults to `mode="v2"`; set `headless=false` to display the browser window on screen).
+2. Call `browser_perceive(session="work", objective="<goal>")` to inspect live interactive ref IDs (`e1`, `e2`, ...).
+3. Call `browser_act(session="work", verb="click"|"type"|"goto"|..., element_id="eN", text="...", auto_perceive=true)` step-by-step until the goal is verified on the live page.
+4. Call `browser_screenshot(session="work")` whenever visual confirmation is needed.
+5. Always finish by calling `browser_stop(all=true)` so Chromium shuts down cleanly.
 
 ## 2. Running via Standalone CLI
 
@@ -90,4 +92,4 @@ agent-eval stop --daemon
 
 - Never print or log passwords, OTPs, or API tokens (password fields are automatically masked as `[filled: value hidden]`).
 - Never attempt to solve or bypass CAPTCHAs or anti-bot challenges; pause and report the block to the user.
-- Always shut down active sessions (`eval_stop` / `agent-eval stop --daemon`) when finished.
+- Always shut down active sessions (`browser_stop` / `agent-eval stop --daemon`) when finished.

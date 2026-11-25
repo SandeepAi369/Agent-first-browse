@@ -10,7 +10,7 @@
   <a href="https://python.org"><img src="https://img.shields.io/badge/Python-3.11%2B-3776AB?style=flat-square&logo=python&logoColor=white" alt="Python 3.11+"></a>
   <a href="https://langchain-ai.github.io/langgraph/"><img src="https://img.shields.io/badge/LangGraph-1.x-FF6B35?style=flat-square" alt="LangGraph 1.x"></a>
   <a href="https://playwright.dev/python/"><img src="https://img.shields.io/badge/Playwright-1.55%2B-2EAD33?style=flat-square&logo=playwright&logoColor=white" alt="Playwright 1.55+"></a>
-  <a href="https://github.com/SandeepAi369/Agent-first-browse/blob/main/docs/EVAL_CONNECTOR.md"><img src="https://img.shields.io/badge/MCP-stdio%20%2B%20CLI-7C3AED?style=flat-square" alt="MCP Ready"></a>
+  <a href="https://github.com/SandeepAi369/Agent-first-browse/blob/main/docs/MCP_SERVER.md"><img src="https://img.shields.io/badge/MCP-stdio%20%2B%20CLI-7C3AED?style=flat-square" alt="MCP Ready"></a>
   <a href="https://glama.ai/mcp/servers/@SandeepAi369/Agent-first-browse"><img src="https://glama.ai/mcp/servers/@SandeepAi369/Agent-first-browse/badges/score.svg" alt="Glama MCP Server Score"></a>
   <a href="https://github.com/SandeepAi369/Agent-first-browse/blob/main/docs/TEST_COVERAGE_MATRIX.md"><img src="https://img.shields.io/badge/Tests-528%20passing-10B981?style=flat-square" alt="528 Passing Tests"></a>
   <a href="https://github.com/SandeepAi369/Agent-first-browse/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-Apache--2.0-0EA5E9?style=flat-square" alt="Apache-2.0 License"></a>
@@ -183,7 +183,7 @@ Add to your `claude_desktop_config.json`:
   "mcpServers": {
     "agent-first-browse": {
       "command": "uvx",
-      "args": ["--from", "agent-first-browse", "agent-eval-mcp"]
+      "args": ["--from", "agent-first-browse", "agent-browse-mcp"]
     }
   }
 }
@@ -194,17 +194,17 @@ Add to your `claude_desktop_config.json`:
 Register via the CLI in one command:
 
 ```bash
-claude mcp add agent-first-browse -- uvx --from agent-first-browse agent-eval-mcp
+claude mcp add agent-first-browse -- uvx --from agent-first-browse agent-browse-mcp
 ```
 
-Or add `.mcp.json` to your project root:
+Or add `.mcp.json` to your project root (see [`.mcp.json.example`](https://github.com/SandeepAi369/Agent-first-browse/blob/main/.mcp.json.example)):
 
 ```json
 {
   "mcpServers": {
     "agent-first-browse": {
       "command": "uvx",
-      "args": ["--from", "agent-first-browse", "agent-eval-mcp"]
+      "args": ["--from", "agent-first-browse", "agent-browse-mcp"]
     }
   }
 }
@@ -219,11 +219,13 @@ Add to `.cursor/mcp.json` (project) or `~/.cursor/mcp.json` (global):
   "mcpServers": {
     "agent-first-browse": {
       "command": "uvx",
-      "args": ["--from", "agent-first-browse", "agent-eval-mcp"]
+      "args": ["--from", "agent-first-browse", "agent-browse-mcp"]
     }
   }
 }
 ```
+
+> **Backwards compatibility:** Legacy `agent-eval-mcp` and `eval_*` tool names remain fully supported aliases alongside `agent-browse-mcp` and `browser_*`.
 
 <details>
 <summary><strong>🔌 Exposed MCP Tools (7) & Source-Checkout Config</strong></summary>
@@ -232,15 +234,17 @@ Add to `.cursor/mcp.json` (project) or `~/.cursor/mcp.json` (global):
 
 | Tool | Purpose |
 |---|---|
-| `eval_start` | Launch a `legacy`, `v2`, or twin `pair` Chromium session (`headless: true/false`). |
-| `eval_perceive` | Run live perception and return compact ref elements + step telemetry. |
-| `eval_act` | Execute `goto`, `click`, `type`, `hover`, `select_option`, `press_enter`, `press_key`, `scroll`, or `wait`. |
-| `eval_compare` | Diff `legacy` vs `v2` sessions side-by-side (latency, tokens, occlusion, visibility). |
-| `eval_screenshot` | Save a viewport or full-page PNG screenshot to disk. |
-| `eval_metrics` | Export cumulative Markdown/JSON telemetry and scenario catalog. |
-| `eval_stop` | Close one session or shut down all active sessions cleanly. |
+| `browser_start` | Launch an isolated Chromium session (`mode: "v2"` default, `"legacy"`, or twin `"pair"`, `headless: true/false`). |
+| `browser_perceive` | Run accessibility-tree-first perception and return compact ref elements + step telemetry. |
+| `browser_act` | Execute `goto`, `click`, `type`, `hover`, `select_option`, `press_enter`, `press_key`, `scroll`, or `wait`. |
+| `browser_screenshot` | Save a viewport or full-page PNG screenshot to disk. |
+| `browser_stop` | Close one session or shut down all active sessions cleanly. |
+| `browser_compare` | Diff `legacy` vs `v2` sessions side-by-side (latency, tokens, occlusion, visibility). |
+| `browser_metrics` | Export cumulative Markdown/JSON telemetry and built-in scenario catalog. |
 
-For local source-checkout setups without `uvx`, copy [`.mcp.json.example`](https://github.com/SandeepAi369/Agent-first-browse/blob/main/.mcp.json.example).
+*(Legacy `eval_start`, `eval_perceive`, `eval_act`, `eval_screenshot`, `eval_stop`, `eval_compare`, and `eval_metrics` aliases are routed automatically in `tools/call`.)*
+
+For local source-checkout setups without `uvx`, see [`docs/MCP_SERVER.md`](https://github.com/SandeepAi369/Agent-first-browse/blob/main/docs/MCP_SERVER.md#local-source-checkout-without-uvx).
 
 </details>
 
@@ -317,7 +321,7 @@ sudo apt-get install -y xvfb
 | Guide | Contents |
 |---|---|
 | [`AGENTS.md`](https://github.com/SandeepAi369/Agent-first-browse/blob/main/AGENTS.md) | Engineering handbook, package boundaries, frozen-file rules, and verification commands. |
-| [`docs/EVAL_CONNECTOR.md`](https://github.com/SandeepAi369/Agent-first-browse/blob/main/docs/EVAL_CONNECTOR.md) | Complete Zero-API MCP + CLI connector guide, scenarios, and headed benchmark results. |
+| [`docs/MCP_SERVER.md`](https://github.com/SandeepAi369/Agent-first-browse/blob/main/docs/MCP_SERVER.md) | Production zero-API Browser MCP Server guide, tool reference, CLI daemon, and headed benchmarks. |
 | [`docs/TEST_COVERAGE_MATRIX.md`](https://github.com/SandeepAi369/Agent-first-browse/blob/main/docs/TEST_COVERAGE_MATRIX.md) | Subsystem-by-layer test coverage rollup and CI gate mapping. |
 | [`docs/V2_ECOSYSTEM_AUDIT_2026.md`](https://github.com/SandeepAi369/Agent-first-browse/blob/main/docs/V2_ECOSYSTEM_AUDIT_2026.md) | V2 perception & resilient action engine design rationale. |
 | [`docs/V29_OVERHAUL.md`](https://github.com/SandeepAi369/Agent-first-browse/blob/main/docs/V29_OVERHAUL.md) | V29 cognitive reliability layers (Reality Monitor, Intent Journal, Sub-Goal Lock). |

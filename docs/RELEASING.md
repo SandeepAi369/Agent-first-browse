@@ -13,7 +13,7 @@
 | **GitHub Releases** (`vX.Y.Z`) | **Yes** | Created automatically with generated release notes + attached `.whl`/`.tar.gz` via built-in `GITHUB_TOKEN`. |
 | **Official MCP Registry** (`registry.modelcontextprotocol.io`) | **Yes** | Published automatically after PyPI confirms live propagation, using zero-secret `mcp-publisher login github-oidc`. |
 | **Glama** (`glama.ai/mcp/servers/@SandeepAi369/Agent-first-browse`) | **No (Evergreen)** | Re-indexes GitHub `main`, `glama.json`, `README.md`, and PyPI automatically. |
-| **Curated Awesome Lists** (`TensorBlock/awesome-mcp-servers`, `punkpeye/awesome-mcp-servers`, `steel-dev/awesome-web-agents`, `YuzeHao2023/Awesome-MCP-Servers`, `mcpservers.org`) | **No (Evergreen)** | None of the submitted entries hardcode version numbers — they link to the GitHub repo, Glama live SVG badge, `uvx --from agent-first-browse agent-eval-mcp`, and Official MCP Registry ID. |
+| **Curated Awesome Lists** (`TensorBlock/awesome-mcp-servers`, `punkpeye/awesome-mcp-servers`, `steel-dev/awesome-web-agents`, `YuzeHao2023/Awesome-MCP-Servers`, `mcpservers.org`) | **No (Evergreen)** | None of the submitted entries hardcode version numbers — they link to the GitHub repo, Glama live SVG badge, `uvx --from agent-first-browse agent-browse-mcp` (with `agent-eval-mcp` alias retained), and Official MCP Registry ID. |
 
 ---
 
