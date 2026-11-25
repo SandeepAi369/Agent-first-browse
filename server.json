@@ -3,7 +3,7 @@
   "name": "io.github.SandeepAi369/agent-first-browse",
   "title": "Agent First Browse",
   "description": "Fast, token-efficient AI browser control MCP server with accessibility-tree perception.",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "websiteUrl": "https://xel-studio.vercel.app",
   "repository": {
     "url": "https://github.com/SandeepAi369/Agent-first-browse",
@@ -13,7 +13,7 @@
     {
       "registryType": "pypi",
       "identifier": "agent-first-browse",
-      "version": "0.1.0",
+      "version": "0.1.1",
       "runtimeHint": "uvx",
       "runtimeArguments": [
         {

@@ -326,4 +326,4 @@ sudo apt-get install -y xvfb
 - Licensed under the **Apache License 2.0** — see [`LICENSE`](https://github.com/SandeepAi369/Agent-first-browse/blob/main/LICENSE).
 - If you find **Agent First Browse** useful, consider starring the repo or supporting ongoing open-source development via [GitHub Sponsors](https://github.com/sponsors/SandeepAi369).
 
-<!-- mcp-name: io.github.SandeepAi369/agent-first-browse -->
+mcp-name: io.github.SandeepAi369/agent-first-browse

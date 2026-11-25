@@ -39,7 +39,7 @@ from eval_connector.session import DualModeSessionManager
 logger = logging.getLogger("eval_connector.mcp_server")
 
 SERVER_NAME = "agent-first-browse-eval"
-SERVER_VERSION = "0.1.0"
+SERVER_VERSION = "0.1.1"
 DEFAULT_PROTOCOL_VERSION = "2025-03-26"
 SUPPORTED_PROTOCOL_VERSIONS = {
     "2024-11-05",

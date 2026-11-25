@@ -8,4 +8,4 @@ Dual-model LangGraph browser automation orchestrator with:
 - SQLite persistence for campaign history and vector memory
 """
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"

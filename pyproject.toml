@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agent-first-browse"
-version = "0.1.0"
+version = "0.1.1"
 description = "Fast, token-efficient AI browser agent that sees, clicks, types, and completes real web tasks autonomously - with native MCP & CLI control."
 readme = "README.md"
 license = "Apache-2.0"
