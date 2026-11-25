@@ -21,6 +21,7 @@
   <a href="#architecture">Architecture</a> ·
   <a href="#verified-benchmarks">Benchmarks</a> ·
   <a href="#quick-start">Quick Start</a> ·
+  <a href="#mcp-server-setup">MCP Setup</a> ·
   <a href="#documentation">Docs</a>
 </p>
 
@@ -164,28 +165,67 @@ pip install -e ".[dev]" && python -m playwright install chromium
 agent-first-browse run --mode v2 "Open https://news.ycombinator.com and find the top 3 stories"
 ```
 
-Want **zero external API keys**? Connect Antigravity, Claude Code, Cursor, VS Code, or Gemini CLI directly via native MCP or the stateful CLI daemon:
+---
 
-<details>
-<summary><strong>🔌 Connect via Native MCP Server (<code>agent-eval-mcp</code> — 7 tools, zero API keys)</strong></summary>
+## MCP Server Setup
 
-<br>
+Connect **Claude Desktop**, **Claude Code**, **Cursor**, or any MCP host directly over `stdio` — **zero external LLM API keys required** (run `python -m playwright install chromium` once if Chromium is not yet installed).
 
-Copy [`.mcp.json.example`](https://github.com/SandeepAi369/Agent-first-browse/blob/main/.mcp.json.example) into your MCP client config:
+### Claude Desktop
+
+Add to your `claude_desktop_config.json`:
 
 ```json
 {
   "mcpServers": {
-    "agent-first-browse-eval": {
-      "command": ".venv/bin/python",
-      "args": ["-m", "eval_connector.mcp_server"],
-      "env": {
-        "PYTHONPATH": "src"
-      }
+    "agent-first-browse": {
+      "command": "uvx",
+      "args": ["--from", "agent-first-browse", "agent-eval-mcp"]
     }
   }
 }
 ```
+
+### Claude Code
+
+Register via the CLI in one command:
+
+```bash
+claude mcp add agent-first-browse -- uvx --from agent-first-browse agent-eval-mcp
+```
+
+Or add `.mcp.json` to your project root:
+
+```json
+{
+  "mcpServers": {
+    "agent-first-browse": {
+      "command": "uvx",
+      "args": ["--from", "agent-first-browse", "agent-eval-mcp"]
+    }
+  }
+}
+```
+
+### Cursor
+
+Add to `.cursor/mcp.json` (project) or `~/.cursor/mcp.json` (global):
+
+```json
+{
+  "mcpServers": {
+    "agent-first-browse": {
+      "command": "uvx",
+      "args": ["--from", "agent-first-browse", "agent-eval-mcp"]
+    }
+  }
+}
+```
+
+<details>
+<summary><strong>🔌 Exposed MCP Tools (7) & Source-Checkout Config</strong></summary>
+
+<br>
 
 | Tool | Purpose |
 |---|---|
@@ -196,6 +236,8 @@ Copy [`.mcp.json.example`](https://github.com/SandeepAi369/Agent-first-browse/bl
 | `eval_screenshot` | Save a viewport or full-page PNG screenshot to disk. |
 | `eval_metrics` | Export cumulative Markdown/JSON telemetry and scenario catalog. |
 | `eval_stop` | Close one session or shut down all active sessions cleanly. |
+
+For local source-checkout setups without `uvx`, copy [`.mcp.json.example`](https://github.com/SandeepAi369/Agent-first-browse/blob/main/.mcp.json.example).
 
 </details>
 
@@ -283,3 +325,5 @@ sudo apt-get install -y xvfb
 
 - Licensed under the **Apache License 2.0** — see [`LICENSE`](https://github.com/SandeepAi369/Agent-first-browse/blob/main/LICENSE).
 - If you find **Agent First Browse** useful, consider starring the repo or supporting ongoing open-source development via [GitHub Sponsors](https://github.com/sponsors/SandeepAi369).
+
+<!-- mcp-name: io.github.SandeepAi369/agent-first-browse -->
