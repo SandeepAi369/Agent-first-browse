@@ -45,6 +45,7 @@ src/
 
 scripts/
   check_guardrails.py   # Automated guardrail & contract verifier (frozen files, universal-only, exports, secrets, test hygiene)
+  release.py            # Single-source version sync/check/tag helper (pyproject.toml, server.json, src/, README mcp-name)
   agent_eval.py         # CLI wrapper for eval_connector.cli:main
   benchmark_v2_vs_legacy.py # Headed/headless side-by-side V2 vs legacy benchmark
   diagnostics/          # Standalone environment & health checks
@@ -58,6 +59,7 @@ tests/
 docs/
   AUDIT_REPORT_agent_first_browse.md      # §6 preservation rules & V27 audit
   EVAL_CONNECTOR.md                       # Zero-API CLI + MCP evaluation connector guide
+  RELEASING.md                            # Zero-touch PyPI + GitHub Releases + MCP Registry OIDC automation guide
   TEST_COVERAGE_MATRIX.md                 # Feature × layer test coverage & tracked debt
   V29_OVERHAUL.md                         # V29 cognitive reliability layers
   V2_ECOSYSTEM_AUDIT_2026.md              # V2 engine benchmark & ecosystem design

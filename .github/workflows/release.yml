@@ -1,0 +1,363 @@
+# Automated Multi-Platform Release & Sync Pipeline
+#
+# Publishes Agent First Browse consistently to:
+#   1. PyPI (Trusted Publishing via OIDC, or optional PYPI_API_TOKEN secret)
+#   2. GitHub Releases (with auto-generated release notes + attached wheel/sdist)
+#   3. Official MCP Registry (zero-secret GitHub Actions OIDC via mcp-publisher)
+#
+# Triggers:
+#   - Push any semver tag `vX.Y.Z` (e.g. `python scripts/release.py --bump patch --commit --tag --push`)
+#   - Or 1-click "Run workflow" in GitHub Actions (bumps, commits, tags, and publishes end-to-end)
+
+name: Release & Multi-Platform Sync
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+*"
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: "Version bump (ignored if explicit version is set)"
+        type: choice
+        default: "patch"
+        options:
+          - patch
+          - minor
+          - major
+      version:
+        description: "Optional explicit semver (e.g. 0.2.0)"
+        type: string
+        required: false
+        default: ""
+      dry_run:
+        description: "Validate and build only (skip publishing to PyPI, GitHub Releases, and MCP Registry)"
+        type: boolean
+        required: false
+        default: false
+
+concurrency:
+  group: release-publish
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  prepare:
+    name: Prepare release version & tag
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      tag: ${{ steps.resolve.outputs.tag }}
+      commit_sha: ${{ steps.resolve.outputs.commit_sha }}
+      dry_run: ${{ steps.resolve.outputs.dry_run }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Resolve version, bump if workflow_dispatch, and verify tag alignment
+        id: resolve
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            DRY_RUN="${{ inputs.dry_run }}"
+            EXPLICIT="${{ inputs.version }}"
+            if [ -n "$EXPLICIT" ]; then
+              python scripts/release.py --version "$EXPLICIT"
+            else
+              python scripts/release.py --bump "${{ inputs.bump }}"
+            fi
+            VERSION="$(python scripts/release.py --print-version)"
+            TAG="v${VERSION}"
+            python scripts/release.py --check --expected-tag "$TAG"
+
+            if [ "$DRY_RUN" = "true" ]; then
+              echo "Dry run: verified bump -> ${VERSION} cleanly; resetting to HEAD for build validation."
+              git checkout -- pyproject.toml server.json src/app/__init__.py src/eval_connector/mcp_server.py
+              VERSION="$(python scripts/release.py --print-version)"
+              TAG="v${VERSION}"
+            else
+              git config user.name "github-actions[bot]"
+              git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+              git add pyproject.toml server.json src/app/__init__.py src/eval_connector/mcp_server.py
+              git commit -m "release(${TAG}): bump version to ${VERSION}"
+              git tag -a "$TAG" -m "Release ${TAG}"
+              git push origin HEAD:main "$TAG"
+            fi
+            SHA="$(git rev-parse HEAD)"
+          else
+            DRY_RUN="false"
+            TAG="${GITHUB_REF_NAME}"
+            python scripts/release.py --check --expected-tag "$TAG"
+            VERSION="$(python scripts/release.py --print-version)"
+            SHA="$(git rev-parse HEAD)"
+          fi
+
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "commit_sha=${SHA}" >> "$GITHUB_OUTPUT"
+          echo "dry_run=${DRY_RUN}" >> "$GITHUB_OUTPUT"
+
+  validate-and-build:
+    name: Validate, test, build & smoke-check wheel
+    needs: prepare
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout release commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.commit_sha }}
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install build, lint, and test tooling
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install build twine flake8 ruff mypy pytest pytest-asyncio
+          pip install -r requirements.txt
+          python -m playwright install --with-deps chromium
+
+      - name: Verify version sync, guardrails, lint, and types
+        run: |
+          if [ "${{ needs.prepare.outputs.dry_run }}" != "true" ]; then
+            python scripts/release.py --check --expected-tag "${{ needs.prepare.outputs.tag }}"
+          else
+            python scripts/release.py --check
+          fi
+          python scripts/check_guardrails.py --strict-test-hygiene
+          ruff check src/core src/v2_engine src/eval_connector scripts/check_guardrails.py scripts/release.py
+          mypy src/core src/v2_engine src/eval_connector scripts/check_guardrails.py scripts/release.py
+          flake8 src scripts tests --count --select=E9,F63,F7,F82 --show-source --statistics
+
+      - name: Run full offline + Chromium test suite
+        run: pytest -q
+
+      - name: Build sdist & wheel and run strict twine check
+        run: |
+          rm -rf dist build src/*.egg-info
+          python -m build
+          twine check --strict dist/*
+
+      - name: Verify wheel metadata (mcp-name) and clean-venv CLI imports
+        env:
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          python - <<'PY'
+          import os, zipfile
+          ver = os.environ["RELEASE_VERSION"]
+          whl = f"dist/agent_first_browse-{ver}-py3-none-any.whl"
+          with zipfile.ZipFile(whl) as z:
+              meta = z.read(f"agent_first_browse-{ver}.dist-info/METADATA").decode("utf-8")
+              names = z.namelist()
+          assert f"Version: {ver}" in meta, "Version missing from wheel METADATA"
+          assert "\nmcp-name: io.github.SandeepAi369/agent-first-browse" in meta, "mcp-name missing from wheel METADATA"
+          assert "dom_parser.py" in names and "eval_connector/mcp_server.py" in names
+          print(f"Verified wheel {whl}: {len(names)} files + mcp-name ownership marker")
+          PY
+
+          python -m venv /tmp/release_smoke_venv
+          /tmp/release_smoke_venv/bin/pip install -q --no-deps "dist/agent_first_browse-${RELEASE_VERSION}-py3-none-any.whl"
+          SITE_PKGS="$(python -c 'import site; print(site.getsitepackages()[0])')"
+          (
+            cd /tmp
+            PYTHONPATH="$SITE_PKGS" /tmp/release_smoke_venv/bin/python -c "import core, v2_engine, eval_connector, dom_parser, brain_graph, run_v16"
+            PYTHONPATH="$SITE_PKGS" /tmp/release_smoke_venv/bin/agent-first-browse --help >/dev/null
+            PYTHONPATH="$SITE_PKGS" /tmp/release_smoke_venv/bin/agent-eval --help >/dev/null
+            PYTHONPATH="$SITE_PKGS" /tmp/release_smoke_venv/bin/agent-eval-mcp --help >/dev/null
+          )
+          rm -rf /tmp/release_smoke_venv
+
+      - name: Upload built distributions
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ needs.prepare.outputs.version }}
+          path: dist/
+          retention-days: 7
+
+  publish-pypi:
+    name: Publish to PyPI
+    needs: [prepare, validate-and-build]
+    if: needs.prepare.outputs.dry_run != 'true'
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/agent-first-browse/${{ needs.prepare.outputs.version }}/
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Download built distributions
+        uses: actions/download-artifact@v4
+        with:
+          name: dist-${{ needs.prepare.outputs.version }}
+          path: dist/
+
+      - name: Check if version is already live on PyPI (idempotent guard)
+        id: check_pypi
+        env:
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+          PYPI_API_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
+        run: |
+          if [ -n "$PYPI_API_TOKEN" ]; then
+            echo "has_token=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_token=false" >> "$GITHUB_OUTPUT"
+          fi
+          python3 - <<'PY'
+          import os, urllib.error, urllib.request
+          ver = os.environ["RELEASE_VERSION"]
+          url = f"https://pypi.org/pypi/agent-first-browse/{ver}/json"
+          try:
+              with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "release-ci"}), timeout=12) as r:
+                  already = (r.status == 200)
+          except urllib.error.HTTPError:
+              already = False
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+              fh.write(f"already_published={'true' if already else 'false'}\n")
+          print(f"PyPI agent-first-browse=={ver} already_published={already}")
+          PY
+
+      - name: Publish via PyPI Trusted Publishing (OIDC)
+        if: steps.check_pypi.outputs.already_published != 'true' && steps.check_pypi.outputs.has_token != 'true'
+        uses: pypa/gh-action-pypi-publish@release/v1
+
+      - name: Publish via PYPI_API_TOKEN fallback
+        if: steps.check_pypi.outputs.already_published != 'true' && steps.check_pypi.outputs.has_token == 'true'
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          password: ${{ secrets.PYPI_API_TOKEN }}
+
+      - name: Wait for PyPI JSON API propagation & verify mcp-name marker
+        env:
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          python3 - <<'PY'
+          import json, os, sys, time, urllib.error, urllib.request
+          ver = os.environ["RELEASE_VERSION"]
+          url = f"https://pypi.org/pypi/agent-first-browse/{ver}/json"
+          marker = "mcp-name: io.github.SandeepAi369/agent-first-browse"
+          for attempt in range(1, 19):
+              try:
+                  with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "release-ci"}), timeout=15) as r:
+                      data = json.loads(r.read().decode("utf-8"))
+                      if marker in (data.get("info", {}).get("description") or ""):
+                          print(f"PyPI {ver} live with verified mcp-name marker (attempt {attempt})")
+                          sys.exit(0)
+              except urllib.error.HTTPError:
+                  pass
+              time.sleep(5)
+          sys.exit(f"Timed out waiting for PyPI {ver} JSON propagation with mcp-name marker")
+          PY
+
+  publish-github-release:
+    name: Create GitHub Release
+    needs: [prepare, publish-pypi]
+    if: needs.prepare.outputs.dry_run != 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download built distributions
+        uses: actions/download-artifact@v4
+        with:
+          name: dist-${{ needs.prepare.outputs.version }}
+          path: dist/
+
+      - name: Create or update GitHub Release with wheel & sdist
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          if gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "Release ${TAG} already exists; ensuring dist assets are attached."
+            gh release upload "$TAG" dist/* --clobber --repo "${{ github.repository }}"
+          else
+            gh release create "$TAG" dist/* \
+              --repo "${{ github.repository }}" \
+              --title "${TAG} — Agent First Browse" \
+              --generate-notes
+          fi
+
+  publish-mcp-registry:
+    name: Publish to Official MCP Registry (OIDC)
+    needs: [prepare, publish-pypi]
+    if: needs.prepare.outputs.dry_run != 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Checkout release commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.commit_sha }}
+
+      - name: Install official mcp-publisher CLI
+        run: |
+          curl -fsSL "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_$(uname -s | tr '[:upper:]' '[:lower:]')_$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/').tar.gz" | tar -xz mcp-publisher
+          chmod +x ./mcp-publisher
+          ./mcp-publisher --version
+
+      - name: Validate server.json against Official MCP Registry
+        run: ./mcp-publisher validate
+
+      - name: Check if version is already live on MCP Registry (idempotent guard)
+        id: check_mcp
+        env:
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          python3 - <<'PY'
+          import json, os, urllib.request
+          ver = os.environ["RELEASE_VERSION"]
+          url = "https://registry.modelcontextprotocol.io/v0.1/servers?search=agent-first-browse"
+          data = json.loads(urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "release-ci"}), timeout=15).read().decode("utf-8"))
+          already = any(
+              (entry.get("server", entry).get("name") == "io.github.SandeepAi369/agent-first-browse"
+               and entry.get("server", entry).get("version") == ver)
+              for entry in data.get("servers", [])
+          )
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+              fh.write(f"already_published={'true' if already else 'false'}\n")
+          print(f"MCP Registry io.github.SandeepAi369/agent-first-browse@{ver} already_published={already}")
+          PY
+
+      - name: Authenticate via GitHub Actions OIDC & publish to MCP Registry
+        if: steps.check_mcp.outputs.already_published != 'true'
+        run: |
+          ./mcp-publisher login github-oidc
+          ./mcp-publisher publish
+
+      - name: Verify new version live on Official MCP Registry
+        env:
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          sleep 3
+          python3 - <<'PY'
+          import json, os, sys, urllib.request
+          ver = os.environ["RELEASE_VERSION"]
+          url = "https://registry.modelcontextprotocol.io/v0.1/servers?search=agent-first-browse"
+          data = json.loads(urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "release-ci"}), timeout=15).read().decode("utf-8"))
+          found = any(
+              (entry.get("server", entry).get("name") == "io.github.SandeepAi369/agent-first-browse"
+               and entry.get("server", entry).get("version") == ver)
+              for entry in data.get("servers", [])
+          )
+          if not found:
+              sys.exit(f"Expected io.github.SandeepAi369/agent-first-browse@{ver} on MCP Registry")
+          print(f"Verified io.github.SandeepAi369/agent-first-browse@{ver} is LIVE on registry.modelcontextprotocol.io")
+          PY

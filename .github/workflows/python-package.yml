@@ -31,15 +31,16 @@ jobs:
         pip install -r requirements.txt
         # Browser-backed unit tests (perception, upload, secret masking) need Chromium
         python -m playwright install --with-deps chromium
-    - name: Check architecture guardrails
+    - name: Check architecture guardrails & version sync
       run: |
         python scripts/check_guardrails.py --strict-test-hygiene
+        python scripts/release.py --check
     - name: Lint with ruff (scoped modern packages)
       run: |
-        ruff check src/core src/v2_engine src/eval_connector scripts/check_guardrails.py
+        ruff check src/core src/v2_engine src/eval_connector scripts/check_guardrails.py scripts/release.py
     - name: Type-check with mypy (progressive scope)
       run: |
-        mypy src/core src/v2_engine src/eval_connector scripts/check_guardrails.py
+        mypy src/core src/v2_engine src/eval_connector scripts/check_guardrails.py scripts/release.py
     - name: Lint with flake8
       run: |
         # stop the build if there are Python syntax errors or undefined names
