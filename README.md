@@ -12,6 +12,7 @@
   <a href="https://playwright.dev/python/"><img src="https://img.shields.io/badge/Playwright-1.55%2B-2EAD33?style=flat-square&logo=playwright&logoColor=white" alt="Playwright 1.55+"></a>
   <a href="https://github.com/SandeepAi369/Agent-first-browse/blob/main/docs/MCP_SERVER.md"><img src="https://img.shields.io/badge/MCP-stdio%20%2B%20CLI-7C3AED?style=flat-square" alt="MCP Ready"></a>
   <a href="https://glama.ai/mcp/servers/@SandeepAi369/Agent-first-browse"><img src="https://glama.ai/mcp/servers/@SandeepAi369/Agent-first-browse/badges/score.svg" alt="Glama MCP Server Score"></a>
+  <a href="https://mcprush.com/to/agent-first-browse-mcp?ref=badge"><img src="https://mcprush.com/badge/agent-first-browse-mcp/card.svg" alt="Agent First Browse MCP server"></a>
   <a href="https://github.com/SandeepAi369/Agent-first-browse/blob/main/docs/TEST_COVERAGE_MATRIX.md"><img src="https://img.shields.io/badge/Tests-528%20passing-10B981?style=flat-square" alt="528 Passing Tests"></a>
   <a href="https://github.com/SandeepAi369/Agent-first-browse/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-Apache--2.0-0EA5E9?style=flat-square" alt="Apache-2.0 License"></a>
 </p>
